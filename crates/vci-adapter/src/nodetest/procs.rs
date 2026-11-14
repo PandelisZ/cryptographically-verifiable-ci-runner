@@ -682,8 +682,26 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        // SAFETY: kill with signal 0 only checks that the process exists.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        // Killed with the group, it is gone once its new parent has reaped
+        // it: until then (moments on a Linux host, never in a container
+        // whose PID 1 does not reap) `kill(pid, 0)` still finds a zombie,
+        // which is ended all the same.
+        let running = || {
+            // SAFETY: kill with signal 0 only checks that the process exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return false;
+            }
+            // After the command's closing parenthesis: the state letter.
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|st| st.rsplit(')').next().map(|r| r.trim_start().chars().next()));
+            state != Some(Some('Z'))
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        while running() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let alive = running();
         if alive {
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
