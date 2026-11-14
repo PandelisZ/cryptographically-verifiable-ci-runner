@@ -410,6 +410,42 @@ impl<'s> StoreLoop<'s> {
         self.done.store_secs += t.elapsed().as_secs_f64();
     }
 
+    /// Say which objects the run wrote or named again, for the records its
+    /// hints and this signer key, on a store that keeps no listing columns
+    /// ([`AttestationStore::put_run_objects`]: git-meta's run-object
+    /// links, 2.11), after the objects and inside the batch, so that a push
+    /// can tell from keys alone which objects remaining records may name.
+    /// A store that refuses it is a warning, never a refused unit: no
+    /// verdict reads it (a push then keeps every object while one of the
+    /// run's records remains).
+    fn put_run_objects(&mut self, run: &Run3) {
+        if self.mode == StoreMode::SignOnly
+            || self.objects_failed.is_some()
+            || run.hints.is_empty()
+            || run.objects.is_empty()
+        {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let ids: Vec<(ObjectKind, String)> = run
+            .objects
+            .iter()
+            .map(|o| (o.kind, vci_core::objects::hex32(&o.id)))
+            .collect();
+        let objects: Vec<(ObjectKind, &str)> =
+            ids.iter().map(|(k, id)| (*k, id.as_str())).collect();
+        if let Err(e) = self
+            .store
+            .put_run_objects(&run.hints, self.signer, &objects)
+        {
+            self.note(format!(
+                "vci: warning: noting the run's objects in the {} store: {e} (a push keeps every object while one of this run's records remains)",
+                self.store.kind()
+            ));
+        }
+        self.done.store_secs += t.elapsed().as_secs_f64();
+    }
+
     fn deferred(&self) -> bool {
         self.batch.as_ref().is_some_and(WriteBatch::defers_writes)
     }
@@ -3298,6 +3334,7 @@ pub fn run_units(
                 if let Some(r) = run3 {
                     stores.put_objects(&r.objects);
                     stores.put_run_state(r);
+                    stores.put_run_objects(r);
                 }
                 for job in rx {
                     stores.apply(job);

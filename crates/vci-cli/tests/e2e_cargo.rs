@@ -3409,6 +3409,451 @@ fn cargo_push_keeps_the_newest_attestations_of_a_unit_without_a_prune() {
     );
 }
 
+// ---- a store that cleans itself (vci 2.11) ---------------------------------
+
+/// The hdr, tables and shape object ids, and the state object ids, of
+/// `dir`'s git-meta store (keys only).
+fn stored_objects(dir: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
+    let rows = AttestStore::new(&store_for(dir))
+        .reader()
+        .unwrap()
+        .object_rows()
+        .unwrap();
+    let (state, other): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|r| r.kind == vci_core::ObjectKind::State);
+    (
+        other.into_iter().map(|r| r.id).collect(),
+        state.into_iter().map(|r| r.id).collect(),
+    )
+}
+
+/// The hdr, tables and shape ids the records of `dir`'s store name (every
+/// value read: they must all be here).
+fn named_objects(dir: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for e in AttestStore::new(&store_for(dir)).list(None).unwrap() {
+        match vci_store::record_object_refs(&e.bytes) {
+            vci_store::ObjectRefs::Named(ids) => out.extend(ids),
+            other => panic!("{}: {other:?}", e.key),
+        }
+    }
+    out
+}
+
+/// The run-object link keys of `dir`'s store.
+fn run_object_links(dir: &Path) -> Vec<String> {
+    AttestStore::new(&store_for(dir))
+        .reader()
+        .unwrap()
+        .run_object_links()
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// b attested on branches `b<v>`, `v` in `versions`, each with its own
+/// data and its own `b/Cargo.toml` (a global input of b: each run has its
+/// own hdr object), a second apart.
+fn attest_b_versions(w: &World, dir: &Path, versions: std::ops::RangeInclusive<u32>) {
+    let cargo_toml = std::fs::read_to_string(dir.join("b/Cargo.toml")).unwrap();
+    for v in versions {
+        w.git(dir, &["checkout", "-q", "-b", &format!("b{v}"), "main"]);
+        std::fs::write(
+            dir.join("b/tests/data/b.json"),
+            format!("{{\"greeting\": \"hello\", \"v\": {v}}}\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("b/Cargo.toml"), format!("{cargo_toml}# v{v}\n")).unwrap();
+        w.git(dir, &["commit", "-qam", "b's data and manifest change"]);
+        w.run(dir, &[B], &w.trusted);
+        // issuedAt has second resolution: the next one is newer.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+}
+
+/// A push removes, from keys alone, the format-3 objects no remaining
+/// attestation names and the run links of runs with none left (2.11):
+/// after the push removes b's two oldest attestations (beyond the 4
+/// newest), their runs' hdr and state objects go too, here and on the
+/// remote, and exactly the objects the remaining records name stay;
+/// `VCI_STORE_AUTO_PRUNE=0` keeps them; the plan still skips b; a second
+/// push has nothing to remove. Before, only `vci prune` removed them, by
+/// reading every attestation (vex, 14 November 2026: 40,753 unreferenced
+/// objects, 39% of the store).
+#[test]
+fn cargo_push_removes_the_objects_no_remaining_attestation_names() {
+    let Some(mut w) = World::new() else { return };
+    // Runs a second old are collected (by default an hour after their issue).
+    w.env.push(("VCI_STORE_RUN_GRACE_SECS".into(), "0".into()));
+    let work = w.work.clone();
+    attest_b_versions(&w, &work, 2..=7);
+    w.git(&work, &["checkout", "-q", "b7"]);
+    for v in 2..=6 {
+        w.git(&work, &["branch", "-D", &format!("b{v}")]);
+    }
+    let (objects, states) = stored_objects(&work);
+    assert!(objects.len() >= 6, "an hdr per run: {objects:?}");
+    assert_eq!(states.len(), 6, "a state object per run");
+    // Each run linked its objects (hdr, tables, shape, state).
+    let links = run_object_links(&work);
+    assert!(links.len() >= 6 * 4, "{links:?}");
+    let off = w.vci_env(
+        &work,
+        &["push", "--remote", "origin"],
+        &[("VCI_STORE_AUTO_PRUNE", "0")],
+    );
+    assert!(off.status.success());
+    assert_eq!(stored_objects(&work), (objects.clone(), states.clone()));
+    let out = w.vci(&work, &["push", "--remote", "origin"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("vci: removed 2 of "), "{err}");
+    assert!(
+        err.contains("object(s) no remaining attestation names"),
+        "{err}"
+    );
+    let (left, left_states) = stored_objects(&work);
+    assert_eq!(
+        left,
+        named_objects(&work),
+        "exactly the objects the remaining attestations name"
+    );
+    assert!(left.len() < objects.len(), "{left:?} of {objects:?}");
+    assert_eq!(left_states.len(), 4, "the remaining runs' state objects");
+    // Every link left is of a run with an attestation left.
+    let records: BTreeSet<(String, String)> = AttestStore::new(&store_for(&work))
+        .list(None)
+        .unwrap()
+        .into_iter()
+        .map(|e| {
+            let h = vci_store::parse_key_hint(&e.key).unwrap();
+            (vci_store::hint_segment(&h), e.signer)
+        })
+        .collect();
+    let links = run_object_links(&work);
+    assert!(!links.is_empty());
+    for l in &links {
+        let (hint, signer, _, _) = vci_store::parse_run_object_key(l).unwrap();
+        assert!(
+            records.contains(&(hint.to_owned(), signer.to_owned())),
+            "{l}"
+        );
+    }
+    // Published: a fresh clone holds the same objects.
+    let fresh = w.base.join("fresh");
+    w.git(
+        &w.base,
+        &["clone", "-q", w.remote.to_str().unwrap(), "fresh"],
+    );
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    assert_eq!(stored_objects(&fresh), (left, left_states));
+    let plan = w.plan(&work, "main");
+    assert!(plan.skip.contains(B), "{:?} {:?}", plan.skip, plan.run);
+    let out = w.vci(&work, &["push", "--remote", "origin"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success() && !err.contains("vci: removed"),
+        "{err}"
+    );
+}
+
+/// The records of runs that wrote no run-object links (a vci before 2.11)
+/// may name any object: a push from a clone that does not hold their
+/// values (a fresh, lazy clone) removes no hdr, tables or shape object and
+/// says why; one that holds them reads them (locally, nothing fetched)
+/// and removes the objects none of them names.
+#[test]
+fn cargo_push_keeps_the_objects_records_of_an_older_vci_may_name() {
+    let Some(mut w) = World::new() else { return };
+    // Runs a second old are collected (by default an hour after their issue).
+    w.env.push(("VCI_STORE_RUN_GRACE_SECS".into(), "0".into()));
+    let work = w.work.clone();
+    attest_b_versions(&w, &work, 2..=3);
+    w.git(&work, &["checkout", "-q", "b3"]);
+    w.git(&work, &["branch", "-D", "b2"]);
+    // As a vci before 2.11 wrote them: no links.
+    let repo = store_for(&work);
+    let st = AttestStore::new(&repo);
+    let links = run_object_links(&work);
+    assert!(!links.is_empty());
+    st.remove_run_state_keys(links).unwrap();
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let (objects, _) = stored_objects(&work);
+    // A fresh, lazy clone: the values are not here.
+    w.git(&w.remote, &["config", "uploadpack.allowFilter", "true"]);
+    let fresh = w.base.join("fresh");
+    w.git(
+        &w.base,
+        &[
+            "clone",
+            "-q",
+            "--no-local",
+            w.remote.to_str().unwrap(),
+            "fresh",
+        ],
+    );
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    assert!(
+        AttestStore::new(&store_for(&fresh))
+            .reader()
+            .unwrap()
+            .attestation_keys_promised()
+            .unwrap()
+            .iter()
+            .all(|(_, promised)| *promised),
+        "no value fetched"
+    );
+    let one = [("VCI_STORE_AUTO_PRUNE", "1")];
+    let out = w.vci_env(&fresh, &["push", "--remote", "origin"], &one);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("vci: removed 1 of 2 attestation(s)"), "{err}");
+    assert!(
+        err.contains("kept every hdr, tables and shape object: 1 of the 1 attestation(s) made before vci 2.11 have no value here"),
+        "{err}"
+    );
+    assert_eq!(stored_objects(&fresh).0, objects);
+    // The clone that holds the values (the record b2's push removed is
+    // gone here too after the merge).
+    let out = w.vci_env(&work, &["push", "--remote", "origin"], &one);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("object(s) no remaining attestation names"),
+        "{err}"
+    );
+    let (left, _) = stored_objects(&work);
+    assert_eq!(left, named_objects(&work));
+    assert!(left.len() < objects.len());
+    assert!(w.plan(&work, "main").skip.contains(B));
+}
+
+/// A run in another clone names an object again (the same inputs: the
+/// same hdr) after this clone fetched, and pushes first; this clone's push
+/// removes that object as no record it knows of names it: the merge of
+/// its push puts it back from the other clone's run-object links (keys
+/// only: the other record's value is not here), and a fresh clone skips
+/// with the other clone's attestation. (The other order, this clone's
+/// removal published first, is the put-back of a clone's own records'
+/// objects, which reads their values: 2.10.)
+#[test]
+fn cargo_push_never_removes_an_object_a_concurrent_writer_names() {
+    let Some(mut w) = World::new() else { return };
+    // Runs a second old are collected (by default an hour after their issue).
+    w.env.push(("VCI_STORE_RUN_GRACE_SECS".into(), "0".into()));
+    let work = w.work.clone();
+    // Lazy fetches: this clone never holds the other clone's record.
+    w.git(&w.remote, &["config", "uploadpack.allowFilter", "true"]);
+    attest_b_versions(&w, &work, 2..=6);
+    w.git(&work, &["checkout", "-q", "b6"]);
+    for v in 2..=5 {
+        w.git(&work, &["push", "-q", "origin", &format!("b{v}")]);
+    }
+    let off = [("VCI_STORE_AUTO_PRUNE", "0")];
+    let out = w.vci_env(&work, &["push", "--remote", "origin"], &off);
+    assert!(out.status.success());
+    // The hdr of b's run on b2 (only that run names it).
+    let hdr_of = |dir: &Path, branch: &str| -> String {
+        let tree = w.git(dir, &["rev-parse", &format!("{branch}^{{tree}}")]);
+        let e = AttestStore::new(&store_for(dir))
+            .list(Some(B))
+            .unwrap()
+            .into_iter()
+            .find(|e| e.tree.as_deref() == Some(&tree[..16]))
+            .unwrap();
+        let hdrs: BTreeSet<String> = AttestStore::new(&store_for(dir))
+            .reader()
+            .unwrap()
+            .object_rows()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == vci_core::ObjectKind::Hdr)
+            .map(|r| r.id)
+            .collect();
+        match vci_store::record_object_refs(&e.bytes) {
+            vci_store::ObjectRefs::Named(ids) => {
+                ids.into_iter().find(|id| hdrs.contains(id)).unwrap()
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    let hdr2 = hdr_of(&work, "b2");
+    let on_remote = |id: &str| {
+        w.git(
+            &w.remote,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "--full-tree",
+                "refs/meta/main",
+            ],
+        )
+        .lines()
+        .any(|l| l.starts_with(&format!("project/vci/object/1/{id}/")))
+    };
+    assert!(on_remote(&hdr2));
+
+    // Another clone runs b on b2's content again (on its own commit) and
+    // publishes first.
+    let other = w.base.join("other");
+    w.git(
+        &w.base,
+        &["clone", "-q", w.remote.to_str().unwrap(), "other"],
+    );
+    w.vci_ok(&other, &["fetch", "--remote", "origin"]);
+    w.git(&other, &["checkout", "-q", "-b", "again", "origin/b2"]);
+    w.git(&other, &["commit", "-q", "--allow-empty", "-m", "again"]);
+    w.run(&other, &[B], &w.trusted);
+    let out = w.vci_env(&other, &["push", "--remote", "origin"], &off);
+    assert!(out.status.success());
+    w.git(&other, &["push", "-q", "origin", "again"]);
+
+    // This clone (which has not fetched since) drops b2's and b3's
+    // attestations and the objects only they name: b2's hdr among them.
+    for v in 2..=5 {
+        w.git(&work, &["branch", "-D", &format!("b{v}")]);
+        w.git(
+            &work,
+            &["push", "-q", "origin", "--delete", &format!("b{v}")],
+        );
+    }
+    let out = w.vci_env(
+        &work,
+        &["push", "--remote", "origin"],
+        &[("VCI_STORE_AUTO_PRUNE", "3")],
+    );
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("object(s) no remaining attestation names"),
+        "{err}"
+    );
+    assert!(err.contains("put back"), "{err}");
+    assert!(on_remote(&hdr2), "the other clone's attestation names it");
+    // A fresh clone on the other clone's commit skips b with it.
+    let fresh = w.base.join("fresh");
+    w.git(
+        &w.base,
+        &[
+            "clone",
+            "-q",
+            "--no-local",
+            w.remote.to_str().unwrap(),
+            "fresh",
+        ],
+    );
+    w.git(&fresh, &["checkout", "-q", "again"]);
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    let p = w.plan(&fresh, "main");
+    assert!(p.skip.contains(B), "{p:?}");
+}
+
+/// An attestation issued longer ago than the longest `max_ttl` of
+/// `vci.toml` (30 days here) is expired or refused by every plan: a push
+/// removes it from its key alone (2.11), and keeps the others;
+/// `VCI_STORE_AUTO_PRUNE=0` keeps it.
+#[test]
+fn cargo_push_removes_attestations_older_than_the_longest_max_ttl() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.run(&work, &[B, C], &w.trusted);
+    // c's attestation as if issued 31 days ago (its key's hint).
+    let repo = store_for(&work);
+    let st = AttestStore::new(&repo);
+    let c = st.list(Some(C)).unwrap().pop().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let hint = vci_git::KeyHint {
+        issued: now - 31 * 86_400,
+        tree: c.tree.clone(),
+    };
+    st.put_hinted(C, &c.signer, &c.storage_key, Some(&hint), &c.bytes)
+        .unwrap();
+    assert_eq!(st.list(Some(C)).unwrap().len(), 1, "replaced");
+    let out = w.vci_env(
+        &work,
+        &["push", "--remote", "origin"],
+        &[("VCI_STORE_AUTO_PRUNE", "0")],
+    );
+    assert!(out.status.success());
+    assert_eq!(st.list(Some(C)).unwrap().len(), 1);
+    let out = w.vci(&work, &["push", "--remote", "origin"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("vci: removed 1 of 2 attestation(s): issued more than 30d ago"),
+        "{err}"
+    );
+    assert!(st.list(Some(C)).unwrap().is_empty());
+    assert_eq!(st.list(Some(B)).unwrap().len(), 1);
+    assert_eq!(published(&w, "after", C), 0);
+    assert_eq!(published(&w, "after-b", B), 1);
+}
+
+/// In CI, a push publishes the store as one commit once the fetched
+/// metadata history is longer than `[store] history_max_commits` (2.11; a
+/// share of half of it more per job, none here with a limit of 1), as `vci
+/// prune` does; outside CI, or with `VCI_STORE_AUTO_PRUNE=0`, it pushes on
+/// top. A clone that fetched the old history merges onto the new one.
+#[test]
+fn cargo_ci_push_rewrites_a_long_history() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    for u in [B, C, D] {
+        w.run(&work, &[u], &w.trusted);
+        w.vci_ok(&work, &["push", "--remote", "origin"]);
+    }
+    let history = || -> u32 {
+        w.git(&w.remote, &["rev-list", "--count", "refs/meta/main"])
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let before = history();
+    assert!(before >= 3, "{before}");
+    let old = w.base.join("old");
+    w.git(&w.base, &["clone", "-q", w.remote.to_str().unwrap(), "old"]);
+    w.vci_ok(&old, &["fetch", "--remote", "origin"]);
+    let max = ("VCI_STORE_HISTORY_MAX_COMMITS", "1");
+    // Outside CI, and switched off: on top.
+    w.run(&work, &[A_LIB], &w.trusted);
+    let out = w.vci_env(&work, &["push", "--remote", "origin"], &[max]);
+    assert!(out.status.success());
+    let out = w.vci_env(
+        &work,
+        &["push", "--remote", "origin"],
+        &[max, ("CI", "true"), ("VCI_STORE_AUTO_PRUNE", "0")],
+    );
+    assert!(out.status.success());
+    assert_eq!(history(), before + 1);
+    // In CI.
+    w.run(&work, &[A_DOC], &w.trusted);
+    let out = w.vci_env(
+        &work,
+        &["push", "--remote", "origin"],
+        &[max, ("CI", "true")],
+    );
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("publishing the store as one commit")
+            && err.contains("vci: published the store as one commit"),
+        "{err}"
+    );
+    assert_eq!(history(), 1);
+    // The old clone merges onto it and still skips every unit.
+    w.vci_ok(&old, &["fetch", "--remote", "origin"]);
+    let p = w.plan(&old, "main");
+    for u in [A_LIB, A_DOC, B, C, D] {
+        assert!(p.skip.contains(u), "{u}: {p:?}");
+    }
+}
+
 // ---- manifests by reference (vci 1.9.0) -----------------------------------
 
 /// The stored statements of `test_id`, as signed (no manifest inlined).

@@ -17,6 +17,7 @@
 //! [git-meta]: https://git-meta.com/
 
 mod cmd;
+pub mod gc;
 pub mod meta;
 mod repo;
 mod store;

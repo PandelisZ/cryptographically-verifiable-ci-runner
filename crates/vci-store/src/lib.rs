@@ -199,11 +199,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use key::{
-    KEY_PREFIX, MANIFEST_PREFIX, ManifestRef, OBJECT_PREFIX, ObjectRefs, RUN_STATE_PREFIX,
-    attestation_key, attestation_key_hinted, envelope_manifest_ref, hint_segment, manifest_key,
-    object_key, parse_key, parse_key_hint, parse_manifest_key, parse_object_key,
-    parse_run_state_key, record_object_refs, run_state_key, run_state_prefix, target_label,
-    test_key,
+    KEY_PREFIX, MANIFEST_PREFIX, ManifestRef, OBJECT_PREFIX, ObjectRefs, RUN_OBJECT_PREFIX,
+    RUN_STATE_PREFIX, attestation_key, attestation_key_hinted, envelope_manifest_ref, hint_segment,
+    manifest_key, object_key, parse_key, parse_key_hint, parse_manifest_key, parse_object_key,
+    parse_run_object_key, parse_run_state_key, record_object_refs, run_object_key, run_state_key,
+    run_state_prefix, target_label, test_key,
 };
 
 pub mod credential;
@@ -502,6 +502,30 @@ impl Columns {
         }
         Ok(())
     }
+}
+
+/// What [`AttestationStore::collect_objects`] found and removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Collected {
+    /// hdr, tables and shape objects removed: no remaining record can name
+    /// them.
+    pub objects: usize,
+    /// State objects removed: no remaining record's run names them, or the
+    /// newest run that did was issued longer ago than the state TTL.
+    pub state: usize,
+    /// Run links (run-object and run-state) removed: no record of their
+    /// run remains.
+    pub links: usize,
+    /// Remaining records whose run wrote no run-object links (a vci before
+    /// 2.11, or a key without a hint).
+    pub legacy: usize,
+    /// Of those, the ones whose value is not here: while there is one, no
+    /// hdr, tables or shape object is removed (it may name any of them).
+    pub legacy_unread: usize,
+    /// Objects the rules would remove but that were put or named again
+    /// since the collection began (a run beside it), left for the next
+    /// push.
+    pub touched: usize,
 }
 
 /// A listed format-3 record and the shape object its descriptor names: the
@@ -1967,6 +1991,55 @@ pub trait AttestationStore: Send + Sync {
         Ok(0)
     }
 
+    /// Say that the run whose records carry these key hints and this
+    /// signer wrote (or named again) these objects, on a store that keeps
+    /// no listing columns (git-meta, vci 2.11: a run-object link,
+    /// [`key::run_object_key`], for each hint and object), inside the batch
+    /// with the run's objects and records, so that
+    /// [`AttestationStore::collect_objects`] can tell from keys alone which
+    /// objects the remaining records may name. Store data: it decides what
+    /// a push keeps, never a verdict. Returns how many links were not
+    /// stored before. Every id is validated first.
+    ///
+    /// Default: nothing (a store with [`Caps::columns`] keeps the ids in the
+    /// record's columns), `Ok(0)`.
+    ///
+    /// Used by: run.rs, after the run's objects and before its records.
+    fn put_run_objects(
+        &self,
+        hints: &[KeyHint],
+        signer: &str,
+        objects: &[(vci_core::ObjectKind, &str)],
+    ) -> Result<usize, StoreError> {
+        key::check_signer(signer)?;
+        for (_, id) in objects {
+            key::check_object_id(id)?;
+        }
+        let _ = hints;
+        Ok(0)
+    }
+
+    /// Remove, from keys and local data alone (no value fetched), the
+    /// format-3 objects no remaining record can name and the run links of
+    /// runs none of whose records remain, and the state objects older than
+    /// `state_older_than` (git-meta, vci 2.11: what a push does before it
+    /// publishes, [`Collected`] says what). Never an object a remaining
+    /// record names: when a record whose run wrote no run-object links (a
+    /// vci before 2.11) remains and its value is not here, no hdr, tables or
+    /// shape object is removed.
+    ///
+    /// Default: nothing (a store whose `vci push` publishes nothing; `vci
+    /// prune` applies the orphan rule there).
+    ///
+    /// Used by: `vci push` and `vci ci --push`, before the push.
+    fn collect_objects(
+        &self,
+        state_older_than: std::time::Duration,
+    ) -> Result<Collected, StoreError> {
+        let _ = state_older_than;
+        Ok(Collected::default())
+    }
+
     /// The error every default of the objects section returns.
     #[doc(hidden)]
     fn objects_unsupported(&self) -> StoreError {
@@ -2599,6 +2672,9 @@ pub mod key {
     /// Key namespace of the run-state links of a backend without listing
     /// columns (git-meta, vci 2.10): [`run_state_key`].
     pub const RUN_STATE_PREFIX: &str = "vci:run-state";
+    /// Key namespace of the run-object links of a backend without listing
+    /// columns (git-meta, vci 2.11): [`run_object_key`].
+    pub const RUN_OBJECT_PREFIX: &str = "vci:run-object";
     /// Length of an object id: 32 bytes of BLAKE3 as lowercase hex.
     pub const OBJECT_ID_LEN: usize = 64;
     /// Length of a signer id.
@@ -2753,6 +2829,48 @@ pub mod key {
     /// chooses which state object the failure text loads, never a verdict.
     pub fn run_state_key(shape: &str, hint: &KeyHint, state: &str) -> String {
         format!("{}{state}", run_state_prefix(shape, hint))
+    }
+
+    /// The key of a run-object link (vci 2.11, git-meta, which keeps no
+    /// listing columns): `vci:run-object:<hint>:<signer>:<kind>:<object
+    /// id>`, which says that the run whose records carry this hint and this
+    /// signer in their keys wrote (or named again) this object. A run writes
+    /// one for each of its objects (hdr, tables, shape, state) in the batch
+    /// that stores its records, so that a push decides from keys alone which
+    /// objects a remaining record may name: those of the runs some record
+    /// of which remains. Store data: it decides what a push keeps, never a
+    /// verdict, and its value is never read.
+    pub fn run_object_key(
+        hint: &KeyHint,
+        signer: &str,
+        kind: vci_core::ObjectKind,
+        id: &str,
+    ) -> String {
+        format!(
+            "{RUN_OBJECT_PREFIX}:{}:{signer}:{}:{id}",
+            hint_segment(hint),
+            kind as u8
+        )
+    }
+
+    /// (hint segment, signer, kind, object id) of a run-object link's key
+    /// ([`run_object_key`]); any other key: `None`. The hint is returned as
+    /// its segment ([`hint_segment`]), the form a record's key carries.
+    pub fn parse_run_object_key(key: &str) -> Option<(&str, &str, vci_core::ObjectKind, &str)> {
+        let rest = key.strip_prefix(RUN_OBJECT_PREFIX)?.strip_prefix(':')?;
+        let mut parts = rest.split(':');
+        let (Some(hint), Some(signer), Some(kind), Some(id), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return None;
+        };
+        parse_hint(hint)?;
+        let kind = super::object_kind(kind.parse::<u8>().ok()?)?;
+        (is_signer_id(signer) && is_object_id(id)).then_some((hint, signer, kind, id))
     }
 
     /// (shape id, hint, state id) of a run-state link's key

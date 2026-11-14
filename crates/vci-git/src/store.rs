@@ -595,6 +595,104 @@ impl AttestationStore for GitMetaStore {
         Ok(self.attest_store().put_run_state_links(&links)?)
     }
 
+    /// A run-object link per hint and object (inside the open batch, with
+    /// the run's objects and records), so that
+    /// [`AttestationStore::collect_objects`] finds from keys alone which
+    /// objects the run's records may name.
+    fn put_run_objects(
+        &self,
+        hints: &[vci_store::KeyHint],
+        signer: &str,
+        objects: &[(ObjectKind, &str)],
+    ) -> Result<usize, StoreError> {
+        key::check_signer(signer)?;
+        for (_, id) in objects {
+            key::check_object_id(id)?;
+        }
+        let keys: BTreeSet<String> = hints
+            .iter()
+            .flat_map(|h| {
+                objects
+                    .iter()
+                    .map(move |(k, id)| vci_store::run_object_key(h, signer, *k, id))
+            })
+            .collect();
+        let keys: Vec<String> = keys.into_iter().collect();
+        Ok(self.attest_store().put_run_object_links(&keys)?)
+    }
+
+    /// [`crate::gc::decide`] over the store's keys (one listing each of the
+    /// attestation keys, the run links and the object rows, on a pooled
+    /// reader), reading the values of the legacy records only when every
+    /// one is here (local reads, at most [`crate::gc::LEGACY_READS_MAX`]);
+    /// then what it chose removed, each only if its row was not written
+    /// since the listing began ([`AttestStore::remove_project_keys_untouched`]).
+    fn collect_objects(
+        &self,
+        state_older_than: Duration,
+    ) -> Result<vci_store::Collected, StoreError> {
+        let began = now_ms();
+        let keys = self.with_reader(Reader::gc_keys)?;
+        let ttl = i64::try_from(state_older_than.as_secs()).unwrap_or(i64::MAX);
+        let d = crate::gc::decide(
+            &keys,
+            began / 1000,
+            ttl,
+            crate::gc::run_grace_secs(),
+            |legacy| {
+                let wanted: BTreeSet<&str> = legacy.iter().copied().collect();
+                let read = self
+                    .with_reader(|r| r.all_reading(|k| wanted.contains(k)))
+                    .ok()?;
+                let mut out = BTreeSet::new();
+                for e in read.iter().filter(|e| wanted.contains(e.key.as_str())) {
+                    if e.error.is_some() || e.bytes.is_empty() {
+                        return None;
+                    }
+                    match key::record_object_refs(&e.bytes) {
+                        key::ObjectRefs::Named(ids) => out.extend(ids),
+                        key::ObjectRefs::FormatOne => {}
+                        key::ObjectRefs::Unknown => return None,
+                    }
+                }
+                Some(out)
+            },
+        );
+        drop(keys);
+        if vci_core::metrics::on() {
+            vci_core::timing_line!(
+                "collect objects: list the keys and decide: {:.2}s ({} objects, {} state objects, {} links to remove)",
+                (now_ms() - began) as f64 / 1000.0,
+                d.objects.len(),
+                d.state.len(),
+                d.links.len()
+            );
+        }
+        let st = self.attest_store();
+        let mut out = vci_store::Collected {
+            legacy: d.legacy,
+            legacy_unread: d.legacy_unread,
+            ..vci_store::Collected::default()
+        };
+        let (n, t) = st.remove_project_keys_untouched(d.objects, began)?;
+        out.objects = n;
+        out.touched += t;
+        let (n, t) = st.remove_project_keys_untouched(d.state, began)?;
+        out.state = n;
+        out.touched += t;
+        let (n, t) = st.remove_project_keys_untouched(d.links, began)?;
+        out.links = n;
+        out.touched += t;
+        if vci_core::metrics::on() {
+            vci_core::timing_line!(
+                "collect objects: remove: {:.2}s",
+                (now_ms() - began) as f64 / 1000.0
+            );
+        }
+        self.refresh_readers();
+        Ok(out)
+    }
+
     /// git-meta's log rows older than the last materialization (or the
     /// one an open serialization journal recorded) and a day, then the
     /// free pages ([`AttestStore::compact_store`]). The pooled

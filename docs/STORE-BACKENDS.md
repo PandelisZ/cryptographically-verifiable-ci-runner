@@ -55,6 +55,10 @@ Built and in use (vci 2.8.0):
   its objects on a store without columns), scenario c43; the plan loads state objects only after its verdicts, for
   the units that run, within `[store] plan_states` and `plan_states_mib` (section 4, "Objects and columns"; section
   14; section 15, git-meta, "Run-state links").
+- **A push that cleans the store** (2.11): `put_run_objects` (a run-object link per hint and object, written by
+  `vci run` beside its objects and records on a store without columns; default nothing) and `collect_objects` (what
+  `vci push` removes before it publishes, from keys and local values only; default nothing): section 15, git-meta,
+  "Run-object links".
 - **Round 2's objects in the candidates' round trip** (2.10.1): `run_objects` (the objects a record's run wrote, from
   keys alone: git-meta's run-state links by the key's hint, and the objects the metadata commit that added a record
   not fetched yet added) and `Prefetch::UnitsWithObjects` (the units and those objects in one round trip); the plan's
@@ -2134,6 +2138,22 @@ the time it was last put here, or fetched (the merge marks a fetched row with th
   with the last of them.
 - `columns` is the default: `Columns::default()` for every entry (the hint is the key; the columns a put passes are
   ignored).
+- **Run-object links (2.11).** `put_run_objects(hints, signer, objects)` writes, inside the run's batch after its
+  objects and before its records, one string value `1` on the `project` target per hint and object of the run (hdr,
+  tables, shape and state, whether the run put the object or found it stored) under
+  `vci:run-object:<hint>:<signer>:<kind>:<object id>` (`key::run_object_key`; the hint and signer as the run's records'
+  keys carry them). A record names only objects of its run, so the objects the records whose keys carry
+  `(hint, signer)` may name are among those that run's links name. `collect_objects(state_ttl)` (`vci_git::gc`) lists
+  the attestation keys (and whether each value is here), the run-object and run-state links and the object rows,
+  values not read, and removes the hdr, tables and shape objects no link of a run with a record left names (nor a
+  run-state link whose hint a record carries); none while a record whose `(hint, signer)` has no link (a vci before
+  2.11, or a key without a hint) remains whose value is not here (with every such value here, at most 10,000, it
+  reads them and keeps what they name); the state objects no such link names or whose newest such link's hint is
+  older than `state_ttl`; and the links of runs with no record left. A run whose hint was issued within the last hour
+  counts as having records (`VCI_STORE_RUN_GRACE_SECS`). Each row is removed only when it was last written before the
+  collection began, checked in the delete's write transaction (an idempotent `put_objects` moves the row's time). The
+  merge of a push or fetch puts back an object this clone deleted that a link of a run with a record left names
+  (`restore_referenced_objects`, keys only), besides those the records whose values are here name (2.10).
 - **Run-state links (2.10).** No signed field names a run's state object and git-meta keeps no `state_obj` column,
   so before 2.10 nothing on git-meta said which state object a record's run wrote, and a plan could never name a
   changed input of a format-3 record there (`entry: changed (attested hash not loaded)`: 477,407 of 500,784 Rails
