@@ -277,6 +277,18 @@ jobs:
           cargo doc --no-deps --locked -p vci-store -p vci-store-sqlite -p vci-store-postgres -p vci-store-libsql
           cargo doc --no-deps --locked -p vci-store --features conformance
 
+  # The unit tests of the crates with platform-specific code, on Linux. They
+  # are written on macOS laptops and nothing else here ran them: a
+  # Linux-only test of 2.11.1 (a node:test file's process ends when vci is
+  # killed) had never run anywhere before this job.
+  unit-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Unit tests of vci-adapter and vci-core
+        run: cargo test --locked -p vci-adapter -p vci-core --lib
+
   # The command line on each store, end to end (crates/vci-cli/tests/
   # store_select.rs, store_backends.rs and store_credential.rs): selection,
   # secrets kept out of every test's environment, fail open, run, plan,
