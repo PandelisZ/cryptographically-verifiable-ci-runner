@@ -4687,6 +4687,17 @@ impl<'a> AttestStore<'a> {
             .collect())
     }
 
+    /// Whether the store has no value row at all (or cannot say: `false`).
+    fn store_has_no_rows(&self) -> bool {
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return false;
+        };
+        db.query_row("SELECT NOT EXISTS (SELECT 1 FROM metadata)", [], |r| {
+            r.get::<_, bool>(0)
+        })
+        .unwrap_or(false)
+    }
+
     /// Point the store's rows for `entries` (key -> blob id in `commit`'s
     /// tree) at those values, reading none that is not here: a blob in the
     /// object database is stored as git-meta's merge stores the value (up to
@@ -4702,8 +4713,27 @@ impl<'a> AttestStore<'a> {
         now: i64,
         inline_max: usize,
     ) -> Result<usize, GitError> {
+        Ok(self
+            .mark_values_gated(entries, commit, now, inline_max, || Ok(true))?
+            .unwrap_or(0))
+    }
+
+    /// [`AttestStore::mark_values`], its rows committed only when `gate`
+    /// (called once, after they are written and before the commit) says so:
+    /// `Ok(None)` when it said no and nothing was written. The merge from
+    /// paths writes them while the deletion records it applies next are
+    /// fetched (2.11: a round trip less before a fresh clone's first
+    /// plan), and keeps the store as it was when they cannot be read.
+    fn mark_values_gated(
+        &self,
+        entries: &BTreeMap<Key, String>,
+        commit: &str,
+        now: i64,
+        inline_max: usize,
+        gate: impl FnOnce() -> Result<bool, GitError>,
+    ) -> Result<Option<usize>, GitError> {
         if entries.is_empty() {
-            return Ok(0);
+            return Ok(gate()?.then_some(0));
         }
         let oids: BTreeSet<String> = entries.values().cloned().collect();
         let sizes = self.present_sizes(&oids)?;
@@ -4718,7 +4748,42 @@ impl<'a> AttestStore<'a> {
                 "the git-meta store does not exist".to_owned(),
             ));
         };
-        let tx = db.unchecked_transaction().map_err(|e| sql_err(&path, e))?;
+        // Taken for writing at once (waiting for another writer as any
+        // write does), so that what is read below is what is written over.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| sql_err(&path, e))?;
+        // A table without a row has none of a key to delete (a fresh
+        // clone's first merge: ~95,000 rows, three deletes each).
+        let holds = |table: &str| -> Result<bool, GitError> {
+            tx.query_row(&format!("SELECT EXISTS (SELECT 1 FROM {table})"), [], |r| {
+                r.get::<_, bool>(0)
+            })
+            .map_err(|e| sql_err(&path, e))
+        };
+        let deletes: Vec<&str> = [
+            (
+                "list_values",
+                "DELETE FROM list_values WHERE metadata_id IN
+                 (SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3)",
+            ),
+            (
+                "set_values",
+                "DELETE FROM set_values WHERE metadata_id IN
+                 (SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3)",
+            ),
+            (
+                "tombstones",
+                "DELETE FROM tombstones WHERE tombstone_type = 'metadata'
+                 AND target_type = ?1 AND target_value = ?2 AND key = ?3",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(table, sql)| match holds(table) {
+            Ok(false) => None,
+            _ => Some(sql),
+        })
+        .collect();
         let mut promised = 0;
         for (k, oid) in entries {
             let here = sizes.contains_key(oid);
@@ -4738,14 +4803,17 @@ impl<'a> AttestStore<'a> {
                 (None, false) => ("", false),
             };
             let (ty, tv, key) = (k.target_type.as_str(), &k.target_value, &k.key);
-            tx.execute(
+            // Prepared once for every row (2.11: a fresh clone's first fetch
+            // writes ~105,000 rows of a store shaped like vex's).
+            tx.prepare_cached(
                 "INSERT INTO metadata (target_type, target_value, key, value, value_type, last_timestamp, is_git_ref, is_promised, promised_commit, source_ref)
                  VALUES (?1, ?2, ?3, ?4, 'string', ?5, ?6, ?7, ?8, NULL)
                  ON CONFLICT(target_type, target_value, key) DO UPDATE
                  SET value = excluded.value, value_type = 'string', last_timestamp = excluded.last_timestamp,
                      is_git_ref = excluded.is_git_ref, is_promised = excluded.is_promised,
                      promised_commit = excluded.promised_commit, source_ref = NULL",
-                rusqlite::params![
+            )
+            .and_then(|mut stmt| stmt.execute(rusqlite::params![
                     ty,
                     tv,
                     key,
@@ -4754,23 +4822,21 @@ impl<'a> AttestStore<'a> {
                     git_ref,
                     !here,
                     if here { None } else { Some(commit) },
-                ],
-            )
+                ]))
             .map_err(|e| sql_err(&path, e))?;
-            for sql in [
-                "DELETE FROM list_values WHERE metadata_id IN
-                 (SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3)",
-                "DELETE FROM set_values WHERE metadata_id IN
-                 (SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3)",
-                "DELETE FROM tombstones WHERE tombstone_type = 'metadata'
-                 AND target_type = ?1 AND target_value = ?2 AND key = ?3",
-            ] {
-                tx.execute(sql, rusqlite::params![ty, tv, key])
+            for sql in &deletes {
+                tx.prepare_cached(sql)
+                    .and_then(|mut stmt| stmt.execute(rusqlite::params![ty, tv, key]))
                     .map_err(|e| sql_err(&path, e))?;
             }
         }
+        // Dropped without a commit (a gate that fails or says no): rolled
+        // back.
+        if !gate()? {
+            return Ok(None);
+        }
         tx.commit().map_err(|e| sql_err(&path, e))?;
-        Ok(promised)
+        Ok(Some(promised))
     }
 
     /// Which of `oids` the local object database holds (nothing is fetched:
@@ -4805,6 +4871,11 @@ impl<'a> AttestStore<'a> {
             }
             input.extend_from_slice(o.as_bytes());
             input.push(b'\n');
+        }
+        if std::env::var_os("VCI_PRESENT_WITH_GIT").is_none()
+            && let Some(sizes) = self.present_sizes_in_process(oids)
+        {
+            return Ok(sizes);
         }
         let listed = self
             .repo
@@ -4851,6 +4922,42 @@ impl<'a> AttestStore<'a> {
                 }
             })
             .collect())
+    }
+
+    /// [`AttestStore::present_sizes`] read in this process from the object
+    /// database as it is now (2.11): the pack indexes are read once, and an
+    /// object they do not hold is absent at once. git itself reads the pack
+    /// directory again for every object it does not find before it says
+    /// so, and a fresh clone's first fetch asked about the ~95,000 values
+    /// of a store shaped like vex's, none of them here: 8 s of `git
+    /// rev-list` in a 20 s plan. Nothing is ever fetched. `None` (the
+    /// repository or an object cannot be read here) sends the caller to
+    /// git.
+    fn present_sizes_in_process(&self, oids: &BTreeSet<String>) -> Option<BTreeMap<String, u64>> {
+        use gix::objs::FindHeader as _;
+        let repo = gix::open_opts(
+            self.repo.root().as_std_path(),
+            gix::open::Options::isolated(),
+        )
+        .ok()?;
+        let mut odb = repo.objects.clone();
+        // An object the indexes read now do not hold is not here: no
+        // second look at the disk for it (the default looks again).
+        odb.refresh_never();
+        let mut out = BTreeMap::new();
+        for o in oids {
+            let id = gix::ObjectId::from_hex(o.as_bytes()).ok()?;
+            match odb.try_header(&id) {
+                Ok(Some(h)) => {
+                    if h.kind == gix::objs::Kind::Blob {
+                        out.insert(o.clone(), h.size);
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+        }
+        Some(out)
     }
 
     /// Download the blobs `oids` from `remote` as a blobless clone fetches a
@@ -5458,15 +5565,31 @@ impl<'a> AttestStore<'a> {
         remote: &str,
         oids: &BTreeSet<String>,
     ) -> Result<(BTreeSet<String>, usize, Option<String>), GitError> {
+        self.ensure_blobs_with(remote, oids, true)
+    }
+
+    /// [`AttestStore::ensure_blobs`]; without `consolidate`, the packs the
+    /// fetch adds are left for a later fetch to merge (one that runs while
+    /// other threads read the object database).
+    fn ensure_blobs_with(
+        &self,
+        remote: &str,
+        oids: &BTreeSet<String>,
+        consolidate: bool,
+    ) -> Result<(BTreeSet<String>, usize, Option<String>), GitError> {
         let mut have = self.present(oids)?;
         let missing: BTreeSet<String> = oids.difference(&have).cloned().collect();
         if missing.is_empty() {
             return Ok((have, 0, None));
         }
-        let error = self
-            .fetch_blobs(remote, &missing.iter().collect::<Vec<_>>())
-            .err()
-            .map(|e| e.to_string());
+        let missing_list: Vec<&String> = missing.iter().collect();
+        let fetched = if consolidate {
+            self.fetch_blobs(remote, &missing_list)
+        } else {
+            VALUE_ROUND_TRIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.fetch_blobs_unpacked(remote, &missing_list, true)
+        };
+        let error = fetched.err().map(|e| e.to_string());
         let now = self.present(&missing)?;
         let fetched = now.len();
         have.extend(now);
@@ -7581,13 +7704,47 @@ impl<'a> AttestStore<'a> {
     /// merge, done from the trees' paths). Same refs and result as `git meta
     /// pull`.
     pub fn fetch(&self, remote: Option<&str>) -> Result<FetchOutcome, GitError> {
+        self.fetch_ahead(remote, None)
+    }
+
+    /// [`AttestStore::fetch`] beside a plan that tells `ahead` which units
+    /// it reads first (vci 2.11, [`vci_store::Exchange::fetch_ahead`]): once
+    /// the fetched tip's keys are listed, the values of the candidates the
+    /// plan will choose among them, then the verdict objects those values
+    /// name, are downloaded in a thread of their own while the merge runs
+    /// (two round trips that a fresh clone's plan made one after the other
+    /// after the fetch). Only blobs are downloaded there: the store's rows
+    /// are the merge's, and the plan's own fetches find the blobs here and
+    /// download nothing. Best effort: a failure there is the plan's to meet
+    /// again, as before.
+    pub fn fetch_ahead(
+        &self,
+        remote: Option<&str>,
+        ahead: Option<&vci_store::ReadsAhead>,
+    ) -> Result<FetchOutcome, GitError> {
+        // However the fetch ends, the plan's units are no longer waited
+        // for.
+        struct Close<'r>(Option<&'r vci_store::ReadsAhead>);
+        impl Drop for Close<'_> {
+            fn drop(&mut self) {
+                if let Some(a) = self.0 {
+                    a.close();
+                }
+            }
+        }
+        let _close = Close(ahead);
         let _lock = self.exchange_lock()?;
         let name = self.ensure_remote(remote)?;
         let mut attempt = 0;
         loop {
             attempt += 1;
             let mut report = Report::default();
-            match self.fetch_named(&name, &mut report, false) {
+            let fetched = std::thread::scope(|scope| {
+                // Closed before the scope waits for the thread below.
+                let _closing = Close(ahead);
+                self.fetch_named_ahead(&name, &mut report, false, ahead.map(|a| (scope, a)))
+            });
+            match fetched {
                 Ok(round) => {
                     return Ok(FetchOutcome {
                         remote: name,
@@ -7609,6 +7766,21 @@ impl<'a> AttestStore<'a> {
         name: &str,
         report: &mut Report,
         for_push: bool,
+    ) -> Result<Round, GitError> {
+        self.fetch_named_ahead(name, report, for_push, None)
+    }
+
+    /// [`AttestStore::fetch_named`], downloading in a thread of `scope` what
+    /// `ahead` says the plan reads first (see [`AttestStore::fetch_ahead`]).
+    fn fetch_named_ahead<'scope, 'env>(
+        &'env self,
+        name: &'env str,
+        report: &mut Report,
+        for_push: bool,
+        ahead: Option<(
+            &'scope std::thread::Scope<'scope, 'env>,
+            &'env vci_store::ReadsAhead,
+        )>,
     ) -> Result<Round, GitError> {
         let ns = self.namespace()?;
         let remote_ref = format!("refs/{ns}/main");
@@ -7803,6 +7975,10 @@ impl<'a> AttestStore<'a> {
                 ));
             }
             remote_deleted = snap.tombstones.clone();
+            if !side && let Some((scope, ahead)) = ahead {
+                let blobs = snap.value_blobs.clone();
+                scope.spawn(move || self.download_ahead(name, ahead, &blobs));
+            }
             tip_snap = Some(snap);
         }
         let t = std::time::Instant::now();
@@ -8106,6 +8282,122 @@ impl<'a> AttestStore<'a> {
             found,
             deleted_here,
         })
+    }
+
+    /// The download of [`AttestStore::fetch_ahead`]: once `ahead` names the
+    /// plan's units (or never, once the fetch closes it), the blobs of the
+    /// candidates its `choose` picks among each unit's keys in `blobs` (the
+    /// fetched tip's values, key -> blob id), then the blobs of the objects
+    /// `objects_of` finds in those values, one `git fetch` each, the packs
+    /// left for a later fetch to merge. Nothing else is touched.
+    fn download_ahead(
+        &self,
+        remote: &str,
+        ahead: &vci_store::ReadsAhead,
+        blobs: &BTreeMap<Key, String>,
+    ) {
+        let Some(units) = ahead.wait() else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        // Each unit's candidates as the store will list them: its keys under
+        // its target, in key order.
+        // (target type, target value, test key) -> its keys and blob ids.
+        type Unit = (TargetType, String, String);
+        let mut by_unit: BTreeMap<Unit, Vec<(&Key, &String)>> = BTreeMap::new();
+        for id in &units.test_ids {
+            let t = target_for(id);
+            by_unit.insert(
+                (
+                    t.target_type().clone(),
+                    t.value().unwrap_or("").to_owned(),
+                    vci_core::test_key(id),
+                ),
+                Vec::new(),
+            );
+        }
+        for (k, oid) in blobs {
+            let Some((tk, _, _)) = parse_key(&k.key) else {
+                continue;
+            };
+            if let Some(v) =
+                by_unit.get_mut(&(k.target_type.clone(), k.target_value.clone(), tk.to_owned()))
+            {
+                v.push((k, oid));
+            }
+        }
+        let mut chosen: BTreeSet<String> = BTreeSet::new();
+        for (cands, (target_type, target_value, _)) in by_unit.values().zip(by_unit.keys()) {
+            let target = if *target_type == TargetType::Project {
+                Target::project()
+            } else {
+                Target::from_parts(target_type.clone(), Some(target_value.clone()))
+            };
+            let envs: Vec<StoredEnvelope> = cands
+                .iter()
+                .filter_map(|(k, _)| {
+                    let (tk, signer, sk) = parse_key(&k.key)?;
+                    let hint = parse_key_hint(&k.key);
+                    Some(StoredEnvelope {
+                        target: target_label(&target),
+                        key: k.key.clone(),
+                        test_key: tk.to_owned(),
+                        signer: signer.to_owned(),
+                        storage_key: sk.to_owned(),
+                        issued: hint.as_ref().map(|h| h.issued),
+                        tree: hint.and_then(|h| h.tree),
+                        bytes: Vec::new(),
+                        error: None,
+                    })
+                })
+                .collect();
+            for i in (units.choose)(&envs) {
+                if let Some((_, oid)) = cands.get(i) {
+                    chosen.insert((*oid).clone());
+                }
+            }
+        }
+        let Ok((have, _, error)) = self.ensure_blobs_with(remote, &chosen, false) else {
+            return;
+        };
+        let values_secs = started.elapsed().as_secs_f64();
+        // The verdict objects the values name.
+        let read = self.read_blobs(&have).unwrap_or_default();
+        let mut objects: BTreeSet<String> = BTreeSet::new();
+        for b in read.values() {
+            let text = String::from_utf8_lossy(b);
+            let value: String = serde_json::from_str(&text).unwrap_or_else(|_| text.into_owned());
+            for (kind, id) in (units.objects_of)(value.as_bytes()) {
+                let key = Key {
+                    target_type: TargetType::Project,
+                    target_value: String::new(),
+                    key: object_key(kind, &id),
+                };
+                if let Some(oid) = blobs.get(&key) {
+                    objects.insert(oid.clone());
+                }
+            }
+        }
+        let objects_out = self.ensure_blobs_with(remote, &objects, false);
+        if vci_core::metrics::on() {
+            vci_core::timing_line!(
+                "fetch ahead: {} candidate value(s) of {} unit(s){}: {:.2}s; {} object(s) they name{}: {:.2}s",
+                chosen.len(),
+                by_unit.len(),
+                if error.is_some() {
+                    ", the fetch failed"
+                } else {
+                    ""
+                },
+                values_secs,
+                objects.len(),
+                match &objects_out {
+                    Ok((_, _, None)) => "",
+                    _ => ", the fetch failed",
+                },
+                started.elapsed().as_secs_f64() - values_secs
+            );
+        }
     }
 
     /// [`AttestStore::restore_lost_values`] for what `local_ref` lost of
@@ -8819,41 +9111,93 @@ impl<'a> AttestStore<'a> {
             .cloned()
             .collect();
         part("read the stored deletion records and compare");
-        let (have, _, error) = self.ensure_blobs(remote, &oids)?;
-        if let Some(e) = error
-            && changed_tombstones.values().any(|o| !have.contains(o))
-        {
-            return Err(GitError::Meta(format!(
-                "fetching the deletion records of {tracking}: {e}"
-            )));
-        }
-        let read = self.read_blobs(&oids)?;
-        let tombstone = |oid: &String| {
-            read.get(oid)
-                .and_then(|b| serde_json::from_slice::<Tombstone>(b).ok())
-        };
-        let mut tombstones: BTreeMap<Key, Tombstone> = BTreeMap::new();
-        for (k, oid) in &changed_tombstones {
-            let Some(t) = tombstone(oid) else {
-                return fallback(format!(
-                    "the deletion record of {} {} (unreadable)",
-                    target_label(&k.to_target()),
-                    k.key
-                ));
-            };
-            tombstones.insert(k.clone(), t);
-        }
-        // git-meta's parse skips a record it cannot read.
-        let restamped: Vec<(Key, Tombstone)> = restamp
-            .iter()
-            .filter_map(|(k, oid)| tombstone(oid).map(|t| (k.clone(), t)))
-            .filter(|(k, t)| held.get(k) != Some(t))
-            .collect();
-        let changed = values.len() + tombstones.len() + removed.len() + dropped_records.len();
         let inline_max = guarded("reading the store", || store.object_max_size())?;
-        part("fetch and read changed deletion records");
-        let promised = self.mark_values(&values, &to_commit, now, inline_max)?;
-        part("mark the changed values");
+        // Into a store without a row or a local commit (a fresh clone's
+        // first merge), the deletion records are fetched (one round trip)
+        // while the values' rows are written, and the rows committed once
+        // the records are read (2.11: a fresh clone's first fetch of a store
+        // shaped like vex's wrote ~95,000 rows for 1.2 s after a round trip
+        // for its 9,240 records). Into any other, they are fetched first,
+        // as before, so that the store is not held for writing during a
+        // fetch while other writers may use it. Either way, records that
+        // cannot be fetched or read leave the store as it was.
+        let overlap = local.is_none() && held.is_empty() && self.store_has_no_rows();
+        enum Records {
+            Read(BTreeMap<Key, Tombstone>, Vec<(Key, Tombstone)>),
+            Unreadable(String),
+            NotFetched(String),
+        }
+        let mut records: Option<Records> = None;
+        let mut fetch_secs = 0.0;
+        let promised = std::thread::scope(|s| {
+            let fetching = s.spawn(|| {
+                let t = std::time::Instant::now();
+                (self.ensure_blobs_with(remote, &oids, false), t.elapsed())
+            });
+            let mut fetching = Some(fetching);
+            let mut fetched = None;
+            if !overlap && let Some(h) = fetching.take() {
+                fetched = Some(h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+            }
+            self.mark_values_gated(&values, &to_commit, now, inline_max, || {
+                let (got, took) = match (fetched, fetching) {
+                    (Some(f), _) => f,
+                    (None, Some(h)) => h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                    (None, None) => unreachable!("the deletion records' fetch is joined once"),
+                };
+                fetch_secs = took.as_secs_f64();
+                let (have, _, error) = got?;
+                if let Some(e) = error
+                    && changed_tombstones.values().any(|o| !have.contains(o))
+                {
+                    records = Some(Records::NotFetched(e));
+                    return Ok(false);
+                }
+                let read = self.read_blobs(&oids)?;
+                let tombstone = |oid: &String| {
+                    read.get(oid)
+                        .and_then(|b| serde_json::from_slice::<Tombstone>(b).ok())
+                };
+                let mut tombstones: BTreeMap<Key, Tombstone> = BTreeMap::new();
+                for (k, oid) in &changed_tombstones {
+                    let Some(t) = tombstone(oid) else {
+                        records = Some(Records::Unreadable(format!(
+                            "the deletion record of {} {} (unreadable)",
+                            target_label(&k.to_target()),
+                            k.key
+                        )));
+                        return Ok(false);
+                    };
+                    tombstones.insert(k.clone(), t);
+                }
+                // git-meta's parse skips a record it cannot read.
+                let restamped: Vec<(Key, Tombstone)> = restamp
+                    .iter()
+                    .filter_map(|(k, oid)| tombstone(oid).map(|t| (k.clone(), t)))
+                    .filter(|(k, t)| held.get(k) != Some(t))
+                    .collect();
+                records = Some(Records::Read(tombstones, restamped));
+                Ok(true)
+            })
+        })?;
+        let (tombstones, restamped, promised) = match (records, promised) {
+            (Some(Records::Read(t, r)), Some(p)) => (t, r, p),
+            (Some(Records::Unreadable(why)), _) => return fallback(why),
+            (Some(Records::NotFetched(e)), _) => {
+                return Err(GitError::Meta(format!(
+                    "fetching the deletion records of {tracking}: {e}"
+                )));
+            }
+            _ => {
+                return Err(GitError::Meta(format!(
+                    "merging {tracking} from its paths: the deletion records were not read"
+                )));
+            }
+        };
+        let changed = values.len() + tombstones.len() + removed.len() + dropped_records.len();
+        part(&format!(
+            "mark the changed values and fetch and read changed deletion records (the fetch {fetch_secs:.2}s)"
+        ));
         let email = session.email().to_owned();
         // The values deleted now are stamped after the tree's records, as
         // git-meta does; a merge keeps the deletion record its tree holds.

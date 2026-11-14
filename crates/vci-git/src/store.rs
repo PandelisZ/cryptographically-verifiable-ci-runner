@@ -887,6 +887,17 @@ impl Exchange for GitMetaStore {
         Ok(out?)
     }
 
+    /// [`AttestStore::fetch_ahead`]; then the reader pool is emptied.
+    fn fetch_ahead(
+        &self,
+        remote: Option<&str>,
+        ahead: &vci_store::ReadsAhead,
+    ) -> Result<FetchOutcome, StoreError> {
+        let out = self.attest_store().fetch_ahead(remote, Some(ahead));
+        self.refresh_readers();
+        Ok(out?)
+    }
+
     /// [`AttestStore::push`], [`AttestStore::push_rewriting_history`] or
     /// [`AttestStore::push_rewriting_history_longer_than`]; then the
     /// reader pool is emptied.
