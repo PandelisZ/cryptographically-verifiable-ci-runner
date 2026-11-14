@@ -2959,6 +2959,9 @@ pub fn run_units(
                 &vci_adapter::RunHints {
                     last_ms: last_ms.clone(),
                     rails_autoload_lookups: project.autoload_lookups(),
+                    rails_preload_routes: project.rails_inputs
+                        == Some(crate::config::RailsInputs::Loose)
+                        && vci_adapter::preload_routes_wanted(),
                 },
             )?;
             Ok((go_tree, out))
