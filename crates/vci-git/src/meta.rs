@@ -157,18 +157,20 @@ const MOVED_SKIPS: u32 = 30;
 /// How many times [`AttestStore::complete_tree`] asks for the subtrees a
 /// fetch of a tree's id left out.
 const COMPLETE_TREE_ROUNDS: usize = 5;
-/// The repack [`AttestStore::consolidate_packs`] runs when the geometric one
-/// fails, as it always does in a partial clone on git before 2.45
-/// (`cannot use internal rev list with --stdin-packs`; Ubuntu 24.04's
-/// 2.43, GitHub's runners). `-A`, never `-a` (2.2.2): `-a -d` deletes the
-/// packed objects no ref reaches, and a value vci wrote is packed while
-/// its local metadata commit reaches it, then unreferenced when vci
-/// rewrites that commit (a merge, an undo) before the push that sends it:
-/// every vex job that lost its attestations to `could not fetch <its own
-/// value> from promisor remote` (no loose object file left) did so this
-/// way. `-A` turns such objects loose instead; nothing prunes them (vci's
-/// git runs with `gc.auto=0`).
-const REPACK_FALLBACK: &[&str] = &["-A", "-d", "-q"];
+/// A pack larger than this is never merged by
+/// [`AttestStore::merge_small_packs`], the fallback of
+/// [`AttestStore::consolidate_packs`] when the geometric repack fails, as
+/// it always does in a partial clone on git before 2.45 (`cannot use
+/// internal rev list with --stdin-packs`; Ubuntu 24.04's 2.43, GitHub's
+/// runners). Until 2.11 the fallback was `git repack -A -d`, which rewrote
+/// the whole object database: 214 s on a vex runner on 12 November 2026.
+/// The packs a batched value fetch adds are a few MB at most.
+const SMALL_PACK_BYTES: u64 = 32 << 20;
+/// The most bytes of packs [`AttestStore::merge_small_packs`] merges in
+/// one go (the smallest first): what bounds its time, a few seconds.
+const SMALL_PACKS_TOTAL_MAX: u64 = 256 << 20;
+/// Removals per savepoint in [`AttestStore::remove_project_keys_untouched`].
+const REMOVE_CHUNK: usize = 500;
 /// Attempts of a fetch that loses a ref-lock race to another git process.
 const FETCH_ATTEMPTS: u32 = 5;
 /// Project-target settings that make every `git meta serialize` prune.
@@ -1378,6 +1380,86 @@ impl Reader {
             let key = r.map_err(|e| sql_err(path, e))?;
             if key.starts_with(prefix) && vci_store::parse_run_state_key(&key).is_some() {
                 out.push(key);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The run-object links on the `project` target
+    /// ([`vci_store::key::run_object_key`]), each with when it was last put
+    /// or fetched here, values not read (a link not fetched yet is listed
+    /// too: its key says everything). One key range on the store's
+    /// (target, key) index. Keys that do not parse as links are foreign and
+    /// left out.
+    pub fn run_object_links(&self) -> Result<Vec<(String, i64)>, GitError> {
+        let Some((path, db)) = &self.db else {
+            return Ok(Vec::new());
+        };
+        READER_QUERIES.with(|n| n.set(n.get() + 1));
+        let prefix = format!("{}:", vci_store::RUN_OBJECT_PREFIX);
+        let upper = prefix_upper(&prefix);
+        let mut stmt = db
+            .prepare_cached(
+                "SELECT key, last_timestamp FROM metadata
+                 WHERE target_type = ?1 AND target_value = '' AND key >= ?2 AND key < ?3
+                   AND value_type = 'string'",
+            )
+            .map_err(|e| sql_err(path, e))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![TargetType::Project.as_str(), prefix, upper],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .map_err(|e| sql_err(path, e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (key, at) = r.map_err(|e| sql_err(path, e))?;
+            if vci_store::parse_run_object_key(&key).is_some() {
+                out.push((key, at));
+            }
+        }
+        Ok(out)
+    }
+
+    /// What [`crate::gc::decide`] reads: every attestation key, run link
+    /// and object row, values not read.
+    pub fn gc_keys(&self) -> Result<crate::gc::Keys, GitError> {
+        Ok(crate::gc::Keys {
+            records: self.attestation_keys_promised()?,
+            run_object_links: self
+                .run_object_links()?
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect(),
+            run_state_links: self.run_state_keys(&format!("{}:", vci_store::RUN_STATE_PREFIX))?,
+            objects: self.object_rows()?,
+        })
+    }
+
+    /// Every stored attestation's key, on any target, and whether its value
+    /// is not fetched here yet (a promised row), values not read.
+    pub fn attestation_keys_promised(&self) -> Result<Vec<(String, bool)>, GitError> {
+        let Some((path, db)) = &self.db else {
+            return Ok(Vec::new());
+        };
+        READER_QUERIES.with(|n| n.set(n.get() + 1));
+        let prefix = format!("{KEY_PREFIX}:");
+        let mut stmt = db
+            .prepare_cached(
+                "SELECT key, is_promised FROM metadata
+                 WHERE substr(key, 1, ?1) = ?2 AND value_type = 'string'",
+            )
+            .map_err(|e| sql_err(path, e))?;
+        let rows = stmt
+            .query_map(rusqlite::params![prefix.len() as i64, prefix], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+            })
+            .map_err(|e| sql_err(path, e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (key, promised) = r.map_err(|e| sql_err(path, e))?;
+            if parse_key(&key).is_some() {
+                out.push((key, promised));
             }
         }
         Ok(out)
@@ -3148,6 +3230,85 @@ impl<'a> AttestStore<'a> {
         Ok(stored.len())
     }
 
+    /// Store run-object links (vci 2.11: [`vci_store::key::run_object_key`])
+    /// on the `project` target, inside the batch when one is open, as
+    /// [`AttestStore::put_run_state_links`] stores run-state links. The
+    /// value is `1` (never read; one blob for every link). A link already
+    /// stored is left as it is. Returns how many were not stored before.
+    pub fn put_run_object_links(&self, keys: &[String]) -> Result<usize, GitError> {
+        let links: Vec<(String, String)> =
+            keys.iter().map(|k| (k.clone(), "1".to_owned())).collect();
+        self.put_run_state_links(&links)
+    }
+
+    /// Delete these keys of the `project` target (objects, run links), each
+    /// only when its row was last put or fetched before `before` (ms since
+    /// the epoch), checked in the same write transaction as the delete, so
+    /// that a row a run put or named again after a collection began
+    /// (`put_objects` moves an existing object's time to now) stays.
+    /// Tombstones, which `push` publishes. Returns how many were removed and
+    /// how many were left because they had been written since.
+    pub fn remove_project_keys_untouched(
+        &self,
+        keys: Vec<String>,
+        before: i64,
+    ) -> Result<(usize, usize), GitError> {
+        if keys.is_empty() {
+            return Ok((0, 0));
+        }
+        // One write transaction (the batch's), in chunks of savepoints: a
+        // savepoint's statement journal is scanned at the end of each
+        // statement inside it, so one savepoint around 87,000 removals took
+        // 281 s instead of about 3.
+        let guard = self.batch()?;
+        let mut out = (0, 0);
+        for chunk in keys.chunks(REMOVE_CHUNK) {
+            let r = self.in_batch(|db, session, written| {
+                use rusqlite::OptionalExtension as _;
+                let project = Target::project();
+                let now = now_ms();
+                let (mut n, mut touched) = (0, 0);
+                for key in chunk {
+                    let at: Option<i64> = db
+                        .prepare_cached(
+                            "SELECT last_timestamp FROM metadata
+                             WHERE target_type = ?1 AND target_value = '' AND key = ?2",
+                        )
+                        .and_then(|mut st| {
+                            st.query_row(
+                                rusqlite::params![TargetType::Project.as_str(), key],
+                                |r| r.get(0),
+                            )
+                            .optional()
+                        })
+                        .map_err(write_err)?;
+                    match at {
+                        None => {}
+                        Some(at) if at >= before => touched += 1,
+                        Some(_) if remove_key(db, &project, key, session.email(), now)? => {
+                            written.push((project.clone(), key.clone()));
+                            n += 1;
+                        }
+                        Some(_) => {}
+                    }
+                }
+                Ok((n, touched))
+            });
+            match r {
+                Some(r) => {
+                    let (n, t) = r?;
+                    out.0 += n;
+                    out.1 += t;
+                }
+                // No batch could be opened on this thread (another
+                // repository's is): nothing is removed.
+                None => break,
+            }
+        }
+        guard.finish()?;
+        Ok(out)
+    }
+
     /// Delete these run-state links in one session (tombstones, which
     /// `push` publishes). Returns how many existed.
     pub fn remove_run_state_keys(&self, keys: Vec<String>) -> Result<usize, GitError> {
@@ -4875,8 +5036,113 @@ impl<'a> AttestStore<'a> {
                 .unwrap_or(false)
         };
         if !repack(&["--geometric=2", "-d", "-q"]) {
-            let _ = repack(REPACK_FALLBACK);
+            match self.merge_small_packs() {
+                Ok(_) => {}
+                Err(e) => store_note(format!(
+                    "the object database has {} packs, and neither a geometric repack nor merging its small packs worked ({e}); reads may fail once there are more than 32 (`git repack -A -d` merges them all, which can take minutes)",
+                    self.pack_count().unwrap_or(0)
+                )),
+            }
         }
+    }
+
+    /// The fallback of [`AttestStore::consolidate_packs`] (2.11): merge the
+    /// packs of at most [`SMALL_PACK_BYTES`] each, the smallest first and
+    /// at most [`SMALL_PACKS_TOTAL_MAX`] in all, into one pack, with
+    /// `git pack-objects` of exactly their objects (listed from their
+    /// indexes: no traversal, so it works in a partial clone on any git and
+    /// keeps every object, those no ref reaches included, as `repack -A`
+    /// did), then delete them. The new pack is a promisor pack when one of
+    /// them was. A pack with a `.keep` file is left alone, and nothing is
+    /// done while a multi-pack index exists (deleting a pack it names is
+    /// `git repack`'s job). Returns how many packs were merged.
+    fn merge_small_packs(&self) -> Result<usize, GitError> {
+        let dir = self
+            .repo
+            .git()
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects/pack",
+            ])
+            .run_str()?;
+        let dir = Utf8PathBuf::from(dir.trim());
+        if dir.join("multi-pack-index").exists() {
+            return Err(GitError::Meta(
+                "a multi-pack index exists; leaving the packs to `git repack`".to_owned(),
+            ));
+        }
+        let mut packs: Vec<(u64, Utf8PathBuf)> = Vec::new();
+        for e in std::fs::read_dir(&dir)?.flatten() {
+            let Ok(path) = Utf8PathBuf::from_path_buf(e.path()) else {
+                continue;
+            };
+            if path.extension() != Some("pack") || path.with_extension("keep").exists() {
+                continue;
+            }
+            if !path.with_extension("idx").exists() {
+                continue;
+            }
+            let size = e.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+            if size <= SMALL_PACK_BYTES {
+                packs.push((size, path));
+            }
+        }
+        packs.sort();
+        let mut total = 0u64;
+        let chosen: Vec<Utf8PathBuf> = packs
+            .into_iter()
+            .take_while(|(size, _)| {
+                total = total.saturating_add(*size);
+                total <= SMALL_PACKS_TOTAL_MAX
+            })
+            .map(|(_, p)| p)
+            .collect();
+        if chosen.len() < 2 {
+            return Ok(0);
+        }
+        let mut oids = String::new();
+        let mut promisor = false;
+        for p in &chosen {
+            let idx = std::fs::read(p.with_extension("idx"))?;
+            let listing = self.repo.git().arg("show-index").run_with_stdin(&idx)?;
+            for line in String::from_utf8_lossy(&listing).lines() {
+                if let Some(oid) = line.split_whitespace().nth(1) {
+                    oids.push_str(oid);
+                    oids.push('\n');
+                }
+            }
+            promisor |= p.with_extension("promisor").exists();
+        }
+        let out = self
+            .repo
+            .git()
+            .args(["pack-objects", "-q", "--delta-base-offset"])
+            .arg(dir.join("pack").as_str())
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_with_stdin(oids.as_bytes())?;
+        let hash = String::from_utf8_lossy(&out).trim().to_owned();
+        if !is_oid(&hash) {
+            return Err(GitError::Parse(format!(
+                "git pack-objects printed {hash:?}"
+            )));
+        }
+        let new = dir.join(format!("pack-{hash}.pack"));
+        if promisor {
+            std::fs::write(new.with_extension("promisor"), b"")?;
+        }
+        for p in &chosen {
+            if *p == new {
+                continue;
+            }
+            // The pack itself last: a reader that lists the packs between
+            // two of these finds the index of every pack it sees.
+            for ext in ["promisor", "bitmap", "rev", "mtimes", "idx", "pack"] {
+                let _ = std::fs::remove_file(p.with_extension(ext));
+            }
+        }
+        Ok(chosen.len())
     }
 
     /// How many packs the object database has, when that can be read.
@@ -9566,7 +9832,20 @@ impl<'a> AttestStore<'a> {
         // holds read (one it never fetched is not one its plans relied on,
         // as for manifests); one that cannot be read might name any of
         // them, so then every candidate is put back.
-        let referenced = self.referenced_objects(true)?;
+        let mut referenced = self.referenced_objects(true)?;
+        // 2.11: and every object a run-object link of a run with a record
+        // here names (keys only): a record another clone pushed since this
+        // one fetched, whose value is not here, names its objects through
+        // its run's links, so an object this clone's push removed and that
+        // record names is put back.
+        if let Some(r) = referenced.as_mut() {
+            let keys = self.reader()?.gc_keys()?;
+            r.extend(crate::gc::live_named(
+                &keys,
+                now_ms() / 1000,
+                crate::gc::run_grace_secs(),
+            ));
+        }
         let wanted: Vec<&String> = candidates
             .iter()
             .filter(|(_, (_, id))| referenced.as_ref().is_none_or(|r| r.contains(id)))
@@ -11397,16 +11676,18 @@ mod tests {
         );
     }
 
-    /// The fallback repack keeps a value that was packed while a ref
-    /// reached it and unreferenced after (2.2.2; `-a -d` deleted it).
+    /// The fallback of the geometric repack (2.11) merges the small packs
+    /// into one, keeps every object they held (one no ref reaches too:
+    /// 2.2.2's `-a -d` deleted such a value), keeps a promisor pack a
+    /// promisor pack, and leaves a large pack and a kept one alone.
     #[test]
-    fn the_fallback_repack_keeps_a_value_whose_ref_moved_away() {
+    fn the_fallback_merges_only_the_small_packs_and_keeps_every_object() {
         let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
         let git = |args: &[&str], input: Option<&str>| -> String {
             use std::io::Write;
             let mut c = std::process::Command::new("git");
-            c.current_dir(d)
+            c.current_dir(&root)
                 .args(args)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_AUTHOR_NAME", "t")
@@ -11420,6 +11701,7 @@ mod tests {
                 ch.stdin.take().unwrap().write_all(i.as_bytes()).unwrap();
             }
             let out = ch.wait_with_output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
             String::from_utf8_lossy(&out.stdout).trim().to_owned()
         };
         git(&["init", "-q"], None);
@@ -11427,21 +11709,57 @@ mod tests {
             &["commit-tree", &git(&["mktree"], Some("")), "-m", "base"],
             None,
         );
-        git(&["update-ref", "refs/meta/local/main", &base], None);
-        let v = git(&["hash-object", "-w", "--stdin"], Some("a value vci wrote"));
-        let t = git(&["mktree"], Some(&format!("100644 blob {v}\tv\n")));
-        let c = git(&["commit-tree", &t, "-p", &base, "-m", "serialized"], None);
-        git(&["update-ref", "refs/meta/local/main", &c], None);
-        let mut args = vec!["-c", "gc.auto=0", "repack"];
-        args.extend(REPACK_FALLBACK);
-        git(&args, None);
-        git(&["update-ref", "refs/meta/local/main", &base], None);
-        git(&args, None);
-        assert_eq!(
-            git(&["cat-file", "-t", &v], None),
-            "blob",
-            "the value was deleted"
-        );
+        git(&["update-ref", "refs/heads/main", &base], None);
+        let packdir = root.join(".git/objects/pack");
+        let packs = || -> Vec<Utf8PathBuf> {
+            let mut v: Vec<Utf8PathBuf> = std::fs::read_dir(&packdir)
+                .unwrap()
+                .flatten()
+                .filter_map(|e| Utf8PathBuf::from_path_buf(e.path()).ok())
+                .filter(|p| p.extension() == Some("pack"))
+                .collect();
+            v.sort();
+            v
+        };
+        // Five small packs of one value each (none reachable from a ref),
+        // the second a promisor pack, the third kept.
+        let mut values = Vec::new();
+        for i in 0..5 {
+            let v = git(
+                &["hash-object", "-w", "--stdin"],
+                Some(&format!("value {i}")),
+            );
+            let before = packs();
+            git(
+                &["pack-objects", "-q", packdir.join("pack").as_str()],
+                Some(&format!("{v}\n")),
+            );
+            let new = packs().into_iter().find(|p| !before.contains(p)).unwrap();
+            if i == 1 {
+                std::fs::write(new.with_extension("promisor"), b"").unwrap();
+            }
+            if i == 2 {
+                std::fs::write(new.with_extension("keep"), b"").unwrap();
+            }
+            values.push(v);
+        }
+        git(&["prune-packed"], None);
+        assert_eq!(packs().len(), 5);
+        let repo = Repo::discover(&root).unwrap();
+        let store = AttestStore::new(&repo);
+        assert_eq!(store.merge_small_packs().unwrap(), 4);
+        let after = packs();
+        assert_eq!(after.len(), 2, "{after:?}");
+        let promisors = after
+            .iter()
+            .filter(|p| p.with_extension("promisor").exists())
+            .count();
+        assert_eq!(promisors, 1, "the merged pack is a promisor pack");
+        for v in &values {
+            assert_eq!(git(&["cat-file", "-t", v], None), "blob", "{v} was lost");
+        }
+        // Nothing left to merge: one small pack and a kept one.
+        assert_eq!(store.merge_small_packs().unwrap(), 0);
     }
 
     /// 2.6.2: a stored value whose blob the object database lacks (an
