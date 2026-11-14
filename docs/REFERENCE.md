@@ -1667,7 +1667,9 @@ by `vci run`; your index, `HEAD` and work tree are never touched) and is exchang
   the same time, the format-3 objects the round's verdicts and the failure text after them will read, so that the
   plan makes one round trip to the remote after its first verdicts instead of three (two when those state objects are
   more than `[store] plan_states` or a run's publishing commit added more than 64 objects; see "Round 2 in one round
-  trip" under [Verification](#verification-vci-plan)). The store's promised rows and the local
+  trip" under [Verification](#verification-vci-plan)). Since 2.11 `vci plan --fetch` has the fetch itself download
+the values the plan reads first and the objects they name while it merges (see "A fresh clone's plan" under
+[Verification](#verification-vci-plan)). The store's promised rows and the local
   metadata tree are listed once for all of a plan's batches (2.1.13: listing them for each took 12 of a vex job's 24 s);
   `vci verify` fetches the one manifest it reads, `vci run` the attestations of the units it attests (supersession
   reads them), and `vci prune` every attestation (on a large store, what a fetch downloaded before 2.0). A value that
@@ -3694,6 +3696,56 @@ files of about 4,458 inputs each (a state object of 714,820 bytes), 167 KB more 
 (283,176 bytes instead of 116,067) when the 50 units round 2 checked again all skipped, and 307 KB when all 2,000
 went to round 2 and skipped; 12 to 30 KB on 150 files. Those plans were still faster (7.42 s instead of 13.08 s,
 median, on the 2,000 files).
+
+**A fresh clone's plan** (since 2.11, git-meta). A CI job without a cached store (no `refs/meta`, no
+`.git/git-meta.sqlite`) that runs `vci plan --fetch` (or `vci ci --fetch`) first fetches and merges the whole store,
+then reads its units' values. On vex's node:test jobs (462 files, about 454 skipped, two of the store's ~25
+projects) that plan step took 18 to 28 s, about as long as running the suite plainly. Measured on a local copy of a
+store shaped like vex's of 14 November 2026 (104,705 entries: about 33,800 attestations, 23,785 of one project,
+60,400 objects, 9,240 deletion records, 300 commits of history), every `git fetch` slowed by 0.8 s as a round trip to
+GitHub, planning one Vitest project of 4 units, a95974f (2.10.3) took 20.3 s: 0.9 s fetching the history's
+commits (`--filter=tree:0`), 2.3 s fetching the tip's tree (most of the plan's 24.1 MB), 0.5 s listing its
+keys, 1.7 s fetching its 9,240 deletion records, 10.2 s writing the 95,461 promised rows, of which 8 s in a `git
+rev-list` asking which of those values the clone already had (git reads the pack directory again for every object
+it does not find, and a fresh clone has none of them), then, after the fetch, three round trips one after the other:
+the candidates (1.1 s), the hdr, tables and shape objects they name (1.2 s) and the state object that names the input
+that changed for the unit that runs (1.2 s). Three changes, none of which changes what is fetched or stored or what
+the plan decides or says:
+
+- which values are here is read in the vci process from the pack indexes, read once (a missing object is missing at
+  once; nothing is fetched); `VCI_PRESENT_WITH_GIT=1` asks git as before;
+- into a store without a row or a local metadata commit, the deletion records are fetched while the rows are
+  written, and the rows are committed once the records are read (records that cannot be fetched or read leave the
+  store as it was, as before); into any other store they are fetched first, as before, so that the store is not held
+  for writing during a fetch;
+- `vci plan --fetch` tells the fetch, once it has listed its units, which units it reads and how it chooses their
+  candidates: once the fetched tip's keys are listed, the fetch downloads in a thread of its own the values of the
+  candidates the plan will choose and then the hdr, tables and shape objects those values name, while it merges.
+  Only blobs are downloaded: the rows are the merge's, and the plan's own fetches find them here and download nothing
+  (`VCI_TIMING=1`: `fetch ahead: 4 candidate value(s) of 4 unit(s): 0.99s; 7 object(s) they name: 0.98s`, then
+  `fetch 7 value(s) (0 blob(s) downloaded)`). A failure there is met again by the plan's own fetch, as before. The
+  state objects that name a changed input are still fetched after the verdicts: which of them a text loads is known
+  only then, and fetching them ahead would download more than `[store] plan_states` of them.
+  `VCI_FETCH_AHEAD=0` fetches after the fetch, as 2.10 did (to compare).
+
+On the same store, five plans each, medians, on a 14-core laptop shared with other jobs (load average 12 to 13):
+26.60 s with a95974f, 11.22 s now (12.50 s with `VCI_FETCH_AHEAD=0`); the plan waits for 5 `git fetch` round trips
+one after the other instead of 6 (the fetch ahead runs beside the merge), and downloads the same 24.1 MB.
+Unloaded, a single plan took 20.33 s with a95974f and 9.88 s now. What remains is mostly proportional to the whole
+store, not to the projects planned: the tip's tree (2.3 to 3.1 s with its round trip), listing and comparing its
+keys (0.9 to 1.4 s), writing its rows (1.2 to 2.3 s, the deletion records' fetch beside it), and a
+`.git/git-meta.sqlite` of 108.6 MB. Fetching only the planned projects' subtrees was measured and left out: the
+store's tree is laid out by target path, but the objects every plan reads are one target's (`project/vci/object/`,
+63,244 trees and 6.9 MB of the 24.1 MB; its hdr listing alone is a 6.4 MB tree of 53,855 entries), against 34 trees
+and 2 KB for the planned project's paths. A tree is fetched by id after its parent arrives, so reaching an object's
+value takes as many round trips as its path is deep unless the whole subtree comes at once; and a clone whose store
+lacks the rows of keys its local metadata commit holds is what every fetch and push repairs before it serializes
+(the store must hold a row or a deletion record of each, or a push would publish their deletion). `crates/vci-cli/
+tests/fresh_fetch.rs` measures this (`measure_fresh_clone_plan`, ignored), and checks that a fresh clone's plan
+decides, says and explains what it did before (also against a vci built before this change, with
+`VCI_TEST_VCI_BEFORE`), that its store holds the values and deletion records git-meta's full merge leaves, that it
+waits for fewer round trips, and that its pushes afterwards (beside a full clone's push, and onto a history another
+clone rewrote) publish the remote's metadata and its own run, losing nothing and publishing nothing deleted again.
 
 **What the text output escapes** (since 2.10). The text format of `vci plan`, the github format's notices and
 warnings, the plan `vci ci` prints and `vci explain` print every path, key, name and reason with these characters

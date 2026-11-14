@@ -2260,6 +2260,73 @@ pub trait AttestationStore: Send + Sync {
     }
 }
 
+/// What a plan will read first, told to the fetch running beside it
+/// ([`Exchange::fetch_ahead`], vci 2.11): set once by the plan when it has
+/// listed its units, waited for by the fetch until it is set or the fetch
+/// no longer needs it ([`ReadsAhead::close`]). Cloning shares it.
+#[derive(Clone, Default)]
+pub struct ReadsAhead(Arc<(std::sync::Mutex<AheadState>, std::sync::Condvar)>);
+
+#[derive(Default)]
+struct AheadState {
+    units: Option<Arc<UnitsAhead>>,
+    closed: bool,
+}
+
+/// How a plan picks a unit's candidates ([`UnitsAhead::choose`]).
+pub type ChooseAhead = dyn Fn(&[StoredEnvelope]) -> Vec<usize> + Send + Sync;
+
+/// The format-3 objects a value names ([`UnitsAhead::objects_of`]).
+pub type ObjectsOf = dyn Fn(&[u8]) -> Vec<(vci_core::ObjectKind, String)> + Send + Sync;
+
+/// The units a plan reads first and how it picks their candidates
+/// ([`ReadsAhead`]).
+pub struct UnitsAhead {
+    /// The units (test ids) whose candidates the plan reads.
+    pub test_ids: Vec<String>,
+    /// Which of a unit's candidates (values not read, in key order) the
+    /// plan reads first, as [`Prefetch::Units`]'s `choose`.
+    pub choose: Box<ChooseAhead>,
+    /// The format-3 objects a candidate's value names that the plan loads
+    /// with it (its verdict's), as (kind, id).
+    pub objects_of: Box<ObjectsOf>,
+}
+
+impl ReadsAhead {
+    /// Tell the fetch what the plan reads first (a second call is ignored,
+    /// and so is one after [`ReadsAhead::close`]).
+    pub fn set(&self, units: UnitsAhead) {
+        let (m, cv) = &*self.0;
+        let mut st = m.lock().unwrap_or_else(|p| p.into_inner());
+        if st.units.is_none() && !st.closed {
+            st.units = Some(Arc::new(units));
+        }
+        cv.notify_all();
+    }
+
+    /// No unit will be asked for any more (the fetch is done with it).
+    pub fn close(&self) {
+        let (m, cv) = &*self.0;
+        m.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+        cv.notify_all();
+    }
+
+    /// The units once set, or `None` once closed without them.
+    pub fn wait(&self) -> Option<Arc<UnitsAhead>> {
+        let (m, cv) = &*self.0;
+        let mut st = m.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(u) = &st.units {
+                return Some(u.clone());
+            }
+            if st.closed {
+                return None;
+            }
+            st = cv.wait(st).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
 /// A store whose writes travel to other machines through push and fetch
 /// with a remote ([`AttestationStore::exchange`]).
 pub trait Exchange: Send + Sync {
@@ -2284,6 +2351,21 @@ pub trait Exchange: Send + Sync {
     /// by the backend's timeouts and locks. A store keeping a pool of
     /// readers refreshes it afterwards.
     fn fetch(&self, remote: Option<&str>) -> Result<FetchOutcome, StoreError>;
+
+    /// [`Exchange::fetch`] beside a plan that tells `ahead` what it will
+    /// read first once it knows (vci 2.11): a lazy store may fetch those
+    /// values while it still merges what it fetched, so that the plan's
+    /// [`AttestationStore::prefetch`] finds them here. Only a download:
+    /// what the fetch makes visible, and what the plan reads, decides and
+    /// says, are [`Exchange::fetch`]'s. Default: [`Exchange::fetch`].
+    fn fetch_ahead(
+        &self,
+        remote: Option<&str>,
+        ahead: &ReadsAhead,
+    ) -> Result<FetchOutcome, StoreError> {
+        let _ = ahead;
+        self.fetch(remote)
+    }
 
     /// Publish the local writes and removals to the remote.
     fn push(&self, remote: Option<&str>, mode: PushMode) -> Result<PushOutcome, StoreError>;

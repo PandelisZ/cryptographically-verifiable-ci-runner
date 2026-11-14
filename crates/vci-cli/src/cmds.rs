@@ -1817,6 +1817,16 @@ pub fn fetch(remote: Option<&str>) -> Result<i32> {
 /// lines for stderr. A store without an exchange has nothing to fetch: it
 /// says so (a `--remote` is refused).
 pub fn fetch_messages(store: &dyn AttestationStore, remote: Option<&str>) -> Result<Vec<String>> {
+    fetch_messages_ahead(store, remote, None)
+}
+
+/// [`fetch_messages`] beside a plan that tells `ahead` what it reads first
+/// ([`vci_store::Exchange::fetch_ahead`]).
+pub fn fetch_messages_ahead(
+    store: &dyn AttestationStore,
+    remote: Option<&str>,
+    ahead: Option<&vci_store::ReadsAhead>,
+) -> Result<Vec<String>> {
     let kind = store.kind();
     let Some(ex) = store.exchange() else {
         store.status()?;
@@ -1834,7 +1844,10 @@ pub fn fetch_messages(store: &dyn AttestationStore, remote: Option<&str>) -> Res
             sharing(store)
         )]);
     };
-    let out = ex.fetch(remote)?;
+    let out = match ahead {
+        Some(a) => ex.fetch_ahead(remote, a)?,
+        None => ex.fetch(remote)?,
+    };
     let mut lines = Vec::new();
     if remote.is_none()
         && let Some(location) = ex.remote_location(&out.remote)
