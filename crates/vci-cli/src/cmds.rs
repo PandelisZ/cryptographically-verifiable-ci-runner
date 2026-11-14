@@ -151,7 +151,13 @@ pub fn ci(args: CiArgs) -> Result<i32> {
     }
     let pushed = if push_wanted {
         // Best effort: CI's result is the tests', never the publication's.
-        match push_with(&*store, args.remote.as_deref(), false, OnRemote::Ignore) {
+        match push_with(
+            &*store,
+            args.remote.as_deref(),
+            false,
+            OnRemote::Ignore,
+            args.base_ref.as_deref(),
+        ) {
             Ok(_) => Some(true),
             Err(e) => {
                 github_warning(&format!(
@@ -1633,7 +1639,7 @@ enum OnRemote {
 pub fn push(remote: Option<&str>, rewrite_history: bool) -> Result<i32> {
     let (repo, _) = open_repo()?;
     let store = crate::store::for_repo(&repo);
-    push_with(&*store, remote, rewrite_history, OnRemote::Refuse)
+    push_with(&*store, remote, rewrite_history, OnRemote::Refuse, None)
 }
 
 /// `vci push`'s work (also `vci ci --push`): publish the store's local
@@ -1644,6 +1650,7 @@ fn push_with(
     remote: Option<&str>,
     rewrite_history: bool,
     on_remote: OnRemote,
+    base_ref: Option<&str>,
 ) -> Result<i32> {
     let kind = store.kind();
     let Some(ex) = store.exchange() else {
@@ -1676,13 +1683,46 @@ fn push_with(
         );
         return Ok(0);
     };
-    let mode = if rewrite_history {
-        PushMode::RewriteHistory
+    drop_superseded(store, base_ref);
+    let auto = if rewrite_history {
+        None
     } else {
-        PushMode::Merge
+        auto_rewrite(store)
     };
-    drop_superseded(store);
+    let mode = match (rewrite_history, auto) {
+        (true, _) => PushMode::RewriteHistory,
+        (false, Some((threshold, _))) => PushMode::RewriteHistoryLongerThan(threshold),
+        (false, None) => PushMode::Merge,
+    };
+    if let Some((threshold, commits)) = auto {
+        eprintln!(
+            "vci: the metadata history has {commits} commits, more than this job's limit of {threshold} ([store] history_max_commits and a share of half of it per job): publishing the store as one commit, unless another clone has since (VCI_STORE_AUTO_PRUNE=0 pushes on top)"
+        );
+        // The deletion records past their window go with it, as `vci prune`
+        // drops them (published ones only).
+        if let Ok((repo, _)) = open_repo()
+            && let Ok(d) = AttestStore::new(&repo).drop_deletion_records()
+            && d.dropped > 0
+        {
+            eprintln!(
+                "vci: dropped {} of {} deletion record(s) older than {} hour(s) ([store] deletion_records_hours)",
+                d.dropped,
+                d.total,
+                d.window_secs as f64 / 3600.0
+            );
+        }
+    }
     let out = ex.push(remote, mode)?;
+    if auto.is_some() {
+        eprintln!(
+            "vci: {}",
+            if out.rewritten {
+                "published the store as one commit"
+            } else {
+                "another clone had published the store as one commit since this one fetched: pushed on top of it"
+            }
+        );
+    }
     let point = ex.exchange_point();
     print_default_remote(kind, ex, remote, &out.remote);
     print_exchange_messages(&out.warnings, &out.notes);
@@ -1715,28 +1755,45 @@ fn auto_keep() -> usize {
 }
 const AUTO_KEEP: usize = 4;
 
-/// What a push removes of the store before it publishes (2.10.3), so that
-/// the store stays the size of what plans use with no `vci prune` run by
-/// hand or on a schedule: of each unit's attestations by one signer, the
-/// ones older than the [`auto_keep`] newest, decided from the keys alone
-/// (when each was issued and on which tree: nothing is fetched or read,
-/// so a CI job's lazy clone does it in the time it takes to list the
-/// keys), except one made on a tree some branch or tag has at its tip, as
-/// `vci prune` keeps; and the state objects past `[store]
-/// explain_hashes_days`. A key that does not say when it was issued
-/// (before vci 2.2) is left alone. The push that follows publishes the
-/// deletions. vex, 8 to 12 November 2026: with the hourly job that ran
-/// `vci prune` switched off, pull request jobs took the store from about
-/// 30,000 attestations to 289,159 (125 of each Rails file), and a plan
-/// from 9 s to 400 s. A failure is a warning: the store is no worse than
-/// before, and the push goes on.
-fn drop_superseded(store: &dyn AttestationStore) {
+/// What a push removes of the store before it publishes, so that the store
+/// stays the size of what plans use with no `vci prune` run by hand or on a
+/// schedule, all of it decided from keys and data already here (nothing is
+/// fetched or read from the remote: a CI job's lazy clone does it in the
+/// time it takes to list the keys). `VCI_STORE_AUTO_PRUNE=0` turns all of
+/// it off. A failure is a warning: the store is no worse than before, and
+/// the push goes on.
+///
+/// 1. (2.11) The attestations issued longer ago than the longest
+///    `max_ttl` of `vci.toml` (the top-level one and every project's) in
+///    the working tree, at the base commit (`base_ref`, as a plan resolves
+///    it) and at every branch, remote-tracking branch and tag tip here,
+///    from the key's issue time: under each of those policies each is
+///    expired, or was signed for longer than it allows (refused); a plan
+///    skips with neither. A branch's lower `max_ttl` does not shorten the
+///    attestations its base or another branch here still accepts.
+///    ([`expiry_cutoff`].)
+/// 2. (2.10.3) Of each unit's attestations by one signer, the ones older
+///    than the [`auto_keep`] newest, except one made on a tree some branch
+///    or tag has at its tip, as `vci prune` keeps. A key that does not say
+///    when it was issued (before vci 2.2) is left alone by both. vex, 8 to
+///    12 November 2026: with the hourly job that ran `vci prune` switched
+///    off, pull request jobs took the store from about 30,000 attestations
+///    to 289,159 (125 of each Rails file), and a plan from 9 s to 400 s.
+/// 3. (2.11) The format-3 objects no remaining record can name, the run
+///    links of runs none of whose records remain, and the state objects of
+///    runs issued longer ago than `[store] explain_hashes_days`
+///    ([`AttestationStore::collect_objects`]; git-meta: `vci_git::gc`).
+///    Before, only `vci prune` found such objects, by reading every
+///    attestation, and its grace period counted from when a row was last
+///    fetched, so a prune from a fresh clone removed none of them (vex, 14
+///    November: 40,753 unreferenced objects, 39% of the store).
+fn drop_superseded(store: &dyn AttestationStore, base_ref: Option<&str>) {
     let keep = auto_keep();
     if keep == 0 {
         return;
     }
     let t = std::time::Instant::now();
-    let Ok((repo, _)) = open_repo() else {
+    let Ok((repo, root)) = open_repo() else {
         return;
     };
     // Without the live trees nothing is removed: one of them may be the
@@ -1758,13 +1815,17 @@ fn drop_superseded(store: &dyn AttestationStore) {
         }
     };
     let total = all.len();
+    let expiry = expiry_cutoff(&repo, &root, base_ref, now_unix());
+    let mut expired: Vec<StoredEnvelope> = Vec::new();
     let mut groups: BTreeMap<(String, String), Vec<StoredEnvelope>> = BTreeMap::new();
     for e in all {
-        if e.issued.is_some() {
-            groups
+        match (e.issued, &expiry) {
+            (Some(issued), Some((cutoff, _))) if issued < *cutoff => expired.push(e),
+            (Some(_), _) => groups
                 .entry((e.test_key.clone(), e.signer.clone()))
                 .or_default()
-                .push(e);
+                .push(e),
+            (None, _) => {}
         }
     }
     let mut doomed: Vec<StoredEnvelope> = Vec::new();
@@ -1780,27 +1841,200 @@ fn drop_superseded(store: &dyn AttestationStore) {
                 .filter(|e| !e.tree.as_deref().is_some_and(|t| live.contains(t))),
         );
     }
+    let expired_keys: BTreeSet<String> = expired.iter().map(|e| e.key.clone()).collect();
+    doomed.extend(expired);
     if !doomed.is_empty() {
         match store.remove(doomed) {
-            Ok(removed) => eprintln!(
-                "vci: removed {} of {total} attestation(s): older than the {keep} newest of their unit and signer, on no tree a branch or tag has at its tip (VCI_STORE_AUTO_PRUNE=0 keeps them)",
-                removed.len()
-            ),
+            Ok(removed) => {
+                let gone_expired = removed
+                    .iter()
+                    .filter(|e| expired_keys.contains(&e.key))
+                    .count();
+                let superseded = removed.len() - gone_expired;
+                if gone_expired > 0
+                    && let Some((_, ttl)) = &expiry
+                {
+                    eprintln!(
+                        "vci: removed {gone_expired} of {total} attestation(s): issued more than {ttl} ago, the longest [policy] max_ttl of vci.toml here, at the base commit and at every branch and tag tip, so expired or refused by every plan (VCI_STORE_AUTO_PRUNE=0 keeps them)"
+                    );
+                }
+                if superseded > 0 {
+                    eprintln!(
+                        "vci: removed {superseded} of {total} attestation(s): older than the {keep} newest of their unit and signer, on no tree a branch or tag has at its tip (VCI_STORE_AUTO_PRUNE=0 keeps them)"
+                    );
+                }
+            }
             Err(e) => eprintln!("vci: warning: cannot remove superseded attestations: {e}"),
         }
     }
+    crate::plan::timing("remove superseded attestations before the push", t);
     if store.caps().objects {
+        let t = std::time::Instant::now();
         let days = crate::store::selection_of(&repo)
             .map(|s| s.explain_hashes_days.value)
             .unwrap_or(vci_store::select::DEFAULT_EXPLAIN_HASHES_DAYS);
-        if let Ok(n) = store.prune_state_objects(std::time::Duration::from_secs(
-            u64::from(days) * 24 * 60 * 60,
-        )) && n > 0
+        let ttl = std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60);
+        match store.collect_objects(ttl) {
+            Ok(c) => {
+                if c.objects + c.state + c.links > 0 {
+                    eprintln!(
+                        "vci: removed {} object(s) no remaining attestation names, {} state object(s) (unnamed, or of runs older than {days} day(s)) and {} link(s) of runs with no attestation left (from keys; VCI_STORE_AUTO_PRUNE=0 keeps them)",
+                        c.objects, c.state, c.links
+                    );
+                }
+                if c.legacy_unread > 0 {
+                    eprintln!(
+                        "vci: note: kept every hdr, tables and shape object: {} of the {} attestation(s) made before vci 2.11 have no value here and may name any of them (they go as they expire or are superseded; then the next push removes the objects nothing names)",
+                        c.legacy_unread, c.legacy
+                    );
+                } else if c.blocked {
+                    let why = if c.legacy > vci_git::gc::legacy_reads_max() {
+                        format!(
+                            "they are more than the {} a push reads",
+                            vci_git::gc::legacy_reads_max()
+                        )
+                    } else {
+                        "one of them cannot be read".to_owned()
+                    };
+                    eprintln!(
+                        "vci: note: kept every hdr, tables and shape object: the {} attestation(s) made before vci 2.11 may name any of them and {why} (they go as they expire or are superseded; then the next push removes the objects nothing names)",
+                        c.legacy
+                    );
+                }
+                if c.deferred > 0 {
+                    eprintln!(
+                        "vci: note: left {} more object(s) and link(s) nothing names for the next push (at most {} a push)",
+                        c.deferred,
+                        vci_git::gc::removals_max()
+                    );
+                }
+            }
+            Err(e) => eprintln!("vci: warning: cannot remove unreferenced objects: {e}"),
+        }
+        // The state objects put here longer ago than the TTL (a store whose
+        // runs wrote no links: before 2.11).
+        if let Ok(n) = store.prune_state_objects(ttl)
+            && n > 0
         {
             eprintln!("vci: removed {n} state object(s) older than {days} day(s)");
         }
+        crate::plan::timing("remove unreferenced objects before the push", t);
     }
-    crate::plan::timing("remove superseded attestations before the push", t);
+}
+
+/// Clock skew a key's issue time is allowed before [`expiry_cutoff`]
+/// counts it (a writer whose clock is behind).
+const EXPIRY_MARGIN_SECS: i64 = 60 * 60;
+
+/// The issue time before which an attestation is expired or refused under
+/// every `vci.toml` a plan may judge it by: `now` minus the longest
+/// `max_ttl` (the top-level one and each project's) of the working tree's
+/// file, the base commit's (`base_ref`, resolved as a plan resolves it)
+/// and the file at every branch, remote-tracking branch and tag tip here,
+/// minus [`EXPIRY_MARGIN_SECS`], with that `max_ttl` as written. A plan
+/// judges an attestation by its base commit's policy, so the pushing
+/// branch's own file alone would let a branch that lowers `max_ttl` (or a
+/// typo, "1h") empty the shared store for every other branch. `None`
+/// (nothing removed by age) when one of them cannot be read here (no base
+/// commit, a partial clone without a tip's file) or a `max_ttl` does not
+/// parse. A missing file is the defaults'.
+fn expiry_cutoff(
+    repo: &vci_git::Repo,
+    root: &Utf8Path,
+    base_ref: Option<&str>,
+    now: i64,
+) -> Option<(i64, String)> {
+    let path = root.join(CONFIG_FILE);
+    let mut files: Vec<Option<Vec<u8>>> = vec![if path.exists() {
+        Some(std::fs::read(&path).ok()?)
+    } else {
+        None
+    }];
+    let (_, base) = crate::plan::resolve_base(repo, base_ref).ok()?;
+    files.push(repo.show_file(&base, CONFIG_FILE).ok()?);
+    files.extend(repo.top_file_at_ref_tips(CONFIG_FILE).ok()?);
+    expiry_cutoff_of(&files, now)
+}
+
+/// [`expiry_cutoff`] of these `vci.toml` contents (`None`: no file).
+fn expiry_cutoff_of(files: &[Option<Vec<u8>>], now: i64) -> Option<(i64, String)> {
+    let mut longest: Option<(i64, String)> = None;
+    for f in files {
+        let cfg = match f {
+            Some(bytes) => crate::config::Config::parse(std::str::from_utf8(bytes).ok()?).ok()?,
+            None => crate::config::Config::default(),
+        };
+        let mut ttls = vec![(cfg.policy.max_ttl_secs().ok()?, cfg.policy.max_ttl.clone())];
+        for p in &cfg.projects {
+            if let Some(v) = p.policy.as_ref().and_then(|o| o.max_ttl.as_ref()) {
+                ttls.push((crate::util::parse_duration(v).ok()?, v.clone()));
+            }
+        }
+        for t in ttls {
+            if longest.as_ref().is_none_or(|l| t.0 > l.0) {
+                longest = Some(t);
+            }
+        }
+    }
+    let (secs, written) = longest?;
+    Some((
+        now.saturating_sub(secs).saturating_sub(EXPIRY_MARGIN_SECS),
+        written,
+    ))
+}
+
+/// The push mode a CI push takes on its own (2.11): past `[store]
+/// history_max_commits` (by a few hundred commits more, chosen per job,
+/// [`rewrite_threshold`]) publish the store as one commit, as `vci prune`
+/// does in CI, so that no prune has to run for the history to stay short.
+/// Only in CI, on git-meta, with `VCI_STORE_AUTO_PRUNE` not 0; `None`
+/// otherwise (a plain push).
+fn auto_rewrite(store: &dyn AttestationStore) -> Option<(u32, u64)> {
+    if auto_keep() == 0
+        || store.kind() != "git-meta"
+        || store.exchange().is_none()
+        || !is_ci(std::env::var_os("CI").as_deref())
+    {
+        return None;
+    }
+    let (repo, _) = open_repo().ok()?;
+    let max = crate::store::selection_of(&repo)
+        .map(|s| s.history_max_commits.value)
+        .unwrap_or(vci_store::select::DEFAULT_HISTORY_MAX_COMMITS);
+    if max == 0 {
+        return None;
+    }
+    let threshold = rewrite_threshold(max, &job_identity());
+    let commits = AttestStore::new(&repo).history_commits().ok()??;
+    (commits > u64::from(threshold)).then_some((threshold, commits))
+}
+
+/// What tells this job from others racing it: GitHub's run, attempt and
+/// job, and the process id.
+fn job_identity() -> String {
+    let var = |k: &str| std::env::var(k).unwrap_or_default();
+    format!(
+        "{}:{}:{}:{}",
+        var("GITHUB_RUN_ID"),
+        var("GITHUB_RUN_ATTEMPT"),
+        var("GITHUB_JOB"),
+        std::process::id()
+    )
+}
+
+/// The history length past which this job's push publishes the store as
+/// one commit: `max` plus between 0 and `max / 2` commits, chosen from the
+/// job's identity. Jobs that push at the same time cross their own
+/// thresholds at different pushes, so that one of them rewrites and the
+/// others, whose fetch then finds a short history, push on top of it
+/// ([`PushMode::RewriteHistoryLongerThan`] counts again after each
+/// attempt's fetch); before, every job past `max` would have fetched every
+/// value to publish its own rewrite. The history is never longer than one
+/// and a half times `max`, give or take the pushes of one rewrite.
+fn rewrite_threshold(max: u32, identity: &str) -> u32 {
+    let h = vci_core::test_key(identity);
+    let n = u32::from_str_radix(&h[..8], 16).unwrap_or(0);
+    max.saturating_add(n % (max / 2 + 1))
 }
 
 pub fn fetch(remote: Option<&str>) -> Result<i32> {
@@ -1817,6 +2051,16 @@ pub fn fetch(remote: Option<&str>) -> Result<i32> {
 /// lines for stderr. A store without an exchange has nothing to fetch: it
 /// says so (a `--remote` is refused).
 pub fn fetch_messages(store: &dyn AttestationStore, remote: Option<&str>) -> Result<Vec<String>> {
+    fetch_messages_ahead(store, remote, None)
+}
+
+/// [`fetch_messages`] beside a plan that tells `ahead` what it reads first
+/// ([`vci_store::Exchange::fetch_ahead`]).
+pub fn fetch_messages_ahead(
+    store: &dyn AttestationStore,
+    remote: Option<&str>,
+    ahead: Option<&vci_store::ReadsAhead>,
+) -> Result<Vec<String>> {
     let kind = store.kind();
     let Some(ex) = store.exchange() else {
         store.status()?;
@@ -1834,7 +2078,10 @@ pub fn fetch_messages(store: &dyn AttestationStore, remote: Option<&str>) -> Res
             sharing(store)
         )]);
     };
-    let out = ex.fetch(remote)?;
+    let out = match ahead {
+        Some(a) => ex.fetch_ahead(remote, a)?,
+        None => ex.fetch(remote)?,
+    };
     let mut lines = Vec::new();
     if remote.is_none()
         && let Some(location) = ex.remote_location(&out.remote)
@@ -3285,14 +3532,17 @@ mod tests {
     #[test]
     fn pushing_a_store_without_an_exchange_sends_nothing() {
         let s = crate::store::mem::MemStore::new();
-        assert_eq!(push_with(&s, None, false, OnRemote::Ignore).unwrap(), 0);
         assert_eq!(
-            push_with(&s, Some("origin"), false, OnRemote::Ignore).unwrap(),
+            push_with(&s, None, false, OnRemote::Ignore, None).unwrap(),
             0
         );
-        let e = push_with(&s, Some("origin"), false, OnRemote::Refuse).unwrap_err();
+        assert_eq!(
+            push_with(&s, Some("origin"), false, OnRemote::Ignore, None).unwrap(),
+            0
+        );
+        let e = push_with(&s, Some("origin"), false, OnRemote::Refuse, None).unwrap_err();
         assert_eq!(e.to_string(), "the memory store does not support a remote");
-        let e = push_with(&s, None, true, OnRemote::Ignore).unwrap_err();
+        let e = push_with(&s, None, true, OnRemote::Ignore, None).unwrap_err();
         assert_eq!(
             e.to_string(),
             "the memory store does not support rewriting history"
@@ -3772,6 +4022,49 @@ mod tests {
     }
 
     /// `CI` says CI when set to anything but empty, `false` or `0`.
+    #[test]
+    fn a_jobs_rewrite_threshold_is_between_the_limit_and_half_as_much_again() {
+        let mut seen = BTreeSet::new();
+        for i in 0..200 {
+            let t = rewrite_threshold(2000, &format!("run:{i}"));
+            assert!((2000..=3000).contains(&t), "{t}");
+            seen.insert(t);
+        }
+        assert!(seen.len() > 150, "jobs spread: {}", seen.len());
+        assert_eq!(rewrite_threshold(1, "x"), 1);
+        assert_eq!(rewrite_threshold(2, "x"), rewrite_threshold(2, "x"));
+    }
+
+    #[test]
+    fn the_expiry_cutoff_is_the_longest_max_ttl_and_an_hour() {
+        let now = 1_000_000_000;
+        // No vci.toml: the default (30d).
+        assert_eq!(
+            expiry_cutoff_of(&[None], now),
+            Some((now - 30 * 86_400 - 3600, "30d".to_owned()))
+        );
+        let mixed = b"[policy]\nmax_ttl = \"14d\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n[projects.policy]\nmax_ttl = \"20d\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"rails\"\n".to_vec();
+        assert_eq!(
+            expiry_cutoff_of(&[Some(mixed.clone())], now),
+            Some((now - 20 * 86_400 - 3600, "20d".to_owned()))
+        );
+        // A branch that lowers max_ttl does not shorten what its base (or
+        // another branch) accepts: the longest of every file.
+        let short = b"[policy]\nmax_ttl = \"1d\"\n".to_vec();
+        assert_eq!(
+            expiry_cutoff_of(&[Some(short.clone()), Some(mixed), None], now),
+            Some((now - 30 * 86_400 - 3600, "30d".to_owned()))
+        );
+        assert_eq!(
+            expiry_cutoff_of(&[Some(short)], now),
+            Some((now - 86_400 - 3600, "1d".to_owned()))
+        );
+        // One that does not parse: nothing is removed by age.
+        let bad = b"[policy]\nmax_ttl = \"soon\"\n".to_vec();
+        assert_eq!(expiry_cutoff_of(&[None, Some(bad)], now), None);
+        assert_eq!(expiry_cutoff_of(&[], now), None);
+    }
+
     #[test]
     fn ci_is_any_value_but_empty_false_or_zero() {
         use std::ffi::OsStr;

@@ -199,11 +199,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use key::{
-    KEY_PREFIX, MANIFEST_PREFIX, ManifestRef, OBJECT_PREFIX, ObjectRefs, RUN_STATE_PREFIX,
-    attestation_key, attestation_key_hinted, envelope_manifest_ref, hint_segment, manifest_key,
-    object_key, parse_key, parse_key_hint, parse_manifest_key, parse_object_key,
-    parse_run_state_key, record_object_refs, run_state_key, run_state_prefix, target_label,
-    test_key,
+    KEY_PREFIX, MANIFEST_PREFIX, ManifestRef, OBJECT_PREFIX, ObjectRefs, RUN_OBJECT_PREFIX,
+    RUN_STATE_PREFIX, attestation_key, attestation_key_hinted, envelope_manifest_ref, hint_segment,
+    manifest_key, object_key, parse_key, parse_key_hint, parse_manifest_key, parse_object_key,
+    parse_run_object_key, parse_run_state_key, record_object_refs, run_object_key, run_state_key,
+    run_state_prefix, target_label, test_key,
 };
 
 pub mod credential;
@@ -502,6 +502,37 @@ impl Columns {
         }
         Ok(())
     }
+}
+
+/// What [`AttestationStore::collect_objects`] found and removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Collected {
+    /// hdr, tables and shape objects removed: no remaining record can name
+    /// them.
+    pub objects: usize,
+    /// State objects removed: no remaining record's run names them, or the
+    /// newest run that did was issued longer ago than the state TTL.
+    pub state: usize,
+    /// Run links (run-object and run-state) removed: no record of their
+    /// run remains.
+    pub links: usize,
+    /// Remaining records whose run wrote no run-object links (a vci before
+    /// 2.11, or a key without a hint).
+    pub legacy: usize,
+    /// Of those, the ones whose value is not here: while there is one, no
+    /// hdr, tables or shape object is removed (it may name any of them).
+    pub legacy_unread: usize,
+    /// Whether the legacy records kept every hdr, tables and shape object:
+    /// one has no value here, one cannot be read, or there are more than
+    /// the collection reads (git-meta: 10,000).
+    pub blocked: bool,
+    /// What the rules would remove beyond the most one collection removes
+    /// (git-meta: 10,000 objects and links), left for the next push.
+    pub deferred: usize,
+    /// Objects the rules would remove but that were put or named again
+    /// since the collection began (a run beside it), left for the next
+    /// push.
+    pub touched: usize,
 }
 
 /// A listed format-3 record and the shape object its descriptor names: the
@@ -1967,6 +1998,55 @@ pub trait AttestationStore: Send + Sync {
         Ok(0)
     }
 
+    /// Say that the run whose records carry these key hints and this
+    /// signer wrote (or named again) these objects, on a store that keeps
+    /// no listing columns (git-meta, vci 2.11: a run-object link,
+    /// [`key::run_object_key`], for each hint and object), inside the batch
+    /// with the run's objects and records, so that
+    /// [`AttestationStore::collect_objects`] can tell from keys alone which
+    /// objects the remaining records may name. Store data: it decides what
+    /// a push keeps, never a verdict. Returns how many links were not
+    /// stored before. Every id is validated first.
+    ///
+    /// Default: nothing (a store with [`Caps::columns`] keeps the ids in the
+    /// record's columns), `Ok(0)`.
+    ///
+    /// Used by: run.rs, after the run's objects and before its records.
+    fn put_run_objects(
+        &self,
+        hints: &[KeyHint],
+        signer: &str,
+        objects: &[(vci_core::ObjectKind, &str)],
+    ) -> Result<usize, StoreError> {
+        key::check_signer(signer)?;
+        for (_, id) in objects {
+            key::check_object_id(id)?;
+        }
+        let _ = hints;
+        Ok(0)
+    }
+
+    /// Remove, from keys and local data alone (no value fetched), the
+    /// format-3 objects no remaining record can name and the run links of
+    /// runs none of whose records remain, and the state objects older than
+    /// `state_older_than` (git-meta, vci 2.11: what a push does before it
+    /// publishes, [`Collected`] says what). Never an object a remaining
+    /// record names: when a record whose run wrote no run-object links (a
+    /// vci before 2.11) remains and its value is not here, no hdr, tables or
+    /// shape object is removed.
+    ///
+    /// Default: nothing (a store whose `vci push` publishes nothing; `vci
+    /// prune` applies the orphan rule there).
+    ///
+    /// Used by: `vci push` and `vci ci --push`, before the push.
+    fn collect_objects(
+        &self,
+        state_older_than: std::time::Duration,
+    ) -> Result<Collected, StoreError> {
+        let _ = state_older_than;
+        Ok(Collected::default())
+    }
+
     /// The error every default of the objects section returns.
     #[doc(hidden)]
     fn objects_unsupported(&self) -> StoreError {
@@ -2260,6 +2340,73 @@ pub trait AttestationStore: Send + Sync {
     }
 }
 
+/// What a plan will read first, told to the fetch running beside it
+/// ([`Exchange::fetch_ahead`], vci 2.11): set once by the plan when it has
+/// listed its units, waited for by the fetch until it is set or the fetch
+/// no longer needs it ([`ReadsAhead::close`]). Cloning shares it.
+#[derive(Clone, Default)]
+pub struct ReadsAhead(Arc<(std::sync::Mutex<AheadState>, std::sync::Condvar)>);
+
+#[derive(Default)]
+struct AheadState {
+    units: Option<Arc<UnitsAhead>>,
+    closed: bool,
+}
+
+/// How a plan picks a unit's candidates ([`UnitsAhead::choose`]).
+pub type ChooseAhead = dyn Fn(&[StoredEnvelope]) -> Vec<usize> + Send + Sync;
+
+/// The format-3 objects a value names ([`UnitsAhead::objects_of`]).
+pub type ObjectsOf = dyn Fn(&[u8]) -> Vec<(vci_core::ObjectKind, String)> + Send + Sync;
+
+/// The units a plan reads first and how it picks their candidates
+/// ([`ReadsAhead`]).
+pub struct UnitsAhead {
+    /// The units (test ids) whose candidates the plan reads.
+    pub test_ids: Vec<String>,
+    /// Which of a unit's candidates (values not read, in key order) the
+    /// plan reads first, as [`Prefetch::Units`]'s `choose`.
+    pub choose: Box<ChooseAhead>,
+    /// The format-3 objects a candidate's value names that the plan loads
+    /// with it (its verdict's), as (kind, id).
+    pub objects_of: Box<ObjectsOf>,
+}
+
+impl ReadsAhead {
+    /// Tell the fetch what the plan reads first (a second call is ignored,
+    /// and so is one after [`ReadsAhead::close`]).
+    pub fn set(&self, units: UnitsAhead) {
+        let (m, cv) = &*self.0;
+        let mut st = m.lock().unwrap_or_else(|p| p.into_inner());
+        if st.units.is_none() && !st.closed {
+            st.units = Some(Arc::new(units));
+        }
+        cv.notify_all();
+    }
+
+    /// No unit will be asked for any more (the fetch is done with it).
+    pub fn close(&self) {
+        let (m, cv) = &*self.0;
+        m.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+        cv.notify_all();
+    }
+
+    /// The units once set, or `None` once closed without them.
+    pub fn wait(&self) -> Option<Arc<UnitsAhead>> {
+        let (m, cv) = &*self.0;
+        let mut st = m.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(u) = &st.units {
+                return Some(u.clone());
+            }
+            if st.closed {
+                return None;
+            }
+            st = cv.wait(st).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
 /// A store whose writes travel to other machines through push and fetch
 /// with a remote ([`AttestationStore::exchange`]).
 pub trait Exchange: Send + Sync {
@@ -2284,6 +2431,21 @@ pub trait Exchange: Send + Sync {
     /// by the backend's timeouts and locks. A store keeping a pool of
     /// readers refreshes it afterwards.
     fn fetch(&self, remote: Option<&str>) -> Result<FetchOutcome, StoreError>;
+
+    /// [`Exchange::fetch`] beside a plan that tells `ahead` what it will
+    /// read first once it knows (vci 2.11): a lazy store may fetch those
+    /// values while it still merges what it fetched, so that the plan's
+    /// [`AttestationStore::prefetch`] finds them here. Only a download:
+    /// what the fetch makes visible, and what the plan reads, decides and
+    /// says, are [`Exchange::fetch`]'s. Default: [`Exchange::fetch`].
+    fn fetch_ahead(
+        &self,
+        remote: Option<&str>,
+        ahead: &ReadsAhead,
+    ) -> Result<FetchOutcome, StoreError> {
+        let _ = ahead;
+        self.fetch(remote)
+    }
 
     /// Publish the local writes and removals to the remote.
     fn push(&self, remote: Option<&str>, mode: PushMode) -> Result<PushOutcome, StoreError>;
@@ -2599,6 +2761,9 @@ pub mod key {
     /// Key namespace of the run-state links of a backend without listing
     /// columns (git-meta, vci 2.10): [`run_state_key`].
     pub const RUN_STATE_PREFIX: &str = "vci:run-state";
+    /// Key namespace of the run-object links of a backend without listing
+    /// columns (git-meta, vci 2.11): [`run_object_key`].
+    pub const RUN_OBJECT_PREFIX: &str = "vci:run-object";
     /// Length of an object id: 32 bytes of BLAKE3 as lowercase hex.
     pub const OBJECT_ID_LEN: usize = 64;
     /// Length of a signer id.
@@ -2753,6 +2918,48 @@ pub mod key {
     /// chooses which state object the failure text loads, never a verdict.
     pub fn run_state_key(shape: &str, hint: &KeyHint, state: &str) -> String {
         format!("{}{state}", run_state_prefix(shape, hint))
+    }
+
+    /// The key of a run-object link (vci 2.11, git-meta, which keeps no
+    /// listing columns): `vci:run-object:<hint>:<signer>:<kind>:<object
+    /// id>`, which says that the run whose records carry this hint and this
+    /// signer in their keys wrote (or named again) this object. A run writes
+    /// one for each of its objects (hdr, tables, shape, state) in the batch
+    /// that stores its records, so that a push decides from keys alone which
+    /// objects a remaining record may name: those of the runs some record
+    /// of which remains. Store data: it decides what a push keeps, never a
+    /// verdict, and its value is never read.
+    pub fn run_object_key(
+        hint: &KeyHint,
+        signer: &str,
+        kind: vci_core::ObjectKind,
+        id: &str,
+    ) -> String {
+        format!(
+            "{RUN_OBJECT_PREFIX}:{}:{signer}:{}:{id}",
+            hint_segment(hint),
+            kind as u8
+        )
+    }
+
+    /// (hint segment, signer, kind, object id) of a run-object link's key
+    /// ([`run_object_key`]); any other key: `None`. The hint is returned as
+    /// its segment ([`hint_segment`]), the form a record's key carries.
+    pub fn parse_run_object_key(key: &str) -> Option<(&str, &str, vci_core::ObjectKind, &str)> {
+        let rest = key.strip_prefix(RUN_OBJECT_PREFIX)?.strip_prefix(':')?;
+        let mut parts = rest.split(':');
+        let (Some(hint), Some(signer), Some(kind), Some(id), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return None;
+        };
+        parse_hint(hint)?;
+        let kind = super::object_kind(kind.parse::<u8>().ok()?)?;
+        (is_signer_id(signer) && is_object_id(id)).then_some((hint, signer, kind, id))
     }
 
     /// (shape id, hint, state id) of a run-state link's key

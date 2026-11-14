@@ -157,6 +157,11 @@ module VciCollector
   # a mode to attest with); "routes" draws the routes only; "warmup" calls
   # Process.warmup in each slot once it is set up, before its first file's
   # process forks.
+  # Batch mode: what a group's process loads after its boot, before its
+  # files' processes fork, so that each of them does not load it on its own
+  # (VCI_RAILS_PRELOAD, set by vci, a comma-separated list; 2.11.0):
+  # "routes" draws the application's routes (Batch.preload_routes!).
+  PRELOAD = ENV["VCI_RAILS_PRELOAD"].to_s.split(",").map(&:strip).reject(&:empty?).freeze
   EXPERIMENT = ENV["VCI_RAILS_EXPERIMENT"].to_s.split(",").map(&:strip).reject(&:empty?).freeze
 
   # A profile of each file's process (VCI_RAILS_PROFILE=1): how long its
@@ -197,6 +202,8 @@ module VciCollector
         self.started = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
         self.gc_ms0 = (::GC.stat(:time) rescue 0)
         self.gc_n0 = ::GC.stat(:count)
+        major0 = ::GC.stat(:major_gc_count)
+        minor0 = ::GC.stat(:minor_gc_count)
         if defined?(::Rails::Application::RoutesReloader) && !::Rails::Application::RoutesReloader.ancestors.include?(Routes)
           ::Rails::Application::RoutesReloader.prepend(Routes)
         end
@@ -205,7 +212,10 @@ module VciCollector
           now = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
           $stdout.puts "vci-profile id=#{id} proc_ms=#{ms.call(now - started)} req_ms=#{ms.call(req_ns)} nreq=#{nreq} " \
                        "routes_ms=#{ms.call(routes_ns)} gc_ms=#{((::GC.stat(:time) rescue 0) - gc_ms0)} " \
-                       "gc_n=#{::GC.stat(:count) - gc_n0} iseq_hit=#{IseqCache.hits.to_i} iseq_miss=#{IseqCache.misses.to_i}"
+                       "gc_n=#{::GC.stat(:count) - gc_n0} major=#{::GC.stat(:major_gc_count) - major0} " \
+                       "minor=#{::GC.stat(:minor_gc_count) - minor0} utime=#{(Process.times.utime * 1000).round} " \
+                       "stime=#{(Process.times.stime * 1000).round} iseq_hit=#{IseqCache.hits.to_i} " \
+                       "iseq_miss=#{IseqCache.misses.to_i}"
           $stdout.flush
         end
       end
@@ -323,6 +333,11 @@ module VciCollector
   # written once for them all (Batch.share!; VCI_RAILS_SHARED_OUTPUT=0:
   # each file's process writes all of its output, as a one-file run does).
   SHARED_OUTPUT = ENV["VCI_RAILS_SHARED_OUTPUT"] != "0"
+  # Batch mode (2.11.0): whether a file's process whose boot or slot wrote
+  # the shared lines makes only its own lines, from what it recorded after
+  # the fork (Output.lines_of's `base`), instead of all of its lines, split
+  # afterwards (VCI_RAILS_OWN_OUTPUT=0: as before).
+  OWN_OUTPUT = ENV["VCI_RAILS_OWN_OUTPUT"] != "0"
   # The fresh temp dir vci gave this process (TMPDIR), read once here: a test
   # that later sets ENV["TMPDIR"] (to "/tmp", HOME, "/") changes where its
   # own temp files go, never which reads the collector treats as vci's
@@ -839,7 +854,15 @@ module VciCollector
     # the repository is not under it and stays repository code.
     def repo_entry?(e)
       return false unless inside?(e, repo)
-      !(defined?(::Gem) && ::Gem.respond_to?(:path) && ::Gem.path.any? { |r| inside?(e, r.to_s) })
+      gp = defined?(::Gem) && ::Gem.respond_to?(:path) ? ::Gem.path : nil
+      # Remembered per entry while Gem.path stays the same (2.11.0: asked
+      # for every entry ahead of the one holding each required file).
+      @repo_entries = {} unless @repo_entries_of.equal?(gp) && @repo_entries_n == gp&.size
+      @repo_entries_of = gp
+      @repo_entries_n = gp&.size
+      @repo_entries.fetch(e) do
+        @repo_entries[e] = !(gp && gp.any? { |r| inside?(e, r.to_s) })
+      end
     rescue StandardError
       true
     end
@@ -852,15 +875,19 @@ module VciCollector
       return unless collect?
       quiet do
         lp.each do |e|
+          # Every candidate of `e` is inside it: an entry that does not hold
+          # the hit, outside the repository's own code, records nothing.
+          mine = repo_entry?(e)
+          next unless mine || (hit && hit.start_with?(e.end_with?("/") ? e : "#{e}/"))
           cands = candidates(e, feature)
           if hit && cands.include?(hit)
             cands.each do |c|
               break if c == hit
-              @records[[:probe, c]] = true if repo_entry?(e)
+              @records[[:probe, c]] = true if mine
             end
             return
           end
-          next unless repo_entry?(e)
+          next unless mine
           cands.each { |c| @records[[exists_quietly?(c) ? :read : :probe, c]] = true }
         end
       end
@@ -1320,10 +1347,12 @@ module VciCollector
                   "it runs on its own"
           end
         end
+        why = preload_routes! if why.nil? && boot && files.size > 1
         if why.nil? && (w = slots_for(files, boot)) > 1
           return run_slots(files, w)
         end
         share!(write: true) if why.nil? && files.size > 1
+        collect_garbage! if why.nil? && files.size > 1
         first = 0
         files.each do |f|
           if why
@@ -1567,6 +1596,7 @@ module VciCollector
         end
         parallel_executor!
         share!(write: true)
+        collect_garbage!(slot: i)
         first = 0
         nxt = i
         while nxt && nxt < files.size
@@ -1869,6 +1899,21 @@ module VciCollector
         $stderr.puts "vci_collector: experiment preload: #{e.class}: #{e.message}"
       end
 
+      # Before the files' processes of a slot (or of a group without slots)
+      # fork from it: a full garbage collection, swept at once (2.11.0).
+      # Ruby sweeps lazily, so each file's process otherwise swept the heap
+      # its parent left unswept, writing to pages it shares with its parent
+      # (each one copied): on vex-api the files' processes spent 40% less
+      # time in the garbage collector, 0.04 s each. Nothing a test sees
+      # changes but when garbage is collected.
+      def collect_garbage!(**line)
+        t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        ::GC.start(full_mark: true, immediate_sweep: true)
+        status(**line, gc_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round)
+      rescue StandardError
+        nil
+      end
+
       # Close the boot's database connections before a file's process forks,
       # as Rails' `parallelize` does before it forks its workers: a forked
       # process that used them, and closed them at exit, would leave the
@@ -1950,6 +1995,48 @@ module VciCollector
         nil
       end
 
+      # In a group's process after its boot (PRELOAD "routes", 2.11.0): draw
+      # the application's routes and build their router's tables, which a
+      # Rails application that does not eager-load leaves to the first
+      # request or URL helper of each process: on vex-api a third of the
+      # files' processes did it on their own, 0.3 s each, a fifth of the
+      # batch. Everything the draw reads or loads (config/routes.rb, the
+      # files it loads, the classes it autoloads: a route's constraint) is
+      # recorded here, before any file's process forks, so it is an input
+      # of every file of the group, as the boot is: a superset of what each
+      # file's own draw would have recorded. What a file's process then
+      # loads, reads or looks up is recorded as before. vci asks for it with
+      # rails_inputs = "loose" (the default), which leaves the routes files
+      # out of every file's inputs anyway; with "strict" the routes would
+      # become an input of every file, so vci does not ask.
+      #
+      # Returns nil, or why the group's files run on their own: a draw that
+      # raises would raise in the files' processes too, and what it left
+      # half done must not be what they start from.
+      def preload_routes!
+        return nil unless PRELOAD.include?("routes")
+        return nil unless defined?(::Rails) && ::Rails.respond_to?(:application) && ::Rails.application
+        app = ::Rails.application
+        return nil unless app.respond_to?(:routes_reloader)
+        rr = app.routes_reloader
+        return nil unless rr.respond_to?(:execute_unless_loaded) && rr.respond_to?(:route_sets)
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        before = VciCollector.records.size
+        rr.execute_unless_loaded
+        # A RouteSet's eager_load! (what eager_load = true does after the
+        # draw) builds the router's recognition tables from the routes
+        # drawn: no file is read, no constant is looked up.
+        rr.route_sets.each { |rs| rs.eager_load! if rs.respond_to?(:eager_load!) }
+        repo = VciCollector.repo
+        added = VciCollector.records.keys.drop(before).count { |(_, abs)| abs.is_a?(String) && VciCollector.inside?(abs, repo) }
+        status(preload: { what: "routes", ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round,
+                          records: VciCollector.records.size - before, repo: added })
+        nil
+      rescue ScriptError, StandardError, SystemExit => e
+        "drawing the application's routes in the batch's boot failed (#{e.class}: " \
+          "#{e.message.to_s.lines.first.to_s.strip}): it runs on its own"
+      end
+
       # Run a boot as the file's first statement does (recorded as anything
       # else the process loads). A boot may be another test file of the
       # batch (`require_relative "queue_result_reuse_test"`, vex-api's
@@ -1996,11 +2083,14 @@ module VciCollector
       # each file's process writing all of its output.
       def share!(write:)
         @shared = nil
+        @base = nil
         return unless SHARED_OUTPUT && OUT
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         name = "shared-#{Process.pid}.jsonl"
         r, w = VciCollector.quiet { IO.pipe }
         disconnect
+        # What the shared lines are made from, as the child below has it.
+        snap = write && OWN_OUTPUT ? snapshot : nil
         pid = fork_own
         if pid.nil?
           code = 1
@@ -2026,14 +2116,22 @@ module VciCollector
         Output.learn(data[:classified])
         Output.learn_ignored(data[:ignored])
         GemVerify.learn(data[:gems])
+        VciCollector.quiet { Output.warm! }
         return unless write
         index = {}
         data[:lines].each_with_index { |l, i| index[l] = i }
         @shared = { name: name, sha256: data[:sha256], index: index, size: data[:lines].size }
+        extra = data[:extra]
+        if snap && extra.is_a?(Hash)
+          @base = { name: name, sha256: data[:sha256], lines: data[:lines], snapshot: snap[0], dl: snap[1],
+                    record_taints: extra[:record_taints], folded: extra[:folded], dbx: extra[:dbx],
+                    externals: data[:lines].select { |l| l[:kind] == "external" }.to_h { |l| [l, true] } }
+        end
         output_line(shared: name, lines: index.size,
                     ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round)
       rescue StandardError => e
         @shared = nil
+        @base = nil
         $stderr.puts "vci_collector: batch: the lines its files share were not written once (#{e.class}: " \
                      "#{e.message}); each file's process writes all of its output"
       end
@@ -2054,7 +2152,35 @@ module VciCollector
         path = File.join(OUT, "batch", name)
         File.write("#{path}.tmp", text)
         File.rename("#{path}.tmp", path)
-        out.merge(lines: lines, sha256: Digest::SHA256.hexdigest(text))
+        out.merge(lines: lines, sha256: Digest::SHA256.hexdigest(text), extra: Output.shared_extra)
+      end
+
+      # In a file's process whose boot or slot wrote the shared lines with
+      # what it takes to add to them (share!): that, for Output.lines_of's
+      # `base`; else nil (the process makes all of its lines and splits them,
+      # split).
+      def base
+        @target ? @base : nil
+      end
+
+      # What the shared lines are made from (share!, before its child
+      # forks): every record but the runner's checks of the batch's files
+      # (shared_output leaves them out), each by sig; and the native
+      # extensions loaded (lines_of records them from $LOADED_FEATURES).
+      def snapshot
+        checks = @loader_checks || {}
+        snap = {}
+        VciCollector.records.each { |k, v| snap[k] = sig(v) unless checks.key?(k) }
+        dl = {}
+        $LOADED_FEATURES.each { |f| dl[f] = true if f.is_a?(String) && DLEXTS.any? { |x| f.end_with?(x) } }
+        [snap, dl]
+      end
+
+      # What a record's value says, for telling whether it changed since a
+      # snapshot: the value, or for a list of who made a check (walked:
+      # [:realpath, [...]], which only grows) its kind and length.
+      def sig(v)
+        v.is_a?(Array) ? v.map { |x| x.is_a?(Array) ? x.size : x } : v
       end
 
       # A file's process at exit, its output's `lines` (Output.lines_of):
@@ -5281,9 +5407,18 @@ module VciCollector
   module Json
     module_function
 
+    # What str escapes.
+    ESCAPED = /["\\\x00-\x1f]/
+
     def str(s)
       s = s.to_s
-      s = s.encode("UTF-8", invalid: :replace, undef: :replace) unless s.encoding == Encoding::UTF_8 && s.valid_encoding?
+      # ASCII is the same bytes in UTF-8 (most paths come as US-ASCII or
+      # binary strings).
+      unless (s.encoding == Encoding::UTF_8 && s.valid_encoding?) || (s.encoding.ascii_compatible? && s.ascii_only?)
+        s = s.encode("UTF-8", invalid: :replace, undef: :replace)
+      end
+      # Nothing to escape (nearly every path): the string as it is.
+      return "\"#{s}\"" unless ESCAPED.match?(s)
       out = +"\""
       s.each_char do |c|
         out << case c
@@ -5315,8 +5450,20 @@ module VciCollector
   module Gems
     module_function
 
+    # The gems activated in this process. What is made from them (dirs,
+    # dir_index, named, evaluated_gemspec?) is made again when more have
+    # been activated since: a batch's group or slot makes it once before its
+    # files' processes fork (Output.warm!), and a file's process that
+    # activated a gem after the fork has it as a process that made it first
+    # at its exit had (2.11.0).
     def specs
-      @specs ||= ::Gem.loaded_specs.values.uniq(&:full_name)
+      n = ::Gem.loaded_specs.size
+      unless @specs && @specs_n == n
+        @specs = ::Gem.loaded_specs.values.uniq(&:full_name)
+        @specs_n = n
+        @dirs = @dir_index = @named = @gemspecs = nil
+      end
+      @specs
     end
 
     # The bundle Bundler resolved for this platform (the toolchain's gem set).
@@ -5332,6 +5479,7 @@ module VciCollector
 
     # [[dir, spec]], longest first.
     def dirs
+      specs
       @dirs ||= specs.flat_map do |s|
         d = []
         d << [File.expand_path(s.full_gem_path), s] if s.full_gem_path
@@ -5360,13 +5508,38 @@ module VciCollector
       end
     end
 
+    # The gem whose directory holds `abs` (the longest of dirs that does),
+    # or nil. Each directory above `abs` is looked up in dir_index instead
+    # of comparing `abs` with every gem's directory: a path is inside `d`
+    # (VciCollector.inside?) exactly when `d` is `abs` or `abs` cut at one
+    # of its slashes, so the deepest such cut that names a gem's directory
+    # is the longest directory of dirs that holds it (2.11.0: on vex-api,
+    # with about 200 gems, comparing each path with every directory was a
+    # tenth of a batch file's process).
     def spec_for(abs)
-      dirs.each { |d, s| return s if VciCollector.inside?(abs, d) }
-      nil
+      return nil unless abs.is_a?(String) && !abs.empty?
+      idx = dir_index
+      p = abs
+      loop do
+        s = idx[p]
+        return s if s
+        i = p.rindex("/")
+        break if i.nil? || i.zero?
+        p = p[0, i]
+      end
+      abs.start_with?("/") ? idx["/"] : nil
+    end
+
+    # dirs as a Hash (directory => spec), the first of dirs for a directory
+    # two gems have.
+    def dir_index
+      dirs
+      @dir_index ||= dirs.each_with_object({}) { |(d, s), h| h[d] ||= s }
     end
 
     # The loaded gem of that full name, or nil.
     def named(full_name)
+      specs
       (@named ||= specs.to_h { |s| [s.full_name, s] })[full_name]
     end
 
@@ -5421,6 +5594,7 @@ module VciCollector
     # gemspec holds whatever this machine has installed.
     def evaluated_gemspec?(abs)
       vc = VciCollector
+      specs
       @gemspecs ||= specs.flat_map do |s|
         next [] unless s.loaded_from
         f = File.expand_path(s.loaded_from)
@@ -5534,6 +5708,29 @@ module VciCollector
 
   module Output
     module_function
+
+    # In a batch's group or slot, before its files' processes fork
+    # (Batch.share!): make what each of them would otherwise make at its
+    # exit from the same unchanging facts (the bundle's gems and their
+    # directories, which on vex-api loaded every gem's full gemspec, a
+    # quarter of a file's output; the gem roots, Ruby's directories, the
+    # zone database's, Gemfile.lock's checksums). Gems' are made again in a
+    # process that activates more gems (Gems.specs).
+    def warm!
+      Gems.dir_index
+      Gems.named("")
+      Gems.roots
+      Gems.homes
+      Gems.evaluated_gemspec?("/")
+      ignored_prefixes
+      ruby_dirs
+      ruby_load_dirs
+      tz_dirs
+      GemVerify.lock_checksums
+      nil
+    rescue StandardError
+      nil
+    end
 
     # vci's temp dirs, as given and as real paths.
     def ignored_prefixes
@@ -5689,7 +5886,15 @@ module VciCollector
       unhooked = VciCollector.unhooked
       TP_COMPILED.disable
       TP_RAISE.disable
-      VciCollector.quiet { write_records(status, unhooked, started) }
+      # A batch's file process ends once its output is written: no garbage
+      # collection while it is made (on vex-api two fifths of the time it
+      # took marked and swept the boot's heap; 2.11.0).
+      regc = Batch.on? && !Batch.target.nil? && !::GC.disable
+      begin
+        VciCollector.quiet { write_records(status, unhooked, started) }
+      ensure
+        ::GC.enable if regc
+      end
     end
 
     # A record under a gem root (classify: :outside_bundle) that is not an
@@ -5732,9 +5937,18 @@ module VciCollector
     def write_records(status, unhooked = [], started = nil)
       clock = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
       t0 = clock.call
-      lines = lines_of(status, unhooked)
+      lines = nil
+      if (base = Batch.base)
+        begin
+          lines = lines_of(status, unhooked, base: base)
+        rescue StandardError => e
+          $stderr.puts "vci_collector: batch: #{e.class}: #{e.message}; the file's process makes all of its output"
+        end
+      end
+      own = !lines.nil?
+      lines ||= lines_of(status, unhooked)
       t1 = clock.call
-      split = Batch.split(lines)
+      split = own ? nil : Batch.split(lines)
       t2 = clock.call
       require "digest/sha2"
       sh = Batch.shard
@@ -5750,7 +5964,7 @@ module VciCollector
                   write_ms: ((t3 - t2) * 1000).round, before_ms: ((t0 - started) * 1000).round }
         lines_parts.each { |k, v| parts[:"lines_#{k}"] = v }
       end
-      Batch.wrote_output(lines.size, split, started, parts) if started
+      Batch.wrote_output(lines.size, own ? lines : split, started, parts) if started
     end
 
     # Every line of the output of this process if it ended now (with exit
@@ -5760,7 +5974,35 @@ module VciCollector
     # of a file's taints stay in its own output, in their order) and no
     # result, each line once; the gems' files are checked against their
     # archives (GemVerify.check remembers it for the files' processes).
-    def lines_of(status, unhooked = [], shared: false)
+    #
+    # `base` (2.11.0): in a batch's file process whose boot or slot wrote
+    # the lines its files share (Batch.share!, Batch.base), the lines to
+    # write instead, made from what this process recorded after the fork
+    # only: meta, {kind: "shared", base: <their name>, sha256: <of their
+    # content>, drop: [the indexes of those lines this process does not
+    # have]}, then its own lines. vci reads the shared lines but those
+    # dropped, and these (read_batch); every kind of line is a set there,
+    # so a line both have counts once.
+    #
+    # Sound by construction, as the split of a whole output was: a record
+    # made before the fork, unchanged since (Batch.sig), gives the line it
+    # gave in the shared lines, unless what this process did since makes
+    # this method leave it out (a probe of a path it then created, a log it
+    # appended to, a database file exempt here and not there, a listing
+    # that stood for absent paths in a directory it wrote in): those lines
+    # are dropped, and the probes such a listing stood for are this
+    # process's lines again. Every record made or changed after the fork is
+    # classified as lines_of classifies any record. The taints the shared
+    # records gave, which the shared lines do not hold, are this process's
+    # (Batch.share! keeps them). This process's own absent paths are folded
+    # as folding them with the shared ones folds them: into a directory the
+    # shared lines folded FOLD_MIN or more into, any number of them;
+    # elsewhere FOLD_MIN or more of its own. Where its own and the shared
+    # ones together reach FOLD_MIN and neither alone does, they stay absent
+    # paths, each as exact as the listing would have been. Externals, the
+    # environment, autoload names, writes, taints and the result are made
+    # whole, as before (the shared lines of those kinds are dropped).
+    def lines_of(status, unhooked = [], shared: false, base: nil)
       vc = VciCollector
       clock = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
       tick = clock.call
@@ -5771,6 +6013,7 @@ module VciCollector
       end
       @lines_parts = Hash.new(0)
       taints = vc.taints.dup + unhooked
+      first_record_taint = taints.size
       lines = shared ? [] : [meta]
       vc.enumerations.each do |where, meth|
         next if Env.allowed_enumeration?(where, meth)
@@ -5780,9 +6023,10 @@ module VciCollector
       externals = {}
       gem_files = {}
       seen = {}
-      records = vc.records.to_a
+      records = base ? base_records(base) : vc.records.to_a
       # Native extensions are loaded without a script_compiled event.
       $LOADED_FEATURES.each do |f|
+        next if base && base[:dl].key?(f)
         records << [[:module, f], true] if f.is_a?(String) && f.start_with?("/") && DLEXTS.any? { |x| f.end_with?(x) }
       end
       # The test environment's SQLite files (and their -wal, -shm and
@@ -5790,6 +6034,7 @@ module VciCollector
       # them is an input (see DB.exempt).
       dbx = DB.exempt
       listed = {}
+      drop = base ? base_drops(base, lines, seen, listed, written, dbx) : nil
       records.each do |(kind, abs), by|
         next if kind == :write
         next if kind == :stat && RUNNER == "rspec" && temp_ancestor?(abs)
@@ -5845,7 +6090,8 @@ module VciCollector
       vc.autoload_listed.each_key { |n| lines << { kind: "autoload_listed", ns: n } }
       # Many absent paths under one directory (load path probes): its
       # listing instead (fold_probes).
-      lines = fold_probes(lines, seen, listed, written)
+      folded = shared ? {} : nil
+      lines = fold_probes(lines, seen, listed, written, folded, into: base && base[:folded])
       lap.call(:fold_ms)
       # A listing of the directory holding one leaves it out (it is not in
       # a fresh checkout, and comes and goes with the database's journal).
@@ -5859,20 +6105,35 @@ module VciCollector
       lap.call(:db_ms)
       taints.concat(GemVerify.check(externals.values.uniq, gem_files))
       lap.call(:gems_ms)
+      if shared
+        # What a file's process forked after this adds to these lines
+        # (lines_of with a base): the taints its records gave (gems outside the
+        # bundle, native extensions in the repository, gem files that differ
+        # from their archives: shared lines hold no taint), the listings that
+        # stand for absent paths (fold_probes) and the database files exempt
+        # here.
+        @shared_extra = { record_taints: taints[first_record_taint..].to_a, folded: folded,
+                          dbx: dbx.to_a.sort_by { |k, _| k } }
+      end
+      have = base ? base[:externals] : {}
       externals.each do |(name, version), s|
         rec = { kind: "external", name: name, version: version, platform: s.platform.to_s }
         src = Gems.source_of(s)
         rec[:source] = src unless src.empty?
-        lines << rec
+        lines << rec unless have.key?(rec)
       end
       # Native libraries FFI opened (see install_ffi): compared with what the
       # probe's process opens where the attestation is checked.
-      Native.versions.each { |name, version| lines << { kind: "external", name: name, version: version } }
+      Native.versions.each do |name, version|
+        rec = { kind: "external", name: name, version: version }
+        lines << rec unless have.key?(rec)
+      end
       keys = vc.env_keys.dup
       Env::ALWAYS_READ.each { |k| keys[k] ||= { "ruby" => true } }
       keys.each { |k, w| lines << { kind: "env", key: k, where: w.keys.first(3).join(" | ") } }
       return lines.uniq if shared
       lap.call(:externals_env_ms)
+      taints.concat(base[:record_taints]) if base
       taints.concat(Checks.run)
       lap.call(:checks_ms)
       taints.concat(RSpecSupport.taints) if RUNNER == "rspec"
@@ -5884,6 +6145,77 @@ module VciCollector
       taints.uniq.each { |t| lines << { kind: "taint", reason: t } }
       lap.call(:result_ms)
       lines << res
+      return lines unless base
+      [lines[0], { kind: "shared", base: base[:name], sha256: base[:sha256], drop: drop }, *lines[1..]]
+    end
+
+    # The kinds of line a record gives (lines_of).
+    RECORD_KINDS = %w[read stat probe readdir module autoload_dir].freeze
+    # The kinds of line lines_of with a base makes whole (not only of what
+    # was recorded after the fork): the shared ones are dropped.
+    WHOLE_KINDS = %w[env autoload_miss autoload_listed write].freeze
+
+    # lines_of with a base: the records made or changed since the base's
+    # lines were made (Batch.sig), in their order.
+    def base_records(base)
+      snap = base[:snapshot]
+      out = []
+      VciCollector.records.each do |k, v|
+        was = snap[k]
+        out << [k, v] if was.nil? || was != Batch.sig(v)
+      end
+      out
+    end
+
+    # lines_of with a base: the indexes of the base's lines this process
+    # does not have (see lines_of). Every other line of the base marks what
+    # it records as seen (and a listing as listed), as lines_of marks its
+    # own; the probes of a listing that stood for them alone in a directory
+    # this process wrote in are added to `lines` again.
+    def base_drops(base, lines, seen, listed, written, dbx)
+      vc = VciCollector
+      log = File.join(vc.root, "log")
+      dbx_changed = dbx.to_a.sort_by { |k, _| k } != base[:dbx]
+      # A directory this process wrote in is not folded (foldable_dir?).
+      unfolded = written.empty? ? {} : base[:folded].select { |d, _| written.each_key.any? { |w| vc.inside?(w, d) } }
+      drop = []
+      base[:lines].each_with_index do |l, i|
+        kind = l[:kind]
+        p = l[:path]
+        gone = case kind
+               when "probe" then written.key?(p)
+               when "stat" then written[p] && vc.inside?(p, log)
+               when "readdir" then unfolded.dig(p, 1)
+               end
+        gone ||= dbx_changed && RECORD_KINDS.include?(kind) && kind != "module" && DB.exempt?(kind.to_sym, p)
+        # What this process's own lines hold whole, as a whole output does.
+        gone ||= WHOLE_KINDS.include?(kind)
+        if gone
+          drop << i
+          next
+        end
+        if RECORD_KINDS.include?(kind)
+          seen[[kind.to_sym, p]] = true
+          listed[p] = true if kind == "readdir"
+        elsif kind == "exclude"
+          seen[[:exclude, p]] = true
+        end
+      end
+      unfolded.each_value do |probes, _|
+        probes.each do |l|
+          p = l[:path]
+          next if written.key?(p) || seen[[:probe, p]]
+          seen[[:probe, p]] = true
+          lines << l
+        end
+      end
+      drop
+    end
+
+    # What the last lines_of with `shared: true` found for a file's process
+    # to add to them (see Batch.share!), or nil.
+    def shared_extra
+      @shared_extra
     end
 
     # The milliseconds of each part of the last lines_of (2.7.14).
@@ -5939,7 +6271,12 @@ module VciCollector
     #   nothing is folded.
     FOLD_MIN = 50
 
-    def fold_probes(lines, seen, listed, written)
+    #
+    # `into` (lines_of with a base): the directories the shared lines folded
+    # FOLD_MIN probes or more into, each of which takes any number of this
+    # process's own probes, as folding the boot's and its own together does
+    # (a batch's file process folds its own probes only).
+    def fold_probes(lines, seen, listed, written, folded = nil, into: nil)
       vc = VciCollector
       repo = vc.repo
       return lines unless repo && !repo.empty?
@@ -5950,7 +6287,8 @@ module VciCollector
         d, child = fold_target(l[:path], repo, lstats)
         (groups[d] ||= []) << [i, child] if d
       end
-      groups.select! { |d, ps| ps.size >= FOLD_MIN && foldable_dir?(d, repo, written, lstats, seen) }
+      min = ->(d) { into&.key?(d) ? 1 : FOLD_MIN }
+      groups.select! { |d, ps| ps.size >= min.call(d) && foldable_dir?(d, repo, written, lstats, seen) }
       return lines if groups.empty?
       ignored = ignored_children(groups.values.flat_map { |ps| ps.map(&:last) }.uniq, repo)
       return lines unless ignored
@@ -5958,11 +6296,14 @@ module VciCollector
       insert = {}
       groups.each do |d, ps|
         ps = ps.reject { |_, c| ignored[c] }
-        next if ps.size < FOLD_MIN
+        next if ps.size < min.call(d)
         ps.each { |i, _| drop[i] = true }
+        # d => [its probes, whether its listing is here for them alone].
+        folded[d] = [ps.map { |i, _| lines[i] }, false] if folded
         listed[d] = true
         next if seen[[:readdir, d]]
         seen[[:readdir, d]] = true
+        folded[d][1] = true if folded
         insert[ps[0][0]] = { kind: "readdir", path: d }
       end
       return lines if drop.empty?
@@ -6203,6 +6544,9 @@ module VciCollector
     end
 
     # Each of `files` => [taint or nil, its place in the archive or nil].
+    # Each file's content is compared, by its SHA-256, with every entry of
+    # that name in the archive's data (archive_index), in the archive's
+    # order, as reading the archive and comparing the bytes did.
     def compare(spec, archive, files)
       root = File.expand_path(spec.full_gem_path)
       res = files.to_h { |f| [f, [nil, nil]] }
@@ -6212,26 +6556,16 @@ module VciCollector
         want[f.delete_prefix("#{root}/")] = f
       end
       return res if want.empty?
+      index = archive_index(archive)
       found = {}
-      at = 0
-      File.open(archive, "rb") do |io|
-        ::Gem::Package::TarReader.new(io) do |tar|
-          tar.each do |entry|
-            next unless entry.full_name == "data.tar.gz"
-            ::Zlib::GzipReader.wrap(entry) do |gz|
-              ::Gem::Package::TarReader.new(gz) do |data|
-                data.each do |f|
-                  at += 1
-                  path = want[f.full_name]
-                  next unless path && f.file?
-                  found[f.full_name] = true
-                  if f.read != File.binread(path)
-                    res[path] = ["ruby:gem-modified:#{spec.full_name}:#{f.full_name} (differs from #{File.basename(archive)})", at]
-                  end
-                end
-              end
-            end
-          end
+      want.each do |rel, path|
+        entries = (index[rel] || []).select { |_, file, _| file }
+        next if entries.empty?
+        found[rel] = true
+        have = Digest::SHA256.digest(File.binread(path))
+        entries.each do |at, _, digest|
+          next if digest == have
+          res[path] = ["ruby:gem-modified:#{spec.full_name}:#{rel} (differs from #{File.basename(archive)})", at]
         end
       end
       want.each do |rel, path|
@@ -6241,6 +6575,80 @@ module VciCollector
         res[path] = ["ruby:gem-modified:#{spec.full_name}:#{rel} (not in #{File.basename(archive)})", nil]
       end
       res
+    end
+
+    # What a gem's archive holds, read once per process and, in a batch,
+    # once per batch: each entry of its data (data.tar.gz) by name => [[its
+    # place (1 for the first entry), whether it is a file, its content's
+    # SHA-256 (a file's)], ...], in the archive's order. Before 2.11.0 each
+    # file's process of a batch decompressed the archive of every gem whose
+    # files it loaded after the fork (on vex-api, a twentieth of a file's
+    # process). In a batch the index is kept under vci's output directory
+    # of the run ($VCI_OUT/batch/gem-index), named by the archive's path,
+    # size and modification time, for the batch's other processes; vci
+    # makes that directory empty for each run.
+    def archive_index(archive)
+      (@indexes ||= {})[archive] ||= begin
+        cached = index_file(archive)
+        idx = cached && VciCollector.quiet { Real.exist?(cached) } ? load_index(cached) : nil
+        if idx.nil?
+          idx = read_archive(archive)
+          save_index(cached, idx) if cached
+        end
+        idx
+      end
+    end
+
+    def read_archive(archive)
+      idx = {}
+      at = 0
+      File.open(archive, "rb") do |io|
+        ::Gem::Package::TarReader.new(io) do |tar|
+          tar.each do |entry|
+            next unless entry.full_name == "data.tar.gz"
+            ::Zlib::GzipReader.wrap(entry) do |gz|
+              ::Gem::Package::TarReader.new(gz) do |data|
+                data.each do |f|
+                  at += 1
+                  file = f.file?
+                  (idx[f.full_name] ||= []) << [at, file, file ? Digest::SHA256.digest(f.read.to_s) : nil]
+                end
+              end
+            end
+          end
+        end
+      end
+      idx
+    end
+
+    # Where a batch keeps the index of `archive`, or nil (not a batch, or
+    # the archive cannot be read).
+    def index_file(archive)
+      return nil unless Batch.on? && OUT && !OUT.empty?
+      st = VciCollector.quiet { Real.stat(archive) }
+      File.join(OUT, "batch", "gem-index",
+                "#{IseqCache.fnv(archive)}-#{st.size}-#{st.mtime.to_i}#{st.mtime.nsec}.idx")
+    rescue StandardError
+      nil
+    end
+
+    def load_index(path)
+      idx = Marshal.load(VciCollector.quiet { Real.binread(path) }) # rubocop:disable Security/MarshalLoad
+      idx.is_a?(Hash) ? idx : nil
+    rescue StandardError
+      nil
+    end
+
+    def save_index(path, idx)
+      VciCollector.quiet do
+        dir = File.dirname(path)
+        Dir.mkdir(dir) unless Real.directory?(dir)
+        tmp = "#{path}.#{Process.pid}"
+        File.binwrite(tmp, Marshal.dump(idx))
+        File.rename(tmp, path)
+      end
+    rescue StandardError
+      nil
     end
   end
 

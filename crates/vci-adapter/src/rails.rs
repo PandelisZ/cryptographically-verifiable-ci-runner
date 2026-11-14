@@ -76,6 +76,26 @@ const RAILS_AUTOLOAD_ENV: &str = "VCI_RAILS_AUTOLOAD_LOOKUPS";
 /// run one after another).
 static AUTOLOAD_LOOKUPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set by vci for a batch (2.11.0): what its boot loads before its files'
+/// processes fork (`routes`: the application's routes, see the collector's
+/// `Batch.preload_routes!`). Never inherited.
+const RAILS_PRELOAD_ENV: &str = "VCI_RAILS_PRELOAD";
+
+/// Set to `0` (in vci's environment): a batch does not draw the routes in
+/// its boot, each file's process draws them when it needs them (as before
+/// 2.11.0).
+pub const RAILS_PRELOAD_ROUTES_ENV: &str = "VCI_RAILS_PRELOAD_ROUTES";
+
+/// Whether the run in progress asked for the routes to be drawn in a
+/// batch's boot ([`crate::RunHints::rails_preload_routes`]).
+static PRELOAD_ROUTES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether vci's environment leaves the routes' preload on (anything but
+/// `VCI_RAILS_PRELOAD_ROUTES=0`).
+pub fn preload_routes_wanted() -> bool {
+    std::env::var(RAILS_PRELOAD_ROUTES_ENV).map_or(true, |v| v.trim() != "0")
+}
+
 /// Set by vci for a batch (2.3.0): the files to run as several processes,
 /// each a share of the file's test methods, as lines `<k>\t<test id>`
 /// (see [`shard_counts`]).
@@ -204,6 +224,11 @@ const RAILS_SLOTS_ASKED_ENV: &str = "VCI_RAILS_SLOTS_ASKED";
 /// (or slot) shares, which the boot writes once ([`merge_shared`]). For
 /// debugging, or to compare.
 pub const RAILS_SHARED_OUTPUT_ENV: &str = "VCI_RAILS_SHARED_OUTPUT";
+
+/// Set to `0` (in vci's environment, 2.11.0): a batch's file process makes
+/// all of its output at exit and splits off what its boot shares, instead
+/// of making only the lines of what it recorded after the fork.
+pub const RAILS_OWN_OUTPUT_ENV: &str = "VCI_RAILS_OWN_OUTPUT";
 
 /// The fixed Minitest seed of every run (`--seed`): the order of the tests in
 /// a file and `Kernel#rand` (Minitest seeds it) are the same where the file
@@ -817,6 +842,7 @@ impl RailsAdapter {
             "VCI_RAILS_BATCH_PID",
             RAILS_SHARDS_ENV,
             RAILS_AUTOLOAD_ENV,
+            RAILS_PRELOAD_ENV,
             "SPRING_SERVER_COMMAND",
             RAILS_PROBE_PIPE_ENV,
         ] {
@@ -1151,8 +1177,13 @@ impl RailsAdapter {
         if let Some(asked) = asked {
             cmd.env(RAILS_SLOTS_ASKED_ENV, asked);
         }
-        if let Ok(v) = std::env::var(RAILS_SHARED_OUTPUT_ENV) {
-            cmd.env(RAILS_SHARED_OUTPUT_ENV, v);
+        for k in [RAILS_SHARED_OUTPUT_ENV, RAILS_OWN_OUTPUT_ENV] {
+            if let Ok(v) = std::env::var(k) {
+                cmd.env(k, v);
+            }
+        }
+        if PRELOAD_ROUTES.load(std::sync::atomic::Ordering::Relaxed) {
+            cmd.env(RAILS_PRELOAD_ENV, "routes");
         }
         // Measurement switches of the collector (see its EXPERIMENT and
         // Profile): passed on as set in vci's environment.
@@ -1348,6 +1379,15 @@ impl RailsAdapter {
                 .as_bytes(),
             );
         }
+        if let Some(&(ms, records, repo)) = slots.preload_routes.iter().max_by_key(|p| p.0) {
+            log.extend_from_slice(
+                format!(
+                    "vci: the batch drew the application's routes in its boot in {:.1} s, before its files' processes forked ({records} path(s) recorded, {repo} of them in the repository: inputs of every file of the group)\n",
+                    ms as f64 / 1000.0
+                )
+                .as_bytes(),
+            );
+        }
         if !slots.output_ms.is_empty() {
             let n = slots.output_ms.len() as f64;
             let sum: u64 = slots.output_ms.iter().sum();
@@ -1510,6 +1550,10 @@ struct SlotStats {
     /// Sums over the files of each part of building their lines (2.7.14).
     lines_parts_ms: BTreeMap<String, u64>,
     shared_ms: Vec<u64>,
+    /// The routes drawn in a group's boot (2.11.0, the collector's
+    /// `Batch.preload_routes!`), per group: its time (ms), what it
+    /// recorded, and how many of those records are in the repository.
+    preload_routes: Vec<(u64, u64, u64)>,
 }
 
 /// The slots of a batch run, and what decided their number (the value of
@@ -1633,6 +1677,14 @@ fn read_batch(
                     g.get("ms").and_then(Value::as_u64).unwrap_or(0),
                 ));
                 stats.groups_at_once |= g.get("at_once").and_then(Value::as_bool) == Some(true);
+            }
+            if let Some(p) = v.get("preload")
+                && p.get("what").and_then(Value::as_str) == Some("routes")
+            {
+                let g = |k: &str| p.get(k).and_then(Value::as_u64).unwrap_or(0);
+                stats
+                    .preload_routes
+                    .push((g("ms"), g("records"), g("repo")));
             }
             if let Some(a) = v.get("after_slots") {
                 let g = |k: &str| a.get(k).and_then(Value::as_u64).unwrap_or(0);
@@ -1799,20 +1851,62 @@ fn read_batch_outputs(out: &Utf8Path) -> Result<BatchOutputs, AdapterError> {
         }
     }
     names.sort();
-    let mut shared = BTreeMap::new();
+    let shared = std::sync::Mutex::new(SharedLines::new());
     let mut own = BTreeMap::new();
     let mut broken = BTreeMap::new();
     // A sharded file's outputs (2.3.0), put together below.
     let mut shards: BTreeMap<String, Vec<Observed>> = BTreeMap::new();
-    for p in names {
-        let text = std::fs::read_to_string(&p)?;
-        match merge_shared(&text, out, &mut shared) {
+    // Each output is read, put together with its shared lines and parsed on
+    // one of several threads (2.11.0: one after the other, a vex job's 896
+    // outputs, each with its boot's 14,000 shared lines, took 4.6 s), then
+    // taken in the order of their names, as before.
+    let read = |p: &Utf8PathBuf| -> Result<ReadOutput, AdapterError> {
+        let text = std::fs::read_to_string(p)?;
+        Ok(match merge_shared(&text, out, &shared) {
             Ok(merged) => {
-                let mut o = parse_jsonl_text(
-                    merged.as_ref().map(|(_, m)| m.as_str()).unwrap_or(&text),
-                    &p,
-                );
+                let mut o =
+                    parse_jsonl_text(merged.as_ref().map(|(_, m)| m.as_str()).unwrap_or(&text), p);
                 o.shared_group = merged.map(|(name, _)| name);
+                Ok(o)
+            }
+            Err(why) => Err((parse_jsonl_text(&text, p), why)),
+        })
+    };
+    let jobs = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, names.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut parsed: Vec<Option<Result<ReadOutput, AdapterError>>> =
+        (0..names.len()).map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..jobs)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(p) = names.get(i) else { break };
+                        done.push((i, read(p)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        for w in workers {
+            if let Ok(done) = w.join() {
+                for (i, r) in done {
+                    parsed[i] = Some(r);
+                }
+            }
+        }
+    });
+    for (p, r) in names.iter().zip(parsed) {
+        let r = match r {
+            Some(r) => r?,
+            None => read(p)?,
+        };
+        match r {
+            Ok(o) => {
                 if o.shard.is_some() {
                     shards.entry(o.test_id.clone()).or_default().push(o);
                 } else if own.contains_key(&o.test_id) {
@@ -1824,8 +1918,7 @@ fn read_batch_outputs(out: &Utf8Path) -> Result<BatchOutputs, AdapterError> {
                     own.insert(o.test_id.clone(), o);
                 }
             }
-            Err(why) => {
-                let o = parse_jsonl_text(&text, &p);
+            Err((o, why)) => {
                 broken.insert(
                     o.test_id,
                     format!(
@@ -1855,13 +1948,17 @@ fn read_batch_outputs(out: &Utf8Path) -> Result<BatchOutputs, AdapterError> {
     Ok((own, broken))
 }
 
+/// One output of a batch, read: its [`Observed`] put together with the
+/// lines it shares, or, when they cannot be read, the output alone and why.
+type ReadOutput = Result<Observed, (Observed, String)>;
+
 /// Each file's [`Observed`] by test id, and why some files' outputs cannot
 /// be read, by test id.
 type BatchOutputs = (BTreeMap<String, Observed>, BTreeMap<String, String>);
 
 /// The shared lines of a batch's boot or slot, by file name: their sha256
 /// (hex) and the lines, or why they cannot be read.
-type SharedLines = BTreeMap<String, Result<(String, Vec<String>), String>>;
+type SharedLines = BTreeMap<String, std::sync::Arc<Result<(String, Vec<String>), String>>>;
 
 /// The output a file's process wrote in a batch (`own`) put together with
 /// the lines it shares with the other files of its boot or slot, when it
@@ -1881,7 +1978,7 @@ type SharedLines = BTreeMap<String, Result<(String, Vec<String>), String>>;
 fn merge_shared(
     own: &str,
     out: &Utf8Path,
-    cache: &mut SharedLines,
+    cache: &std::sync::Mutex<SharedLines>,
 ) -> Result<Option<(String, String)>, String> {
     let mut refs = own.lines().filter(|l| l.contains(r#""kind":"shared""#));
     let Some(line) = refs.next() else {
@@ -1914,19 +2011,31 @@ fn merge_shared(
         .and_then(Value::as_array)
         .and_then(|a| a.iter().map(Value::as_u64).collect())
         .ok_or_else(|| format!("no list of dropped lines in {line:?}"))?;
-    let entry = cache.entry(name.to_owned()).or_insert_with(|| {
-        use sha2::{Digest, Sha256};
-        let path = out.join("batch").join(name);
-        std::fs::read_to_string(&path)
-            .map(|t| {
-                (
-                    hex::encode(Sha256::digest(t.as_bytes())),
-                    t.lines().map(str::to_owned).collect(),
+    // Each shared file is read once, by the first file that names it; the
+    // others wait for it, then put their output together without the lock.
+    let entry = {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .entry(name.to_owned())
+            .or_insert_with(|| {
+                use sha2::{Digest, Sha256};
+                let path = out.join("batch").join(name);
+                std::sync::Arc::new(
+                    std::fs::read_to_string(&path)
+                        .map(|t| {
+                            (
+                                hex::encode(Sha256::digest(t.as_bytes())),
+                                t.lines().map(str::to_owned).collect(),
+                            )
+                        })
+                        .map_err(|e| format!("{path}: {e}")),
                 )
             })
-            .map_err(|e| format!("{path}: {e}"))
-    });
-    let (sha, lines) = entry.as_ref().map_err(Clone::clone)?;
+            .clone()
+    };
+    let (sha, lines) = entry.as_ref().as_ref().map_err(Clone::clone)?;
     if sha != want {
         return Err(format!(
             "batch/{name} does not have the sha256 the file's output names"
@@ -2556,6 +2665,10 @@ impl Adapter for RailsAdapter {
             hints.rails_autoload_lookups,
             std::sync::atomic::Ordering::Relaxed,
         );
+        PRELOAD_ROUTES.store(
+            hints.rails_preload_routes,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let last_ms = &hints.last_ms;
         let collector = self.collector_file()?;
         if files.len() < 2 || per_file_forced() {
@@ -3093,7 +3206,9 @@ mod tests {
         // Slots: each line names the slot that ran the file; a slot's own
         // line (no id) is not a file's; a later why overrides an earlier
         // exit (the group found afterwards that the file's run cannot stand).
+        // The routes drawn in the boot (2.11.0) are the group's, not a file's.
         let slotted = [
+            r#"{"preload":{"what":"routes","ms":420,"records":268,"repo":200}}"#,
             r#"{"slot":0,"setup_ms":1500,"at":1500}"#,
             r#"{"slot":1,"setup_ms":900,"at":900}"#,
             r#"{"id":"test/a_test.rb","exit":0,"slot":0,"ms":2000,"at":3500}"#,
@@ -3114,6 +3229,7 @@ mod tests {
         );
         let (obs, fallback, code, slots) = read_batch(&out, &files).unwrap();
         assert_eq!(slots.count, 2);
+        assert_eq!(slots.preload_routes, [(420, 268, 200)]);
         assert_eq!(slots.setup_ms, 1500);
         assert_eq!(slots.file_ms, [2000, 3000, 10]);
         assert_eq!(slots.last_at, 4000);

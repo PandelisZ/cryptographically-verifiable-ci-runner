@@ -2339,7 +2339,10 @@ class CollectorTest < Minitest::Test
   # time and in slots. A's process writes a path the boot found absent (that
   # probe is not A's input: dropped), B reads an environment variable the
   # boot read from somewhere else (its line differs: B's own), each file
-  # keeps the runner's check of its own file only.
+  # keeps the runner's check of its own file only. Each file's process makes
+  # its lines from what it recorded after the fork (2.11.0), or makes all of
+  # them and splits off the shared ones (VCI_RAILS_OWN_OUTPUT=0): the same
+  # lines either way.
   def test_batch_shared_output_is_each_files_own_output
     put("test/test_helper.rb", <<~RUBY)
       require "minitest"
@@ -2375,21 +2378,24 @@ class CollectorTest < Minitest::Test
       lines.map { |l| l.sub(/"durationMs":\d+/, "\"durationMs\":0") }.sort
     end
     slots = { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" }
-    [{}, slots].each do |env|
+    split = { "VCI_RAILS_OWN_OUTPUT" => "0" }
+    [{}, slots, split, slots.merge(split)].each do |env|
       full = batch(ids, env: env.merge("VCI_RAILS_SHARED_OUTPUT" => "0"))
       out = batch(ids, env: env)
       # (Which slot takes the third file is a race.)
       assert_equal full[:status].filter_map { |l| l.slice("id", "exit") if l["id"] }.sort_by(&:to_s),
                    out[:status].filter_map { |l| l.slice("id", "exit") if l["id"] }.sort_by(&:to_s), out[:said]
       shared = out[:output].filter_map { |l| l["shared"] }
-      assert_equal(env.empty? ? 1 : 2, shared.size, out[:said])
+      assert_equal(env.key?("VCI_RAILS_SLOTS") ? 2 : 1, shared.size, out[:said])
       ids.each do |id|
         refute(full[:own][id].any? { |l| l.include?("\"kind\":\"shared\"") }, id)
         refs = out[:own][id].select { |l| l.include?("\"kind\":\"shared\"") }
         assert_equal 1, refs.size, "#{id}: #{out[:said]}"
         assert_equal norm.call(full[:lines][id]), norm.call(out[:lines][id]), id
-        # Most of a file's output is its boot's.
-        assert_operator out[:own][id].size * 2, :<, out[:lines][id].size, id
+        # Most of what a file's process recorded is its boot's (its own
+        # lines hold the environment, its writes and its taints whole).
+        recorded = out[:own][id].count { |l| l.match?(/"kind":"(read|stat|probe|readdir|module|autoload_dir)"/) }
+        assert_operator recorded * 2, :<, out[:lines][id].size, id
         assert_includes paths(out[id], "module"), id
         (ids - [id]).each { |other| refute_includes paths(out[id], "module"), other, id }
       end
@@ -2405,6 +2411,208 @@ class CollectorTest < Minitest::Test
       assert_equal ids.sort, out[:output].filter_map { |l| l["file"] }.sort
       assert(out[:output].select { |l| l["file"] }.all? { |l| l["ms"].is_a?(Integer) && l["own"] < l["lines"] })
     end
+  end
+
+  # 2.11.0: a batch's file process makes its lines from what it recorded
+  # after the fork, on top of the lines its boot (or slot) shares. Put
+  # together, they are what it makes of everything it recorded, line for
+  # line, when what it did after the fork changes the meaning of what the
+  # boot recorded: the boot's 60 absent paths under vendor/ are one listing
+  # (folded), A writes in vendor/ (a listing that changes during the run is
+  # not folded into: its probes come back), B looks up more absent paths
+  # there (folded into the boot's listing), C uses a constant its boot
+  # loaded from lib/dep.rb (an input of every file: what was loaded before
+  # the fork is recorded once, for each of them). Compared with the whole
+  # output (VCI_RAILS_SHARED_OUTPUT=0) and with the split one
+  # (VCI_RAILS_OWN_OUTPUT=0), one file at a time and in slots; then a
+  # change to lib/dep.rb is a change to an input of C's.
+  def test_batch_own_lines_are_the_whole_output
+    put("lib/dep.rb", "DEP = 41\n")
+    put("vendor/.keep")
+    put("test/test_helper.rb", <<~RUBY)
+      require "minitest"
+      $LOAD_PATH.unshift(File.expand_path("../vendor", __dir__))
+      20.times do |i|
+        begin
+          require "nope_\#{i}/deep/x"
+        rescue LoadError
+        end
+      end
+      require_relative "../lib/dep"
+    RUBY
+    put("test/a_test.rb", <<~RUBY)
+      require "test_helper"
+      class ATest < Minitest::Test
+        def test_a
+          path = File.expand_path("../vendor/made_by_a.txt", __dir__)
+          File.write(path, "a")
+          File.delete(path)
+          assert true
+        end
+      end
+    RUBY
+    put("test/b_test.rb", <<~RUBY)
+      require "test_helper"
+      class BTest < Minitest::Test
+        def test_b
+          3.times do |i|
+            begin
+              require "more_\#{i}/x"
+            rescue LoadError
+            end
+          end
+          assert true
+        end
+      end
+    RUBY
+    put("test/c_test.rb", "require \"test_helper\"\nclass CTest < Minitest::Test\n  def test_c = assert_equal(42, DEP + 1)\nend\n")
+    assert system("git", "init", "-q", @repo)
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb]
+    norm = ->(lines) { lines.map { |l| l.sub(/"durationMs":\d+/, "\"durationMs\":0") }.sort }
+    slots = { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" }
+    [{}, slots].each do |env|
+      full = batch(ids, env: env.merge("VCI_RAILS_SHARED_OUTPUT" => "0"))
+      split = batch(ids, env: env.merge("VCI_RAILS_OWN_OUTPUT" => "0"))
+      own = batch(ids, env: env)
+      ids.each do |id|
+        assert_equal norm.call(full[:lines][id]), norm.call(own[:lines][id]), "#{id} #{env}"
+        assert_equal norm.call(split[:lines][id]), norm.call(own[:lines][id]), "#{id} #{env}"
+        assert_equal 1, own[:own][id].count { |l| l.include?("\"kind\":\"shared\"") }, id
+        assert_includes paths(own[id], "module"), "lib/dep.rb", id
+      end
+      a = own["test/a_test.rb"]
+      assert_includes paths(a, "probe"), "vendor/nope_0/deep/x.rb"
+      refute_includes paths(a, "readdir"), "vendor"
+      b = own["test/b_test.rb"]
+      assert_includes paths(b, "readdir"), "vendor"
+      assert_empty paths(b, "probe").grep(%r{\Avendor/})
+      # B's own lines hold no probe: they are under the boot's listing.
+      refute(own[:own]["test/b_test.rb"].any? { |l| l.include?("\"kind\":\"probe\"") && l.include?("/vendor/") })
+    end
+  end
+
+  # 2.11.0: with VCI_RAILS_PRELOAD=routes (vci sets it when rails_inputs is
+  # "loose"), a group's process draws the application's routes after its
+  # boot, before any file's process forks: what the draw read and loaded
+  # (config/routes.rb, the constraint class it loads) is in every file's
+  # lines, including B's, which never draws them. Without it, only A, which
+  # draws them, has them. A draw that raises sends every file of the group
+  # to run on its own.
+  def test_batch_draws_the_routes_before_the_fork
+    put("test/test_helper.rb", <<~RUBY)
+      require "minitest"
+      module Rails
+        class Reloader
+          def route_sets = []
+          def execute_unless_loaded
+            return false if @loaded
+            @loaded = true
+            load File.expand_path("../config/routes.rb", __dir__)
+            true
+          end
+        end
+        class App
+          def routes_reloader = (@routes_reloader ||= Reloader.new)
+        end
+        def self.application = (@application ||= App.new)
+      end
+    RUBY
+    put("config/routes.rb", <<~RUBY)
+      raise "no routes today" if File.exist?(File.expand_path("../boom", __dir__))
+      require_relative "../app/constraints/admin_constraint"
+    RUBY
+    put("app/constraints/admin_constraint.rb", "class AdminConstraint\n  def matches?(_) = true\nend\n")
+    put("test/a_test.rb", <<~RUBY)
+      require "test_helper"
+      class ATest < Minitest::Test
+        def test_a
+          Rails.application.routes_reloader.execute_unless_loaded
+          assert AdminConstraint.new.matches?(nil)
+        end
+      end
+    RUBY
+    put("test/b_test.rb", "require \"test_helper\"\nclass BTest < Minitest::Test\n  def test_b = assert(true)\nend\n")
+    ids = %w[test/a_test.rb test/b_test.rb]
+    preload = { "VCI_RAILS_PRELOAD" => "routes" }
+    slots = { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" }
+    [preload, preload.merge(slots)].each do |env|
+      out = batch(ids, env: env)
+      assert_equal [0, 0], ids.map { |id| out[:status].find { |l| l["id"] == id }&.fetch("exit", nil) }, out[:said]
+      drawn = out[:status].filter_map { |l| l["preload"] }
+      assert_equal ["routes"], drawn.map { |d| d["what"] }, out[:said]
+      assert_operator drawn[0]["repo"], :>=, 2
+      ids.each do |id|
+        assert_includes paths(out[id], "module"), "app/constraints/admin_constraint.rb", id
+        assert_includes paths(out[id], "module"), "config/routes.rb", id
+      end
+    end
+    out = batch(ids)
+    assert_empty out[:status].filter_map { |l| l["preload"] }
+    assert_includes paths(out["test/a_test.rb"], "module"), "app/constraints/admin_constraint.rb"
+    refute_includes paths(out["test/b_test.rb"], "module"), "app/constraints/admin_constraint.rb"
+    put("boom")
+    out = batch(ids, env: preload)
+    ids.each do |id|
+      why = out[:status].find { |l| l["id"] == id }&.fetch("why", nil).to_s
+      assert_includes why, "drawing the application's routes in the batch's boot failed (RuntimeError: no routes today)", id
+    end
+  end
+
+  # 2.11.0: a gem file loaded after the fork is compared with the gem's
+  # archive as before (a file that differs is a taint), the archive read
+  # once for the batch: its index is kept under the batch's output
+  # directory for the other files' processes.
+  def test_gem_files_are_compared_with_the_archive_once_per_batch
+    root = File.join(@tmp, "gemroot")
+    src = File.join(@tmp, "gemsrc")
+    files = { "lib/verifyfake.rb" => "$verifyfake = 1\n", "lib/verifyfake/extra.rb" => "$verifyfake_extra = 1\n" }
+    files.each do |rel, body|
+      FileUtils.mkdir_p(File.dirname(File.join(src, rel)))
+      File.write(File.join(src, rel), body)
+      FileUtils.mkdir_p(File.dirname(File.join(root, "gems/verifyfake-1.0", rel)))
+      File.write(File.join(root, "gems/verifyfake-1.0", rel), body)
+    end
+    spec = Gem::Specification.new do |s|
+      s.name = "verifyfake"
+      s.version = "1.0"
+      s.summary = "x"
+      s.authors = ["x"]
+      s.files = files.keys
+      s.require_paths = ["lib"]
+    end
+    require "rubygems/package"
+    built = Dir.chdir(src) { Gem::Package.build(spec) }
+    FileUtils.mkdir_p(File.join(root, "cache"))
+    FileUtils.mv(File.join(src, built), File.join(root, "cache", built))
+    FileUtils.mkdir_p(File.join(root, "specifications"))
+    File.write(File.join(root, "specifications/verifyfake-1.0.gemspec"), spec.to_ruby)
+    # Installed, then changed.
+    File.write(File.join(root, "gems/verifyfake-1.0/lib/verifyfake/extra.rb"), "$verifyfake_extra = 2\n")
+    env = { "GEM_PATH" => ([root] + Gem.path).join(File::PATH_SEPARATOR) }
+    changed = "ruby:gem-modified:verifyfake-1.0:lib/verifyfake/extra.rb (differs from verifyfake-1.0.gem)"
+    recs = collect("require \"verifyfake\"\nrequire \"verifyfake/extra\"\n", env: env)
+    assert_includes taints(recs), changed
+    refute(taints(recs).any? { |t| t.include?("lib/verifyfake.rb") }, taints(recs).inspect)
+    put("test/test_helper.rb", "require \"minitest\"\nrequire \"verifyfake\"\n")
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb]
+    ids.each do |id|
+      put(id, "require \"test_helper\"\nrequire \"verifyfake/extra\"\nclass #{File.basename(id, ".rb").capitalize.delete("_")} < Minitest::Test\n  def test_x = assert(true)\nend\n")
+    end
+    [{}, { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" }].each do |slots|
+      out = batch(ids, env: env.merge(slots))
+      ids.each do |id|
+        assert_includes taints(out[id]), changed, "#{id}: #{out[:said]}"
+        refute(taints(out[id]).any? { |t| t.include?("lib/verifyfake.rb") }, id)
+      end
+      # One index of the gem's archive (named by its path, size and
+      # modification time), whose files three processes loaded.
+      st = File.stat(File.join(root, "cache", built))
+      assert_equal 1, Dir[File.join(@out, "batch", "gem-index", "*-#{st.size}-#{st.mtime.to_i}#{st.mtime.nsec}.idx")].size,
+                   Dir[File.join(@out, "batch", "gem-index", "*")].inspect
+    end
+    File.write(File.join(root, "gems/verifyfake-1.0/lib/verifyfake/extra.rb"), "$verifyfake_extra = 1\n")
+    out = batch(ids, env: env)
+    ids.each { |id| refute(taints(out[id]).any? { |t| t.include?("verifyfake") }, "#{id}: #{taints(out[id])}") }
   end
 
   # Run the files `ids` with the collector in batch mode, the loader asking
@@ -2429,7 +2637,7 @@ class CollectorTest < Minitest::Test
     assert File.file?(status_file), "no batch status; process said:\n#{said}"
     # Timing-only lines (what a group, the boot or the slots' end took) are
     # left out: tests compare what was said of the files.
-    timing = %w[group group_cleanup_ms boot_ms spawn_to_slots_ms after_slots]
+    timing = %w[group group_cleanup_ms boot_ms spawn_to_slots_ms after_slots gc_ms]
     status = File.readlines(status_file).map { |l| JSON.parse(l) }.reject { |l| (l.keys & timing).any? }
     out = { said: said, status: status, lines: {}, own: {} }
     timing = File.join(@out, "batch", "output.jsonl")

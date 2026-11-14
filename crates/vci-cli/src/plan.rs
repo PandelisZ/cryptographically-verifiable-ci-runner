@@ -1337,7 +1337,32 @@ impl ObjectLoader {
 }
 
 /// The object ids one candidate names, with its rank in the verdict's order.
-type RankedIds = ((bool, Option<i64>), Vec<(ObjectKind, String)>);
+type RankedIds = ((bool, Option<i64>), ObjectIds);
+
+/// Objects by kind and id.
+type ObjectIds = Vec<(ObjectKind, String)>;
+
+/// The verdict objects a format-3 record names (its hdr and tables, from
+/// its statement, and its shape, from its descriptor; whichever can be
+/// read), and its tables id; `None` for any other value.
+fn verdict_objects_of(bytes: &[u8]) -> Option<(ObjectIds, Option<String>)> {
+    let Ok(Record::FormatThree(frame)) = decode_record(bytes) else {
+        return None;
+    };
+    let mut ids = Vec::with_capacity(3);
+    let mut tables = None;
+    if let Ok(st) = serde_json::from_slice::<vci_attest::Statement>(&frame.statement)
+        && let Ok(p) = serde_json::from_value::<VciPredicateV2>(st.predicate)
+    {
+        tables = Some(p.tables.clone());
+        ids.push((ObjectKind::Hdr, p.hdr));
+        ids.push((ObjectKind::Tables, p.tables));
+    }
+    if let Ok(shape) = Descriptor::shape_id(&frame.descriptor) {
+        ids.push((ObjectKind::Shape, hex32(&shape)));
+    }
+    Some((ids, tables))
+}
 
 /// The verdict objects (hdr, tables, shape) the format-3 candidates among
 /// `cands` name, in candidate-priority order (the order [`Verifier::verdict`]
@@ -1362,19 +1387,11 @@ fn preload_objects<'a>(
         if s.error.is_some() {
             continue;
         }
-        let Ok(Record::FormatThree(frame)) = decode_record(&s.bytes) else {
+        let Some((ids, tables)) = verdict_objects_of(&s.bytes) else {
             continue;
         };
-        let mut ids = Vec::with_capacity(3);
-        if let Ok(st) = serde_json::from_slice::<vci_attest::Statement>(&frame.statement)
-            && let Ok(p) = serde_json::from_value::<VciPredicateV2>(st.predicate)
-        {
-            tables_by_key.push((s.key.clone(), p.tables.clone()));
-            ids.push((ObjectKind::Hdr, p.hdr));
-            ids.push((ObjectKind::Tables, p.tables));
-        }
-        if let Ok(shape) = Descriptor::shape_id(&frame.descriptor) {
-            ids.push((ObjectKind::Shape, hex32(&shape)));
+        if let Some(tables) = tables {
+            tables_by_key.push((s.key.clone(), tables));
         }
         let same_tree = s.tree.is_some() && s.tree == head16;
         ranked.push(((same_tree, issued_hint(s)), ids));
@@ -2157,13 +2174,17 @@ fn plan_timed(opts: &PlanOptions) -> Result<PlanResult> {
     let mut fetch = match (opts.fetch.clone(), store.exchange().is_some()) {
         (Some(remote), true) => {
             let (store, from) = (store.clone(), remote.clone());
+            // Told what the plan reads first once its units are listed
+            // (`tell_ahead`), the fetch downloads it while it merges.
+            let ahead = vci_store::ReadsAhead::default();
+            let told = ahead.clone();
             let handle = std::thread::spawn(move || {
                 let t = std::time::Instant::now();
-                let r = crate::cmds::fetch_messages(&*store, from.as_deref());
+                let r = crate::cmds::fetch_messages_ahead(&*store, from.as_deref(), Some(&told));
                 timing("fetch attestations (--fetch, in the background)", t);
                 r
             });
-            Some((remote, handle))
+            Some((remote, handle, ahead))
         }
         (Some(Some(remote)), false) => {
             let w = format!(
@@ -2184,14 +2205,21 @@ fn plan_timed(opts: &PlanOptions) -> Result<PlanResult> {
 
 /// A `--fetch` running in the background: the remote asked for and the
 /// thread fetching from it (its messages for stderr, or the error).
-type PendingFetch = Option<(Option<String>, std::thread::JoinHandle<Result<Vec<String>>>)>;
+/// And what to tell it the plan reads first ([`tell_ahead`]).
+type PendingFetch = Option<(
+    Option<String>,
+    std::thread::JoinHandle<Result<Vec<String>>>,
+    vci_store::ReadsAhead,
+)>;
 
 /// Wait for a pending `--fetch` and report it as `vci fetch` does; a failure
 /// is a warning (only attestations already stored locally are used).
 fn join_fetch(fetch: &mut PendingFetch, res: &mut PlanResult) {
-    let Some((remote, handle)) = fetch.take() else {
+    let Some((remote, handle, ahead)) = fetch.take() else {
         return;
     };
+    // Nothing more to tell it.
+    ahead.close();
     let outcome = handle
         .join()
         .unwrap_or_else(|p| std::panic::resume_unwind(p));
@@ -2659,6 +2687,7 @@ fn plan_with(
     // `vci fetch`, or `--fetch` above, materializes the remote's into),
     // looked up per unit, then per project: toolchain, repo identity, and
     // the checks.
+    tell_ahead(fetch, store, &ctx.repo, &files, res);
     join_fetch(fetch, res);
     let mut by_id: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
     // The candidates read only for the units the first pass cannot skip
@@ -2997,34 +3026,8 @@ fn hydrate_for_plan(
     res: &mut PlanResult,
 ) {
     let t = std::time::Instant::now();
-    let ids: Vec<&str> = files
-        .iter()
-        .filter(|f| {
-            res.projects
-                .get(f.project)
-                .is_some_and(|p| p.run_all.is_none())
-        })
-        .map(|f| f.test_id.as_str())
-        .collect();
-    // The envelopes and manifests of each unit's likeliest attestation(s)
-    // only, chosen from the keys (vci 2.2 keys say when an attestation was
-    // issued and on which tree): one made on this checkout's tree, else the
-    // newest; keys without a hint (older) are fetched too. The verdict
-    // checks those first and the plan fetches the rest only for the units
-    // it could not skip (`hydrate_more`).
-    let head = repo.head_tree().ok();
-    let base = res
-        .base_commit
-        .as_deref()
-        .and_then(|b| repo.tree_of(b).ok());
-    let memos = passing_memos(store, head.as_deref(), base.as_deref());
-    let choose = move |cands: &[StoredEnvelope]| -> Vec<usize> {
-        let memo = cands
-            .first()
-            .and_then(|c| memos.get(&c.test_key))
-            .map(String::as_str);
-        choose_candidates(cands, head.as_deref(), base.as_deref(), memo)
-    };
+    let ids = verified_ids(files, res);
+    let choose = plan_chooser(store, repo, res);
     let warning = match store.prefetch(Prefetch::Units {
         test_ids: &ids,
         choose: Some(&choose),
@@ -3044,6 +3047,84 @@ fn hydrate_for_plan(
         res.warnings.push(w);
     }
     timing("fetch the stored values the plan reads", t);
+}
+
+/// The units whose candidates the plan reads: those of every project that
+/// is verified.
+fn verified_ids<'f>(files: &'f [TestFile], res: &PlanResult) -> Vec<&'f str> {
+    files
+        .iter()
+        .filter(|f| {
+            res.projects
+                .get(f.project)
+                .is_some_and(|p| p.run_all.is_none())
+        })
+        .map(|f| f.test_id.as_str())
+        .collect()
+}
+
+/// Which of a unit's candidates the plan reads first (`hydrate_for_plan`):
+/// the envelopes and manifests of each unit's likeliest attestation(s)
+/// only, chosen from the keys (vci 2.2 keys say when an attestation was
+/// issued and on which tree): one made on this checkout's tree, else the
+/// newest; keys without a hint (older) are fetched too. The verdict checks
+/// those first and the plan fetches the rest only for the units it could
+/// not skip (`hydrate_more`).
+fn plan_chooser(
+    store: &dyn AttestationStore,
+    repo: &Repo,
+    res: &PlanResult,
+) -> impl Fn(&[StoredEnvelope]) -> Vec<usize> + Send + Sync + 'static {
+    let head = repo.head_tree().ok();
+    let base = res
+        .base_commit
+        .as_deref()
+        .and_then(|b| repo.tree_of(b).ok());
+    let memos = passing_memos(store, head.as_deref(), base.as_deref());
+    move |cands: &[StoredEnvelope]| -> Vec<usize> {
+        let memo = cands
+            .first()
+            .and_then(|c| memos.get(&c.test_key))
+            .map(String::as_str);
+        choose_candidates(cands, head.as_deref(), base.as_deref(), memo)
+    }
+}
+
+/// Tell a `--fetch` running beside the plan what the plan reads first (its
+/// units, how it chooses their candidates, and the verdict objects a
+/// candidate's value names), so that it downloads them while it merges
+/// (vci 2.11, [`vci_store::Exchange::fetch_ahead`]): a download only, the
+/// plan then reads and decides as without it.
+fn tell_ahead(
+    fetch: &PendingFetch,
+    store: &dyn AttestationStore,
+    repo: &Repo,
+    files: &[TestFile],
+    res: &PlanResult,
+) {
+    let Some((_, _, ahead)) = fetch else {
+        return;
+    };
+    // `VCI_FETCH_AHEAD=0`: nothing is told, the plan fetches what it reads
+    // after the fetch, as 2.10 did (to compare).
+    if res.projects.iter().all(|p| p.run_all.is_some())
+        || std::env::var("VCI_FETCH_AHEAD").is_ok_and(|v| v.trim() == "0")
+    {
+        ahead.close();
+        return;
+    }
+    ahead.set(vci_store::UnitsAhead {
+        test_ids: verified_ids(files, res)
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        choose: Box::new(plan_chooser(store, repo, res)),
+        objects_of: Box::new(|bytes: &[u8]| {
+            verdict_objects_of(bytes)
+                .map(|(ids, _)| ids)
+                .unwrap_or_default()
+        }),
+    });
 }
 
 /// How many candidates of one unit round 2 reads at most, the newest first

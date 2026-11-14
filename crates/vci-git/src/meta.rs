@@ -157,18 +157,20 @@ const MOVED_SKIPS: u32 = 30;
 /// How many times [`AttestStore::complete_tree`] asks for the subtrees a
 /// fetch of a tree's id left out.
 const COMPLETE_TREE_ROUNDS: usize = 5;
-/// The repack [`AttestStore::consolidate_packs`] runs when the geometric one
-/// fails, as it always does in a partial clone on git before 2.45
-/// (`cannot use internal rev list with --stdin-packs`; Ubuntu 24.04's
-/// 2.43, GitHub's runners). `-A`, never `-a` (2.2.2): `-a -d` deletes the
-/// packed objects no ref reaches, and a value vci wrote is packed while
-/// its local metadata commit reaches it, then unreferenced when vci
-/// rewrites that commit (a merge, an undo) before the push that sends it:
-/// every vex job that lost its attestations to `could not fetch <its own
-/// value> from promisor remote` (no loose object file left) did so this
-/// way. `-A` turns such objects loose instead; nothing prunes them (vci's
-/// git runs with `gc.auto=0`).
-const REPACK_FALLBACK: &[&str] = &["-A", "-d", "-q"];
+/// A pack larger than this is never merged by
+/// [`AttestStore::merge_small_packs`], the fallback of
+/// [`AttestStore::consolidate_packs`] when the geometric repack fails, as
+/// it always does in a partial clone on git before 2.45 (`cannot use
+/// internal rev list with --stdin-packs`; Ubuntu 24.04's 2.43, GitHub's
+/// runners). Until 2.11 the fallback was `git repack -A -d`, which rewrote
+/// the whole object database: 214 s on a vex runner on 12 November 2026.
+/// The packs a batched value fetch adds are a few MB at most.
+const SMALL_PACK_BYTES: u64 = 32 << 20;
+/// The most bytes of packs [`AttestStore::merge_small_packs`] merges in
+/// one go (the smallest first): what bounds its time, a few seconds.
+const SMALL_PACKS_TOTAL_MAX: u64 = 256 << 20;
+/// Removals per savepoint in [`AttestStore::remove_project_keys_untouched`].
+const REMOVE_CHUNK: usize = 500;
 /// Attempts of a fetch that loses a ref-lock race to another git process.
 const FETCH_ATTEMPTS: u32 = 5;
 /// Project-target settings that make every `git meta serialize` prune.
@@ -1378,6 +1380,86 @@ impl Reader {
             let key = r.map_err(|e| sql_err(path, e))?;
             if key.starts_with(prefix) && vci_store::parse_run_state_key(&key).is_some() {
                 out.push(key);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The run-object links on the `project` target
+    /// ([`vci_store::key::run_object_key`]), each with when it was last put
+    /// or fetched here, values not read (a link not fetched yet is listed
+    /// too: its key says everything). One key range on the store's
+    /// (target, key) index. Keys that do not parse as links are foreign and
+    /// left out.
+    pub fn run_object_links(&self) -> Result<Vec<(String, i64)>, GitError> {
+        let Some((path, db)) = &self.db else {
+            return Ok(Vec::new());
+        };
+        READER_QUERIES.with(|n| n.set(n.get() + 1));
+        let prefix = format!("{}:", vci_store::RUN_OBJECT_PREFIX);
+        let upper = prefix_upper(&prefix);
+        let mut stmt = db
+            .prepare_cached(
+                "SELECT key, last_timestamp FROM metadata
+                 WHERE target_type = ?1 AND target_value = '' AND key >= ?2 AND key < ?3
+                   AND value_type = 'string'",
+            )
+            .map_err(|e| sql_err(path, e))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![TargetType::Project.as_str(), prefix, upper],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .map_err(|e| sql_err(path, e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (key, at) = r.map_err(|e| sql_err(path, e))?;
+            if vci_store::parse_run_object_key(&key).is_some() {
+                out.push((key, at));
+            }
+        }
+        Ok(out)
+    }
+
+    /// What [`crate::gc::decide`] reads: every attestation key, run link
+    /// and object row, values not read.
+    pub fn gc_keys(&self) -> Result<crate::gc::Keys, GitError> {
+        Ok(crate::gc::Keys {
+            records: self.attestation_keys_promised()?,
+            run_object_links: self
+                .run_object_links()?
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect(),
+            run_state_links: self.run_state_keys(&format!("{}:", vci_store::RUN_STATE_PREFIX))?,
+            objects: self.object_rows()?,
+        })
+    }
+
+    /// Every stored attestation's key, on any target, and whether its value
+    /// is not fetched here yet (a promised row), values not read.
+    pub fn attestation_keys_promised(&self) -> Result<Vec<(String, bool)>, GitError> {
+        let Some((path, db)) = &self.db else {
+            return Ok(Vec::new());
+        };
+        READER_QUERIES.with(|n| n.set(n.get() + 1));
+        let prefix = format!("{KEY_PREFIX}:");
+        let mut stmt = db
+            .prepare_cached(
+                "SELECT key, is_promised FROM metadata
+                 WHERE substr(key, 1, ?1) = ?2 AND value_type = 'string'",
+            )
+            .map_err(|e| sql_err(path, e))?;
+        let rows = stmt
+            .query_map(rusqlite::params![prefix.len() as i64, prefix], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+            })
+            .map_err(|e| sql_err(path, e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (key, promised) = r.map_err(|e| sql_err(path, e))?;
+            if parse_key(&key).is_some() {
+                out.push((key, promised));
             }
         }
         Ok(out)
@@ -3148,6 +3230,85 @@ impl<'a> AttestStore<'a> {
         Ok(stored.len())
     }
 
+    /// Store run-object links (vci 2.11: [`vci_store::key::run_object_key`])
+    /// on the `project` target, inside the batch when one is open, as
+    /// [`AttestStore::put_run_state_links`] stores run-state links. The
+    /// value is `1` (never read; one blob for every link). A link already
+    /// stored is left as it is. Returns how many were not stored before.
+    pub fn put_run_object_links(&self, keys: &[String]) -> Result<usize, GitError> {
+        let links: Vec<(String, String)> =
+            keys.iter().map(|k| (k.clone(), "1".to_owned())).collect();
+        self.put_run_state_links(&links)
+    }
+
+    /// Delete these keys of the `project` target (objects, run links), each
+    /// only when its row was last put or fetched before `before` (ms since
+    /// the epoch), checked in the same write transaction as the delete, so
+    /// that a row a run put or named again after a collection began
+    /// (`put_objects` moves an existing object's time to now) stays.
+    /// Tombstones, which `push` publishes. Returns how many were removed and
+    /// how many were left because they had been written since.
+    pub fn remove_project_keys_untouched(
+        &self,
+        keys: Vec<String>,
+        before: i64,
+    ) -> Result<(usize, usize), GitError> {
+        if keys.is_empty() {
+            return Ok((0, 0));
+        }
+        // One write transaction (the batch's), in chunks of savepoints: a
+        // savepoint's statement journal is scanned at the end of each
+        // statement inside it, so one savepoint around 87,000 removals took
+        // 281 s instead of about 3.
+        let guard = self.batch()?;
+        let mut out = (0, 0);
+        for chunk in keys.chunks(REMOVE_CHUNK) {
+            let r = self.in_batch(|db, session, written| {
+                use rusqlite::OptionalExtension as _;
+                let project = Target::project();
+                let now = now_ms();
+                let (mut n, mut touched) = (0, 0);
+                for key in chunk {
+                    let at: Option<i64> = db
+                        .prepare_cached(
+                            "SELECT last_timestamp FROM metadata
+                             WHERE target_type = ?1 AND target_value = '' AND key = ?2",
+                        )
+                        .and_then(|mut st| {
+                            st.query_row(
+                                rusqlite::params![TargetType::Project.as_str(), key],
+                                |r| r.get(0),
+                            )
+                            .optional()
+                        })
+                        .map_err(write_err)?;
+                    match at {
+                        None => {}
+                        Some(at) if at >= before => touched += 1,
+                        Some(_) if remove_key(db, &project, key, session.email(), now)? => {
+                            written.push((project.clone(), key.clone()));
+                            n += 1;
+                        }
+                        Some(_) => {}
+                    }
+                }
+                Ok((n, touched))
+            });
+            match r {
+                Some(r) => {
+                    let (n, t) = r?;
+                    out.0 += n;
+                    out.1 += t;
+                }
+                // No batch could be opened on this thread (another
+                // repository's is): nothing is removed.
+                None => break,
+            }
+        }
+        guard.finish()?;
+        Ok(out)
+    }
+
     /// Delete these run-state links in one session (tombstones, which
     /// `push` publishes). Returns how many existed.
     pub fn remove_run_state_keys(&self, keys: Vec<String>) -> Result<usize, GitError> {
@@ -4526,6 +4687,17 @@ impl<'a> AttestStore<'a> {
             .collect())
     }
 
+    /// Whether the store has no value row at all (or cannot say: `false`).
+    fn store_has_no_rows(&self) -> bool {
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return false;
+        };
+        db.query_row("SELECT NOT EXISTS (SELECT 1 FROM metadata)", [], |r| {
+            r.get::<_, bool>(0)
+        })
+        .unwrap_or(false)
+    }
+
     /// Point the store's rows for `entries` (key -> blob id in `commit`'s
     /// tree) at those values, reading none that is not here: a blob in the
     /// object database is stored as git-meta's merge stores the value (up to
@@ -4541,8 +4713,27 @@ impl<'a> AttestStore<'a> {
         now: i64,
         inline_max: usize,
     ) -> Result<usize, GitError> {
+        Ok(self
+            .mark_values_gated(entries, commit, now, inline_max, || Ok(true))?
+            .unwrap_or(0))
+    }
+
+    /// [`AttestStore::mark_values`], its rows committed only when `gate`
+    /// (called once, after they are written and before the commit) says so:
+    /// `Ok(None)` when it said no and nothing was written. The merge from
+    /// paths writes them while the deletion records it applies next are
+    /// fetched (2.11: a round trip less before a fresh clone's first
+    /// plan), and keeps the store as it was when they cannot be read.
+    fn mark_values_gated(
+        &self,
+        entries: &BTreeMap<Key, String>,
+        commit: &str,
+        now: i64,
+        inline_max: usize,
+        gate: impl FnOnce() -> Result<bool, GitError>,
+    ) -> Result<Option<usize>, GitError> {
         if entries.is_empty() {
-            return Ok(0);
+            return Ok(gate()?.then_some(0));
         }
         let oids: BTreeSet<String> = entries.values().cloned().collect();
         let sizes = self.present_sizes(&oids)?;
@@ -4557,7 +4748,42 @@ impl<'a> AttestStore<'a> {
                 "the git-meta store does not exist".to_owned(),
             ));
         };
-        let tx = db.unchecked_transaction().map_err(|e| sql_err(&path, e))?;
+        // Taken for writing at once (waiting for another writer as any
+        // write does), so that what is read below is what is written over.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| sql_err(&path, e))?;
+        // A table without a row has none of a key to delete (a fresh
+        // clone's first merge: ~95,000 rows, three deletes each).
+        let holds = |table: &str| -> Result<bool, GitError> {
+            tx.query_row(&format!("SELECT EXISTS (SELECT 1 FROM {table})"), [], |r| {
+                r.get::<_, bool>(0)
+            })
+            .map_err(|e| sql_err(&path, e))
+        };
+        let deletes: Vec<&str> = [
+            (
+                "list_values",
+                "DELETE FROM list_values WHERE metadata_id IN
+                 (SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3)",
+            ),
+            (
+                "set_values",
+                "DELETE FROM set_values WHERE metadata_id IN
+                 (SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3)",
+            ),
+            (
+                "tombstones",
+                "DELETE FROM tombstones WHERE tombstone_type = 'metadata'
+                 AND target_type = ?1 AND target_value = ?2 AND key = ?3",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(table, sql)| match holds(table) {
+            Ok(false) => None,
+            _ => Some(sql),
+        })
+        .collect();
         let mut promised = 0;
         for (k, oid) in entries {
             let here = sizes.contains_key(oid);
@@ -4577,14 +4803,17 @@ impl<'a> AttestStore<'a> {
                 (None, false) => ("", false),
             };
             let (ty, tv, key) = (k.target_type.as_str(), &k.target_value, &k.key);
-            tx.execute(
+            // Prepared once for every row (2.11: a fresh clone's first fetch
+            // writes ~105,000 rows of a store shaped like vex's).
+            tx.prepare_cached(
                 "INSERT INTO metadata (target_type, target_value, key, value, value_type, last_timestamp, is_git_ref, is_promised, promised_commit, source_ref)
                  VALUES (?1, ?2, ?3, ?4, 'string', ?5, ?6, ?7, ?8, NULL)
                  ON CONFLICT(target_type, target_value, key) DO UPDATE
                  SET value = excluded.value, value_type = 'string', last_timestamp = excluded.last_timestamp,
                      is_git_ref = excluded.is_git_ref, is_promised = excluded.is_promised,
                      promised_commit = excluded.promised_commit, source_ref = NULL",
-                rusqlite::params![
+            )
+            .and_then(|mut stmt| stmt.execute(rusqlite::params![
                     ty,
                     tv,
                     key,
@@ -4593,23 +4822,21 @@ impl<'a> AttestStore<'a> {
                     git_ref,
                     !here,
                     if here { None } else { Some(commit) },
-                ],
-            )
+                ]))
             .map_err(|e| sql_err(&path, e))?;
-            for sql in [
-                "DELETE FROM list_values WHERE metadata_id IN
-                 (SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3)",
-                "DELETE FROM set_values WHERE metadata_id IN
-                 (SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3)",
-                "DELETE FROM tombstones WHERE tombstone_type = 'metadata'
-                 AND target_type = ?1 AND target_value = ?2 AND key = ?3",
-            ] {
-                tx.execute(sql, rusqlite::params![ty, tv, key])
+            for sql in &deletes {
+                tx.prepare_cached(sql)
+                    .and_then(|mut stmt| stmt.execute(rusqlite::params![ty, tv, key]))
                     .map_err(|e| sql_err(&path, e))?;
             }
         }
+        // Dropped without a commit (a gate that fails or says no): rolled
+        // back.
+        if !gate()? {
+            return Ok(None);
+        }
         tx.commit().map_err(|e| sql_err(&path, e))?;
-        Ok(promised)
+        Ok(Some(promised))
     }
 
     /// Which of `oids` the local object database holds (nothing is fetched:
@@ -4644,6 +4871,11 @@ impl<'a> AttestStore<'a> {
             }
             input.extend_from_slice(o.as_bytes());
             input.push(b'\n');
+        }
+        if std::env::var_os("VCI_PRESENT_WITH_GIT").is_none()
+            && let Some(sizes) = self.present_sizes_in_process(oids)
+        {
+            return Ok(sizes);
         }
         let listed = self
             .repo
@@ -4690,6 +4922,42 @@ impl<'a> AttestStore<'a> {
                 }
             })
             .collect())
+    }
+
+    /// [`AttestStore::present_sizes`] read in this process from the object
+    /// database as it is now (2.11): the pack indexes are read once, and an
+    /// object they do not hold is absent at once. git itself reads the pack
+    /// directory again for every object it does not find before it says
+    /// so, and a fresh clone's first fetch asked about the ~95,000 values
+    /// of a store shaped like vex's, none of them here: 8 s of `git
+    /// rev-list` in a 20 s plan. Nothing is ever fetched. `None` (the
+    /// repository or an object cannot be read here) sends the caller to
+    /// git.
+    fn present_sizes_in_process(&self, oids: &BTreeSet<String>) -> Option<BTreeMap<String, u64>> {
+        use gix::objs::FindHeader as _;
+        let repo = gix::open_opts(
+            self.repo.root().as_std_path(),
+            gix::open::Options::isolated(),
+        )
+        .ok()?;
+        let mut odb = repo.objects.clone();
+        // An object the indexes read now do not hold is not here: no
+        // second look at the disk for it (the default looks again).
+        odb.refresh_never();
+        let mut out = BTreeMap::new();
+        for o in oids {
+            let id = gix::ObjectId::from_hex(o.as_bytes()).ok()?;
+            match odb.try_header(&id) {
+                Ok(Some(h)) => {
+                    if h.kind == gix::objs::Kind::Blob {
+                        out.insert(o.clone(), h.size);
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+        }
+        Some(out)
     }
 
     /// Download the blobs `oids` from `remote` as a blobless clone fetches a
@@ -4875,8 +5143,113 @@ impl<'a> AttestStore<'a> {
                 .unwrap_or(false)
         };
         if !repack(&["--geometric=2", "-d", "-q"]) {
-            let _ = repack(REPACK_FALLBACK);
+            match self.merge_small_packs() {
+                Ok(_) => {}
+                Err(e) => store_note(format!(
+                    "the object database has {} packs, and neither a geometric repack nor merging its small packs worked ({e}); reads may fail once there are more than 32 (`git repack -A -d` merges them all, which can take minutes)",
+                    self.pack_count().unwrap_or(0)
+                )),
+            }
         }
+    }
+
+    /// The fallback of [`AttestStore::consolidate_packs`] (2.11): merge the
+    /// packs of at most [`SMALL_PACK_BYTES`] each, the smallest first and
+    /// at most [`SMALL_PACKS_TOTAL_MAX`] in all, into one pack, with
+    /// `git pack-objects` of exactly their objects (listed from their
+    /// indexes: no traversal, so it works in a partial clone on any git and
+    /// keeps every object, those no ref reaches included, as `repack -A`
+    /// did), then delete them. The new pack is a promisor pack when one of
+    /// them was. A pack with a `.keep` file is left alone, and nothing is
+    /// done while a multi-pack index exists (deleting a pack it names is
+    /// `git repack`'s job). Returns how many packs were merged.
+    fn merge_small_packs(&self) -> Result<usize, GitError> {
+        let dir = self
+            .repo
+            .git()
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects/pack",
+            ])
+            .run_str()?;
+        let dir = Utf8PathBuf::from(dir.trim());
+        if dir.join("multi-pack-index").exists() {
+            return Err(GitError::Meta(
+                "a multi-pack index exists; leaving the packs to `git repack`".to_owned(),
+            ));
+        }
+        let mut packs: Vec<(u64, Utf8PathBuf)> = Vec::new();
+        for e in std::fs::read_dir(&dir)?.flatten() {
+            let Ok(path) = Utf8PathBuf::from_path_buf(e.path()) else {
+                continue;
+            };
+            if path.extension() != Some("pack") || path.with_extension("keep").exists() {
+                continue;
+            }
+            if !path.with_extension("idx").exists() {
+                continue;
+            }
+            let size = e.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+            if size <= SMALL_PACK_BYTES {
+                packs.push((size, path));
+            }
+        }
+        packs.sort();
+        let mut total = 0u64;
+        let chosen: Vec<Utf8PathBuf> = packs
+            .into_iter()
+            .take_while(|(size, _)| {
+                total = total.saturating_add(*size);
+                total <= SMALL_PACKS_TOTAL_MAX
+            })
+            .map(|(_, p)| p)
+            .collect();
+        if chosen.len() < 2 {
+            return Ok(0);
+        }
+        let mut oids = String::new();
+        let mut promisor = false;
+        for p in &chosen {
+            let idx = std::fs::read(p.with_extension("idx"))?;
+            let listing = self.repo.git().arg("show-index").run_with_stdin(&idx)?;
+            for line in String::from_utf8_lossy(&listing).lines() {
+                if let Some(oid) = line.split_whitespace().nth(1) {
+                    oids.push_str(oid);
+                    oids.push('\n');
+                }
+            }
+            promisor |= p.with_extension("promisor").exists();
+        }
+        let out = self
+            .repo
+            .git()
+            .args(["pack-objects", "-q", "--delta-base-offset"])
+            .arg(dir.join("pack").as_str())
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_with_stdin(oids.as_bytes())?;
+        let hash = String::from_utf8_lossy(&out).trim().to_owned();
+        if !is_oid(&hash) {
+            return Err(GitError::Parse(format!(
+                "git pack-objects printed {hash:?}"
+            )));
+        }
+        let new = dir.join(format!("pack-{hash}.pack"));
+        if promisor {
+            std::fs::write(new.with_extension("promisor"), b"")?;
+        }
+        for p in &chosen {
+            if *p == new {
+                continue;
+            }
+            // The pack itself last: a reader that lists the packs between
+            // two of these finds the index of every pack it sees.
+            for ext in ["promisor", "bitmap", "rev", "mtimes", "idx", "pack"] {
+                let _ = std::fs::remove_file(p.with_extension(ext));
+            }
+        }
+        Ok(chosen.len())
     }
 
     /// How many packs the object database has, when that can be read.
@@ -5192,15 +5565,31 @@ impl<'a> AttestStore<'a> {
         remote: &str,
         oids: &BTreeSet<String>,
     ) -> Result<(BTreeSet<String>, usize, Option<String>), GitError> {
+        self.ensure_blobs_with(remote, oids, true)
+    }
+
+    /// [`AttestStore::ensure_blobs`]; without `consolidate`, the packs the
+    /// fetch adds are left for a later fetch to merge (one that runs while
+    /// other threads read the object database).
+    fn ensure_blobs_with(
+        &self,
+        remote: &str,
+        oids: &BTreeSet<String>,
+        consolidate: bool,
+    ) -> Result<(BTreeSet<String>, usize, Option<String>), GitError> {
         let mut have = self.present(oids)?;
         let missing: BTreeSet<String> = oids.difference(&have).cloned().collect();
         if missing.is_empty() {
             return Ok((have, 0, None));
         }
-        let error = self
-            .fetch_blobs(remote, &missing.iter().collect::<Vec<_>>())
-            .err()
-            .map(|e| e.to_string());
+        let missing_list: Vec<&String> = missing.iter().collect();
+        let fetched = if consolidate {
+            self.fetch_blobs(remote, &missing_list)
+        } else {
+            VALUE_ROUND_TRIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.fetch_blobs_unpacked(remote, &missing_list, true)
+        };
+        let error = fetched.err().map(|e| e.to_string());
         let now = self.present(&missing)?;
         let fetched = now.len();
         have.extend(now);
@@ -7315,13 +7704,47 @@ impl<'a> AttestStore<'a> {
     /// merge, done from the trees' paths). Same refs and result as `git meta
     /// pull`.
     pub fn fetch(&self, remote: Option<&str>) -> Result<FetchOutcome, GitError> {
+        self.fetch_ahead(remote, None)
+    }
+
+    /// [`AttestStore::fetch`] beside a plan that tells `ahead` which units
+    /// it reads first (vci 2.11, [`vci_store::Exchange::fetch_ahead`]): once
+    /// the fetched tip's keys are listed, the values of the candidates the
+    /// plan will choose among them, then the verdict objects those values
+    /// name, are downloaded in a thread of their own while the merge runs
+    /// (two round trips that a fresh clone's plan made one after the other
+    /// after the fetch). Only blobs are downloaded there: the store's rows
+    /// are the merge's, and the plan's own fetches find the blobs here and
+    /// download nothing. Best effort: a failure there is the plan's to meet
+    /// again, as before.
+    pub fn fetch_ahead(
+        &self,
+        remote: Option<&str>,
+        ahead: Option<&vci_store::ReadsAhead>,
+    ) -> Result<FetchOutcome, GitError> {
+        // However the fetch ends, the plan's units are no longer waited
+        // for.
+        struct Close<'r>(Option<&'r vci_store::ReadsAhead>);
+        impl Drop for Close<'_> {
+            fn drop(&mut self) {
+                if let Some(a) = self.0 {
+                    a.close();
+                }
+            }
+        }
+        let _close = Close(ahead);
         let _lock = self.exchange_lock()?;
         let name = self.ensure_remote(remote)?;
         let mut attempt = 0;
         loop {
             attempt += 1;
             let mut report = Report::default();
-            match self.fetch_named(&name, &mut report, false) {
+            let fetched = std::thread::scope(|scope| {
+                // Closed before the scope waits for the thread below.
+                let _closing = Close(ahead);
+                self.fetch_named_ahead(&name, &mut report, false, ahead.map(|a| (scope, a)))
+            });
+            match fetched {
                 Ok(round) => {
                     return Ok(FetchOutcome {
                         remote: name,
@@ -7343,6 +7766,21 @@ impl<'a> AttestStore<'a> {
         name: &str,
         report: &mut Report,
         for_push: bool,
+    ) -> Result<Round, GitError> {
+        self.fetch_named_ahead(name, report, for_push, None)
+    }
+
+    /// [`AttestStore::fetch_named`], downloading in a thread of `scope` what
+    /// `ahead` says the plan reads first (see [`AttestStore::fetch_ahead`]).
+    fn fetch_named_ahead<'scope, 'env>(
+        &'env self,
+        name: &'env str,
+        report: &mut Report,
+        for_push: bool,
+        ahead: Option<(
+            &'scope std::thread::Scope<'scope, 'env>,
+            &'env vci_store::ReadsAhead,
+        )>,
     ) -> Result<Round, GitError> {
         let ns = self.namespace()?;
         let remote_ref = format!("refs/{ns}/main");
@@ -7537,6 +7975,10 @@ impl<'a> AttestStore<'a> {
                 ));
             }
             remote_deleted = snap.tombstones.clone();
+            if !side && let Some((scope, ahead)) = ahead {
+                let blobs = snap.value_blobs.clone();
+                scope.spawn(move || self.download_ahead(name, ahead, &blobs));
+            }
             tip_snap = Some(snap);
         }
         let t = std::time::Instant::now();
@@ -7755,6 +8197,7 @@ impl<'a> AttestStore<'a> {
                 }
                 let back = self.restore_referenced_objects(
                     &session,
+                    name,
                     &objects_before,
                     local_before.as_deref(),
                     &remote_object_blobs,
@@ -7840,6 +8283,122 @@ impl<'a> AttestStore<'a> {
             found,
             deleted_here,
         })
+    }
+
+    /// The download of [`AttestStore::fetch_ahead`]: once `ahead` names the
+    /// plan's units (or never, once the fetch closes it), the blobs of the
+    /// candidates its `choose` picks among each unit's keys in `blobs` (the
+    /// fetched tip's values, key -> blob id), then the blobs of the objects
+    /// `objects_of` finds in those values, one `git fetch` each, the packs
+    /// left for a later fetch to merge. Nothing else is touched.
+    fn download_ahead(
+        &self,
+        remote: &str,
+        ahead: &vci_store::ReadsAhead,
+        blobs: &BTreeMap<Key, String>,
+    ) {
+        let Some(units) = ahead.wait() else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        // Each unit's candidates as the store will list them: its keys under
+        // its target, in key order.
+        // (target type, target value, test key) -> its keys and blob ids.
+        type Unit = (TargetType, String, String);
+        let mut by_unit: BTreeMap<Unit, Vec<(&Key, &String)>> = BTreeMap::new();
+        for id in &units.test_ids {
+            let t = target_for(id);
+            by_unit.insert(
+                (
+                    t.target_type().clone(),
+                    t.value().unwrap_or("").to_owned(),
+                    vci_core::test_key(id),
+                ),
+                Vec::new(),
+            );
+        }
+        for (k, oid) in blobs {
+            let Some((tk, _, _)) = parse_key(&k.key) else {
+                continue;
+            };
+            if let Some(v) =
+                by_unit.get_mut(&(k.target_type.clone(), k.target_value.clone(), tk.to_owned()))
+            {
+                v.push((k, oid));
+            }
+        }
+        let mut chosen: BTreeSet<String> = BTreeSet::new();
+        for (cands, (target_type, target_value, _)) in by_unit.values().zip(by_unit.keys()) {
+            let target = if *target_type == TargetType::Project {
+                Target::project()
+            } else {
+                Target::from_parts(target_type.clone(), Some(target_value.clone()))
+            };
+            let envs: Vec<StoredEnvelope> = cands
+                .iter()
+                .filter_map(|(k, _)| {
+                    let (tk, signer, sk) = parse_key(&k.key)?;
+                    let hint = parse_key_hint(&k.key);
+                    Some(StoredEnvelope {
+                        target: target_label(&target),
+                        key: k.key.clone(),
+                        test_key: tk.to_owned(),
+                        signer: signer.to_owned(),
+                        storage_key: sk.to_owned(),
+                        issued: hint.as_ref().map(|h| h.issued),
+                        tree: hint.and_then(|h| h.tree),
+                        bytes: Vec::new(),
+                        error: None,
+                    })
+                })
+                .collect();
+            for i in (units.choose)(&envs) {
+                if let Some((_, oid)) = cands.get(i) {
+                    chosen.insert((*oid).clone());
+                }
+            }
+        }
+        let Ok((have, _, error)) = self.ensure_blobs_with(remote, &chosen, false) else {
+            return;
+        };
+        let values_secs = started.elapsed().as_secs_f64();
+        // The verdict objects the values name.
+        let read = self.read_blobs(&have).unwrap_or_default();
+        let mut objects: BTreeSet<String> = BTreeSet::new();
+        for b in read.values() {
+            let text = String::from_utf8_lossy(b);
+            let value: String = serde_json::from_str(&text).unwrap_or_else(|_| text.into_owned());
+            for (kind, id) in (units.objects_of)(value.as_bytes()) {
+                let key = Key {
+                    target_type: TargetType::Project,
+                    target_value: String::new(),
+                    key: object_key(kind, &id),
+                };
+                if let Some(oid) = blobs.get(&key) {
+                    objects.insert(oid.clone());
+                }
+            }
+        }
+        let objects_out = self.ensure_blobs_with(remote, &objects, false);
+        if vci_core::metrics::on() {
+            vci_core::timing_line!(
+                "fetch ahead: {} candidate value(s) of {} unit(s){}: {:.2}s; {} object(s) they name{}: {:.2}s",
+                chosen.len(),
+                by_unit.len(),
+                if error.is_some() {
+                    ", the fetch failed"
+                } else {
+                    ""
+                },
+                values_secs,
+                objects.len(),
+                match &objects_out {
+                    Ok((_, _, None)) => "",
+                    _ => ", the fetch failed",
+                },
+                started.elapsed().as_secs_f64() - values_secs
+            );
+        }
     }
 
     /// [`AttestStore::restore_lost_values`] for what `local_ref` lost of
@@ -8553,41 +9112,93 @@ impl<'a> AttestStore<'a> {
             .cloned()
             .collect();
         part("read the stored deletion records and compare");
-        let (have, _, error) = self.ensure_blobs(remote, &oids)?;
-        if let Some(e) = error
-            && changed_tombstones.values().any(|o| !have.contains(o))
-        {
-            return Err(GitError::Meta(format!(
-                "fetching the deletion records of {tracking}: {e}"
-            )));
-        }
-        let read = self.read_blobs(&oids)?;
-        let tombstone = |oid: &String| {
-            read.get(oid)
-                .and_then(|b| serde_json::from_slice::<Tombstone>(b).ok())
-        };
-        let mut tombstones: BTreeMap<Key, Tombstone> = BTreeMap::new();
-        for (k, oid) in &changed_tombstones {
-            let Some(t) = tombstone(oid) else {
-                return fallback(format!(
-                    "the deletion record of {} {} (unreadable)",
-                    target_label(&k.to_target()),
-                    k.key
-                ));
-            };
-            tombstones.insert(k.clone(), t);
-        }
-        // git-meta's parse skips a record it cannot read.
-        let restamped: Vec<(Key, Tombstone)> = restamp
-            .iter()
-            .filter_map(|(k, oid)| tombstone(oid).map(|t| (k.clone(), t)))
-            .filter(|(k, t)| held.get(k) != Some(t))
-            .collect();
-        let changed = values.len() + tombstones.len() + removed.len() + dropped_records.len();
         let inline_max = guarded("reading the store", || store.object_max_size())?;
-        part("fetch and read changed deletion records");
-        let promised = self.mark_values(&values, &to_commit, now, inline_max)?;
-        part("mark the changed values");
+        // Into a store without a row or a local commit (a fresh clone's
+        // first merge), the deletion records are fetched (one round trip)
+        // while the values' rows are written, and the rows committed once
+        // the records are read (2.11: a fresh clone's first fetch of a store
+        // shaped like vex's wrote ~95,000 rows for 1.2 s after a round trip
+        // for its 9,240 records). Into any other, they are fetched first,
+        // as before, so that the store is not held for writing during a
+        // fetch while other writers may use it. Either way, records that
+        // cannot be fetched or read leave the store as it was.
+        let overlap = local.is_none() && held.is_empty() && self.store_has_no_rows();
+        enum Records {
+            Read(BTreeMap<Key, Tombstone>, Vec<(Key, Tombstone)>),
+            Unreadable(String),
+            NotFetched(String),
+        }
+        let mut records: Option<Records> = None;
+        let mut fetch_secs = 0.0;
+        let promised = std::thread::scope(|s| {
+            let fetching = s.spawn(|| {
+                let t = std::time::Instant::now();
+                (self.ensure_blobs_with(remote, &oids, false), t.elapsed())
+            });
+            let mut fetching = Some(fetching);
+            let mut fetched = None;
+            if !overlap && let Some(h) = fetching.take() {
+                fetched = Some(h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+            }
+            self.mark_values_gated(&values, &to_commit, now, inline_max, || {
+                let (got, took) = match (fetched, fetching) {
+                    (Some(f), _) => f,
+                    (None, Some(h)) => h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                    (None, None) => unreachable!("the deletion records' fetch is joined once"),
+                };
+                fetch_secs = took.as_secs_f64();
+                let (have, _, error) = got?;
+                if let Some(e) = error
+                    && changed_tombstones.values().any(|o| !have.contains(o))
+                {
+                    records = Some(Records::NotFetched(e));
+                    return Ok(false);
+                }
+                let read = self.read_blobs(&oids)?;
+                let tombstone = |oid: &String| {
+                    read.get(oid)
+                        .and_then(|b| serde_json::from_slice::<Tombstone>(b).ok())
+                };
+                let mut tombstones: BTreeMap<Key, Tombstone> = BTreeMap::new();
+                for (k, oid) in &changed_tombstones {
+                    let Some(t) = tombstone(oid) else {
+                        records = Some(Records::Unreadable(format!(
+                            "the deletion record of {} {} (unreadable)",
+                            target_label(&k.to_target()),
+                            k.key
+                        )));
+                        return Ok(false);
+                    };
+                    tombstones.insert(k.clone(), t);
+                }
+                // git-meta's parse skips a record it cannot read.
+                let restamped: Vec<(Key, Tombstone)> = restamp
+                    .iter()
+                    .filter_map(|(k, oid)| tombstone(oid).map(|t| (k.clone(), t)))
+                    .filter(|(k, t)| held.get(k) != Some(t))
+                    .collect();
+                records = Some(Records::Read(tombstones, restamped));
+                Ok(true)
+            })
+        })?;
+        let (tombstones, restamped, promised) = match (records, promised) {
+            (Some(Records::Read(t, r)), Some(p)) => (t, r, p),
+            (Some(Records::Unreadable(why)), _) => return fallback(why),
+            (Some(Records::NotFetched(e)), _) => {
+                return Err(GitError::Meta(format!(
+                    "fetching the deletion records of {tracking}: {e}"
+                )));
+            }
+            _ => {
+                return Err(GitError::Meta(format!(
+                    "merging {tracking} from its paths: the deletion records were not read"
+                )));
+            }
+        };
+        let changed = values.len() + tombstones.len() + removed.len() + dropped_records.len();
+        part(&format!(
+            "mark the changed values and fetch and read changed deletion records (the fetch {fetch_secs:.2}s)"
+        ));
         let email = session.email().to_owned();
         // The values deleted now are stamped after the tree's records, as
         // git-meta does; a merge keeps the deletion record its tree holds.
@@ -9533,6 +10144,7 @@ impl<'a> AttestStore<'a> {
     fn restore_referenced_objects(
         &self,
         session: &Session,
+        remote: &str,
         before: &BTreeSet<String>,
         local_before: Option<&str>,
         tip_blobs: &BTreeMap<String, String>,
@@ -9562,14 +10174,44 @@ impl<'a> AttestStore<'a> {
         if candidates.is_empty() {
             return Ok(0);
         }
+        let keys = self.reader()?.gc_keys()?;
+        // 2.11: a record whose run wrote no run-object links (a vci before
+        // 2.11, such as a laptop or a pinned workflow still on 2.10) and
+        // whose value is not here may name any of them. While there is one,
+        // every removal of this clone's that the remote's tip does not
+        // have yet (its tip still holds the object) is put back: such a
+        // record here at the collection kept it from removing any hdr,
+        // tables or shape object, and one another clone published since
+        // this one fetched may name an object this push removed. (An
+        // object the remote has already removed is put back only if a
+        // record read here or a live link names it, as below: a `vci
+        // prune` elsewhere is not undone.)
+        let legacy_unread =
+            !crate::gc::unread_legacy(&keys.records, &keys.run_object_links).is_empty();
+        let own_removal = |k: &String| legacy_unread && tip_blobs.contains_key(k);
         // Which attestations name them needs every attestation this clone
         // holds read (one it never fetched is not one its plans relied on,
         // as for manifests); one that cannot be read might name any of
         // them, so then every candidate is put back.
-        let referenced = self.referenced_objects(true)?;
+        let mut referenced = self.referenced_objects(true)?;
+        // 2.11: and every object a run-object link of a run with a record
+        // here names (keys only): a record another clone pushed since this
+        // one fetched, whose value is not here, names its objects through
+        // its run's links, so an object this clone's push removed and that
+        // record names is put back.
+        if let Some(r) = referenced.as_mut() {
+            r.extend(crate::gc::live_named(
+                &keys,
+                now_ms() / 1000,
+                crate::gc::run_grace_secs(),
+            ));
+        }
+        drop(keys);
         let wanted: Vec<&String> = candidates
             .iter()
-            .filter(|(_, (_, id))| referenced.as_ref().is_none_or(|r| r.contains(id)))
+            .filter(|(k, (_, id))| {
+                own_removal(k) || referenced.as_ref().is_none_or(|r| r.contains(id))
+            })
             .map(|(k, _)| k)
             .collect();
         if wanted.is_empty() {
@@ -9617,6 +10259,18 @@ impl<'a> AttestStore<'a> {
             .flatten()
             .cloned()
             .collect();
+        // A lazy (blobless) clone, as every CI job's is, never fetched the
+        // value of an object only another clone's record names: it is
+        // fetched from the remote's tip here (only the ones not here), or
+        // the object could not be put back and the push would publish its
+        // removal.
+        let from_tip: BTreeSet<String> = wanted
+            .iter()
+            .filter(|k| local_blobs.get(**k).is_none_or(|o| !oids.contains(o)))
+            .filter_map(|k| tip_blobs.get(*k))
+            .cloned()
+            .collect();
+        let (present, _, fetch_error) = self.ensure_blobs(remote, &from_tip)?;
         let bytes = self.read_blobs(&oids)?;
         let project = Target::project();
         let mut put_back: Vec<String> = Vec::new();
@@ -9641,6 +10295,32 @@ impl<'a> AttestStore<'a> {
                 put_back.push(key.clone());
                 break;
             }
+        }
+        // An object a record names whose value is on the remote's tip but
+        // could not be fetched: publishing this merge would remove it, so
+        // nothing is (the push fails as a whole; the removal stays local
+        // and the next push puts it back or publishes it).
+        let put: BTreeSet<&String> = put_back.iter().collect();
+        let unread = candidates
+            .keys()
+            .filter(|k| !put.contains(k))
+            .filter(|k| {
+                own_removal(k)
+                    || referenced
+                        .as_ref()
+                        .is_none_or(|r| r.contains(&candidates[*k].1))
+            })
+            .filter(|k| {
+                tip_blobs
+                    .get(*k)
+                    .is_some_and(|o| !present.contains(o) && !bytes.contains_key(o))
+            })
+            .count();
+        if unread > 0 {
+            return Err(GitError::Meta(format!(
+                "cannot put back {unread} object(s) that attestations name, which this store removed and {remote}'s refs/meta/main holds: fetching their values failed ({}); nothing was pushed",
+                fetch_error.as_deref().unwrap_or("not in the fetched pack")
+            )));
         }
         self.stamp_written(put_back.iter().map(|k| (&project, k.as_str())))?;
         Ok(put_back.len())
@@ -11397,16 +12077,18 @@ mod tests {
         );
     }
 
-    /// The fallback repack keeps a value that was packed while a ref
-    /// reached it and unreferenced after (2.2.2; `-a -d` deleted it).
+    /// The fallback of the geometric repack (2.11) merges the small packs
+    /// into one, keeps every object they held (one no ref reaches too:
+    /// 2.2.2's `-a -d` deleted such a value), keeps a promisor pack a
+    /// promisor pack, and leaves a large pack and a kept one alone.
     #[test]
-    fn the_fallback_repack_keeps_a_value_whose_ref_moved_away() {
+    fn the_fallback_merges_only_the_small_packs_and_keeps_every_object() {
         let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
         let git = |args: &[&str], input: Option<&str>| -> String {
             use std::io::Write;
             let mut c = std::process::Command::new("git");
-            c.current_dir(d)
+            c.current_dir(&root)
                 .args(args)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_AUTHOR_NAME", "t")
@@ -11420,6 +12102,7 @@ mod tests {
                 ch.stdin.take().unwrap().write_all(i.as_bytes()).unwrap();
             }
             let out = ch.wait_with_output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
             String::from_utf8_lossy(&out.stdout).trim().to_owned()
         };
         git(&["init", "-q"], None);
@@ -11427,21 +12110,57 @@ mod tests {
             &["commit-tree", &git(&["mktree"], Some("")), "-m", "base"],
             None,
         );
-        git(&["update-ref", "refs/meta/local/main", &base], None);
-        let v = git(&["hash-object", "-w", "--stdin"], Some("a value vci wrote"));
-        let t = git(&["mktree"], Some(&format!("100644 blob {v}\tv\n")));
-        let c = git(&["commit-tree", &t, "-p", &base, "-m", "serialized"], None);
-        git(&["update-ref", "refs/meta/local/main", &c], None);
-        let mut args = vec!["-c", "gc.auto=0", "repack"];
-        args.extend(REPACK_FALLBACK);
-        git(&args, None);
-        git(&["update-ref", "refs/meta/local/main", &base], None);
-        git(&args, None);
-        assert_eq!(
-            git(&["cat-file", "-t", &v], None),
-            "blob",
-            "the value was deleted"
-        );
+        git(&["update-ref", "refs/heads/main", &base], None);
+        let packdir = root.join(".git/objects/pack");
+        let packs = || -> Vec<Utf8PathBuf> {
+            let mut v: Vec<Utf8PathBuf> = std::fs::read_dir(&packdir)
+                .unwrap()
+                .flatten()
+                .filter_map(|e| Utf8PathBuf::from_path_buf(e.path()).ok())
+                .filter(|p| p.extension() == Some("pack"))
+                .collect();
+            v.sort();
+            v
+        };
+        // Five small packs of one value each (none reachable from a ref),
+        // the second a promisor pack, the third kept.
+        let mut values = Vec::new();
+        for i in 0..5 {
+            let v = git(
+                &["hash-object", "-w", "--stdin"],
+                Some(&format!("value {i}")),
+            );
+            let before = packs();
+            git(
+                &["pack-objects", "-q", packdir.join("pack").as_str()],
+                Some(&format!("{v}\n")),
+            );
+            let new = packs().into_iter().find(|p| !before.contains(p)).unwrap();
+            if i == 1 {
+                std::fs::write(new.with_extension("promisor"), b"").unwrap();
+            }
+            if i == 2 {
+                std::fs::write(new.with_extension("keep"), b"").unwrap();
+            }
+            values.push(v);
+        }
+        git(&["prune-packed"], None);
+        assert_eq!(packs().len(), 5);
+        let repo = Repo::discover(&root).unwrap();
+        let store = AttestStore::new(&repo);
+        assert_eq!(store.merge_small_packs().unwrap(), 4);
+        let after = packs();
+        assert_eq!(after.len(), 2, "{after:?}");
+        let promisors = after
+            .iter()
+            .filter(|p| p.with_extension("promisor").exists())
+            .count();
+        assert_eq!(promisors, 1, "the merged pack is a promisor pack");
+        for v in &values {
+            assert_eq!(git(&["cat-file", "-t", v], None), "blob", "{v} was lost");
+        }
+        // Nothing left to merge: one small pack and a kept one.
+        assert_eq!(store.merge_small_packs().unwrap(), 0);
     }
 
     /// 2.6.2: a stored value whose blob the object database lacks (an

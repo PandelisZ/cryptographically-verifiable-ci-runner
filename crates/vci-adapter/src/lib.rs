@@ -44,8 +44,9 @@ pub use pytest::{
 };
 pub use rails::{
     AUTOLOAD_INPUTS, RAILS_GLOBAL_FILES, RAILS_HASH, RAILS_IGNORE, RAILS_LOOSE_HASH,
-    RAILS_LOOSE_IGNORED_INPUTS, RAILS_RUN_VARS, RAILS_SCRATCH_DIRS, RAILS_SEED, RSPEC_GLOBAL_FILES,
-    RUBY_BIN_ENV, RUBY_COLLECTOR_ENV, RailsAdapter, RailsRunner, find_ruby_collector,
+    RAILS_LOOSE_IGNORED_INPUTS, RAILS_PRELOAD_ROUTES_ENV, RAILS_RUN_VARS, RAILS_SCRATCH_DIRS,
+    RAILS_SEED, RSPEC_GLOBAL_FILES, RUBY_BIN_ENV, RUBY_COLLECTOR_ENV, RailsAdapter, RailsRunner,
+    find_ruby_collector, preload_routes_wanted,
 };
 pub use vitest::{JS_PLUGIN_ENV, VITEST_HASH, VITEST_IGNORE, VitestAdapter, find_js_plugin};
 
@@ -156,6 +157,11 @@ pub struct RunHints {
     /// the constants looked up in autoload directories instead of their
     /// listings.
     pub rails_autoload_lookups: bool,
+    /// Rails (2.11.0): a batch's boot draws the application's routes before
+    /// its files' processes fork (`rails_inputs = "loose"`, which leaves
+    /// the routes files out of every manifest; `VCI_RAILS_PRELOAD_ROUTES=0`
+    /// turns it off).
+    pub rails_preload_routes: bool,
 }
 
 /// A test file as reported by the runner's list command.
