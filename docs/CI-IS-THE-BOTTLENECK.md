@@ -160,7 +160,7 @@ Actions history. The jobs API gives when each job started and ended; each job's 
 jobs per pull request.
 
 We added vci on 16 October, and Rails pull-request jobs started skipping on 19 October. The chart covers 5 October to
-8 November. For each day we read 30 pull-request runs and 15 runs of vci's attest workflow, spread over the day, and
+8 November, while Rails ran through vci; what happened after that is at the end of this section. For each day we read 30 pull-request runs and 15 runs of vci's attest workflow, spread over the day, and
 scaled them to every run that day.
 
 ![vex's Rails CI from 5 October to 8 November 2026: the share of test-file runs vci skipped, the median pull-request job, and runner-hours per week with vci against an estimate without it](images/vex-rails-ci-over-time.png)
@@ -210,8 +210,7 @@ Our Rails CI has not got cheaper in total. From 19 October to 8 November, vci co
   unattested.
 
 Net, for the week of 2 November: the pull-request jobs took 138 runner-hours, against 152 to 167 without vci (9 to
-17% less), and the attest job added 33. The attest job is the next thing to fix. Refreshing the cache needs only the
-attestations, not Ruby or the gems, so it can move to a small runner.
+17% less), and the attest job added 33.
 
 The full reruns are correct, not misses. The plan names the file that caused each one:
 
@@ -237,14 +236,40 @@ vci also runs our vex-web node:test files and our Rust test targets. On 7 and 8 
 were skipped. Their attest jobs cost 12 runner-hours in the week of 2 November. We have no baseline for the time they
 save, so they are not in the totals above.
 
+### Then we took Rails off it
+
+On 12 November we stopped running Rails through vci. Two things decided it.
+
+**The store grew until the plan cost more than the tests.** On 8 November we switched off the hourly job that pruned
+the attestation store. Nothing else pruned it. Pull-request jobs publish an attestation
+of every file they run, and in four days the store went from about 30,000 attestations to 289,159: 125 of each Rails
+file. The plan in every Rails job went from 9 seconds to about 400. A store that needs a scheduled job to stay small
+is a design mistake, and vci no longer has one: since 2.10.3 `vci push` removes superseded attestations as it
+publishes, from the keys alone, and since 2.11.0 it also removes expired ones and the objects nothing references.
+
+**When every file runs, vci costs about twice the plain runner.** Our Rails tests got faster in October (SQLite,
+in-memory fixtures): a shard of 908 files now takes 30 seconds with `bin/rails test` on one machine. vci runs each
+file in its own process, forked from a booted parent, so that it can record exactly what that file read. The same
+shard took 83 seconds with vci 2.10.3 and takes 58 with 2.11.0. About a third of our Rails jobs rerun everything,
+because `db/schema.rb` changed, so the jobs that skip most files did not make up for the ones that do not. Sharing
+worker processes between files would close the gap, but then a file's recorded inputs miss whatever an earlier file
+already loaded, and we have no sound way around that yet.
+
+vci still runs our node:test and Go suites. There it is close to break-even, not a win: a plain run of all 458
+vex-web test files takes 36 seconds on a 4-core runner, and a pull-request job with vci takes about the same (9
+seconds to plan, 22 to run the nine files it cannot skip, 4 to publish). Eight of those nine can never be attested,
+because they touch paths inside `node_modules` that vci does not track, and they are the slow ones.
+
+What this taught us about where vci pays: tests that are slow per file (seconds, not milliseconds), inputs that
+rarely change for most files, and a plan that costs a few seconds. Our Rails suite fails the first two. A suite of
+slow integration or end-to-end tests would pass all three.
+
 ## Status and what it costs
 
-v2.10.2, MIT. Six runners: Vitest, node:test, pytest, Go, Cargo, and Rails with RSpec. Each has an end-to-end suite
-that drives the real CLI against a bare git remote. On our 2,350-file Rails suite, vci's own steps (fetch and plan,
-restore its store, sign and publish) take a median of 30 s in a job that skips most of its files and 52 s in one
-that runs everything. What you save beyond that is every test that already ran on the same inputs. What you pay
-beyond that, when nothing ran before, is one process per test file plus signing and pushing, and the jobs that
-attest your default branch.
+v2.11.0, MIT. Six runners: Vitest, node:test, pytest, Go, Cargo, and Rails with RSpec. Each has an end-to-end suite
+that drives the real CLI against a bare git remote. On our monorepo, vci's own steps in a node:test job (fetch and
+plan, sign and publish) take about 13 s. What you save beyond that is every test that already ran on the same
+inputs. What you pay beyond that, when nothing ran before, is one process per test file plus signing and pushing.
 
 There is no company behind this. It is a tool for a problem that the people with the most agents hit first and that
 the rest of us are about to.
