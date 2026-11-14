@@ -430,3 +430,159 @@ test("module.register from TypeScript loaders that resolve off-thread (tsx) is r
   assert.equal(result(r.recs).state, "passed", r.output);
   assert.ok(taints(r.recs).some((t) => t.startsWith("module.register:")), JSON.stringify(r.recs));
 });
+
+/**
+ * A pnpm virtual store entry: `node_modules/.pnpm/<name>@<version>/node_modules/<name>` with
+ * `files`, its dependencies linked beside it, and `node_modules/<name>` linking to it.
+ * @param {string} project
+ * @param {string} name
+ * @param {string} version
+ * @param {Record<string, string>} files
+ * @param {string[]} [deps] `name@version` of store entries it depends on
+ */
+function pnpmPackage(project, name, version, files, deps = []) {
+  const entry = path.join(project, "node_modules/.pnpm", `${name.replace("/", "+")}@${version}`, "node_modules");
+  const dir = path.join(entry, name);
+  fs.mkdirSync(dir, { recursive: true });
+  for (const [rel, content] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), content);
+  }
+  for (const d of deps) {
+    const at = d.lastIndexOf("@");
+    const [dn, dv] = [d.slice(0, at), d.slice(at + 1)];
+    const link = path.join(entry, dn);
+    fs.mkdirSync(path.dirname(link), { recursive: true });
+    fs.symlinkSync(path.join(project, "node_modules/.pnpm", `${dn.replace("/", "+")}@${dv}`, "node_modules", dn), link, "dir");
+  }
+  const top = path.join(project, "node_modules", name);
+  fs.mkdirSync(path.dirname(top), { recursive: true });
+  if (!fs.existsSync(top)) fs.symlinkSync(dir, top, "dir");
+}
+
+/** napi-rs's loader: the binary beside the loader first, else the platform package. */
+const NAPI_LOADER =
+  "let b;\ntry { b = require('./addon.plat.node'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; b = require('addon-plat'); }\nmodule.exports = b;\n";
+
+test("a native addon a package looks for in its own directory is that package's, by name@version", () => {
+  const p = makeProject({
+    "src/addon.test.cjs": "const assert = require('node:assert');\nconst { test } = require('node:test');\ntest('a', () => { assert.equal(require('addon').v, 7); });\n",
+    // A library that looks for npm's hidden lockfile at the top of node_modules (pnpm never
+    // writes one): a probe of a path in no package, which the Rust side records as absent.
+    "src/hidden.test.cjs":
+      "const assert = require('node:assert');\nconst fs = require('node:fs');\nconst path = require('node:path');\nconst { test } = require('node:test');\n" +
+      "test('a', () => { assert.equal(require('lockfinder').find(), null); });\n",
+  });
+  pnpmPackage(p, "addon-plat", "1.0.0", {
+    "package.json": JSON.stringify({ name: "addon-plat", version: "1.0.0", main: "addon.plat.js" }),
+    "addon.plat.js": "module.exports = { v: 7 };\n",
+  });
+  pnpmPackage(p, "addon", "1.0.0", {
+    "package.json": JSON.stringify({ name: "addon", version: "1.0.0", optionalDependencies: { "addon-plat": "1.0.0" } }),
+    "index.js": NAPI_LOADER,
+  }, ["addon-plat@1.0.0"]);
+  pnpmPackage(p, "lockfinder", "2.0.0", {
+    "package.json": JSON.stringify({ name: "lockfinder", version: "2.0.0" }),
+    "index.js":
+      "const fs = require('node:fs');\nconst path = require('node:path');\n" +
+      "exports.find = () => { const f = path.join(process.cwd(), 'node_modules/.package-lock.json'); return fs.existsSync(f) ? f : null; };\n",
+  });
+  const r = runFile(p, "src/addon.test.cjs");
+  assert.equal(result(r.recs).state, "passed", r.output);
+  assert.deepEqual(taints(r.recs), []);
+  const ext = new Set(r.recs.filter((x) => x.kind === "external").map((x) => `${x.name}@${x.version}`));
+  assert.ok(ext.has("addon@1.0.0") && ext.has("addon-plat@1.0.0"), JSON.stringify([...ext]));
+  // Regression (vex-web, vci 2.10.3): `require('./addon.plat.node')` failing in the package's
+  // directory was recorded as probes of paths inside node_modules, which no run can vouch for.
+  for (const x of r.recs) {
+    if (typeof x.path === "string") assert.ok(!x.path.includes("/node_modules/"), `inside node_modules: ${JSON.stringify(x)}`);
+  }
+
+  const h = runFile(p, "src/hidden.test.cjs");
+  assert.equal(result(h.recs).state, "passed", h.output);
+  assert.ok(paths(h.recs, "probe").has(path.join(p, "node_modules/.package-lock.json")), JSON.stringify(h.recs));
+  assert.deepEqual(taints(h.recs), []);
+});
+
+test("a native addon of a package that builds or downloads code when installed is refused", () => {
+  const p = makeProject({
+    "src/gyp.test.cjs": "const assert = require('node:assert');\nconst { test } = require('node:test');\ntest('a', () => { assert.equal(require('gypaddon').v, 1); });\n",
+  });
+  // node-gyp's output, which no tarball holds: the version does not pin it.
+  pnpmPackage(p, "gypaddon", "3.0.0", {
+    "package.json": JSON.stringify({ name: "gypaddon", version: "3.0.0", scripts: { install: "node-gyp rebuild" } }),
+    "index.js": "let b;\ntry { b = require('./build/Release/gypaddon.node'); } catch (e) { b = { v: 1 }; }\nmodule.exports = b;\n",
+  });
+  const r = runFile(p, "src/gyp.test.cjs");
+  assert.equal(result(r.recs).state, "passed", r.output);
+  assert.ok(taints(r.recs).some((t) => t.startsWith("external-native-installed:gypaddon@3.0.0")), JSON.stringify(r.recs));
+  // So is one with a binding.gyp and no install script (npm runs `node-gyp rebuild` for it).
+  const q = makeProject({ "src/gyp.test.cjs": "const assert = require('node:assert');\nconst { test } = require('node:test');\ntest('a', () => { assert.equal(require('gypaddon').v, 1); });\n" });
+  pnpmPackage(q, "gypaddon", "3.0.0", {
+    "package.json": JSON.stringify({ name: "gypaddon", version: "3.0.0" }),
+    "binding.gyp": "{}\n",
+    "index.js": "let b;\ntry { b = require('./build/Release/gypaddon.node'); } catch (e) { b = { v: 1 }; }\nmodule.exports = b;\n",
+  });
+  const s = runFile(q, "src/gyp.test.cjs");
+  assert.ok(taints(s.recs).some((t) => t.startsWith("external-native-installed:gypaddon@3.0.0")), JSON.stringify(s.recs));
+});
+
+/** A node-gyp-build style loader that reads (for the test, instead of dlopen) its addon. */
+const GYP_BUILD_LOADER =
+  "const fs = require('node:fs');\nconst path = require('node:path');\n" +
+  "const built = path.join(__dirname, 'build/Release/addon.node');\n" +
+  "const f = fs.existsSync(built) ? built : path.join(__dirname, 'prebuilds/any/addon.node');\n" +
+  "module.exports = JSON.parse(fs.readFileSync(f, 'utf8'));\n";
+
+test("a prebuilt addon node-gyp-build loads from the package's tarball is accepted, its build/ recorded absent", () => {
+  const body = "const assert = require('node:assert');\nconst { test } = require('node:test');\ntest('a', () => { assert.equal(require('ngb').v, 4); });\n";
+  const p = makeProject({ "src/ngb.test.cjs": body });
+  // bufferutil, utf-8-validate: "install": "node-gyp-build", prebuilds/ in the tarball.
+  pnpmPackage(p, "ngb", "4.0.9", {
+    "package.json": JSON.stringify({ name: "ngb", version: "4.0.9", scripts: { install: "node-gyp-build" } }),
+    "binding.gyp": "{}\n",
+    "index.js": GYP_BUILD_LOADER,
+    "prebuilds/any/addon.node": JSON.stringify({ v: 4 }),
+  });
+  const r = runFile(p, "src/ngb.test.cjs");
+  assert.equal(result(r.recs).state, "passed", r.output);
+  assert.deepEqual(taints(r.recs), [], JSON.stringify(r.recs));
+  assert.ok(r.recs.some((x) => x.kind === "external" && x.name === "ngb" && x.version === "4.0.9"));
+  const dir = path.join(p, "node_modules/.pnpm/ngb@4.0.9/node_modules/ngb");
+  assert.ok(paths(r.recs, "probe").has(path.join(dir, "build")), JSON.stringify(r.recs));
+
+  // Built locally (node-gyp-build found no prebuild, or someone ran node-gyp): build/ is not the
+  // tarball's, whichever file was loaded.
+  fs.mkdirSync(path.join(dir, "build/Release"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "build/Release/addon.node"), JSON.stringify({ v: 4 }));
+  const b = runFile(p, "src/ngb.test.cjs");
+  assert.ok(taints(b.recs).some((t) => t.startsWith("external-native-installed:ngb@4.0.9")), JSON.stringify(b.recs));
+
+  // Any other install code (prebuild-install downloads into build/Release; a script may write
+  // anywhere): a prebuilds/ addon is refused too.
+  const q = makeProject({ "src/ngb.test.cjs": body });
+  pnpmPackage(q, "ngb", "4.0.9", {
+    "package.json": JSON.stringify({ name: "ngb", version: "4.0.9", scripts: { install: "node fetch-binary.js" } }),
+    "index.js": GYP_BUILD_LOADER,
+    "prebuilds/any/addon.node": JSON.stringify({ v: 4 }),
+  });
+  const s = runFile(q, "src/ngb.test.cjs");
+  assert.ok(taints(s.recs).some((t) => t.startsWith("external-native-installed:ngb@4.0.9")), JSON.stringify(s.recs));
+});
+
+test("an addon below a nested package.json is judged by the installed package around it", () => {
+  const p = makeProject({
+    "src/nested.test.cjs": "const assert = require('node:assert');\nconst { test } = require('node:test');\ntest('a', () => { assert.equal(require('gyp').v, 5); });\n",
+  });
+  // gyp@1.0.0 runs node-gyp at install; its build/ holds a package.json with a name and version
+  // of its own (2.11.0's first cut attributed the addon to it and accepted it).
+  pnpmPackage(p, "gyp", "1.0.0", {
+    "package.json": JSON.stringify({ name: "gyp", version: "1.0.0", scripts: { install: "node-gyp rebuild" } }),
+    "build/package.json": JSON.stringify({ name: "gyp-build", version: "0.0.0" }),
+    "build/Release/gyp.node": JSON.stringify({ v: 5 }),
+    "index.js": "const fs = require('node:fs');\nconst path = require('node:path');\nmodule.exports = JSON.parse(fs.readFileSync(path.join(__dirname, 'build/Release/gyp.node'), 'utf8'));\n",
+  });
+  const r = runFile(p, "src/nested.test.cjs");
+  assert.equal(result(r.recs).state, "passed", r.output);
+  assert.ok(taints(r.recs).some((t) => t.startsWith("external-native-installed:gyp-build@0.0.0")), JSON.stringify(r.recs));
+});

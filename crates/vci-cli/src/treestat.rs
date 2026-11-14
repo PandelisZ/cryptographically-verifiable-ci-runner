@@ -110,14 +110,31 @@ pub struct TreeStat {
     /// recorded, they are not walked.
     nested: Vec<Utf8PathBuf>,
     map: HashMap<Utf8PathBuf, StatKey>,
+    /// The names in every `node_modules` directory the walk met (a real
+    /// directory, not walked), lowercased; `None` when it could not be
+    /// listed. What a run's absent probes directly below one are checked
+    /// against ([`TreeStat::absent_below_node_modules`]).
+    node_modules: HashMap<Utf8PathBuf, Option<std::collections::BTreeSet<String>>>,
 }
 
 /// One directory's share of a snapshot: its children's metadata (and its
-/// own, handed down by its parent), or the fact that it is a nested
-/// repository.
+/// own, handed down by its parent), the fact that it is a nested
+/// repository, or the names in a `node_modules` directory.
 enum DirResult {
     Entries(Vec<(Utf8PathBuf, StatKey)>),
     Nested(Utf8PathBuf),
+    NodeModules(Utf8PathBuf, Option<std::collections::BTreeSet<String>>),
+}
+
+/// The names in `dir`, lowercased (a name that differs only in letter case
+/// counts as the same: on a case-insensitive file system it is).
+fn lowercase_names(dir: &Utf8Path) -> Option<std::collections::BTreeSet<String>> {
+    let mut out = std::collections::BTreeSet::new();
+    for ent in std::fs::read_dir(dir).ok()? {
+        let name = ent.ok()?.file_name().into_string().ok()?;
+        out.insert(name.to_lowercase());
+    }
+    Some(out)
 }
 
 /// State shared by the parallel walk of [`TreeStat::snapshot_skipping`].
@@ -167,6 +184,9 @@ impl Walk<'_> {
             if m.is_dir() && !SKIP_DIRS.contains(&name.as_str()) {
                 scope.spawn(move |s| self.dir(s, p, Some(k)));
             } else {
+                if m.is_dir() && name == "node_modules" {
+                    self.push(DirResult::NodeModules(p.clone(), lowercase_names(&p)));
+                }
                 out.push((p, k));
             }
         }
@@ -214,16 +234,20 @@ impl TreeStat {
             .iter()
             .map(|r| match r {
                 DirResult::Entries(e) => e.len(),
-                DirResult::Nested(_) => 0,
+                DirResult::Nested(_) | DirResult::NodeModules(..) => 0,
             })
             .sum::<usize>();
         let mut map = HashMap::with_capacity(len + 1);
         let mut nested = Vec::new();
+        let mut node_modules = HashMap::new();
         map.insert(root.to_owned(), root_key);
         for r in results {
             match r {
                 DirResult::Entries(e) => map.extend(e),
                 DirResult::Nested(d) => nested.push(d),
+                DirResult::NodeModules(d, names) => {
+                    node_modules.insert(d, names);
+                }
             }
         }
         nested.sort();
@@ -233,6 +257,7 @@ impl TreeStat {
             submodules,
             nested,
             map,
+            node_modules,
         })
     }
 
@@ -316,6 +341,11 @@ impl TreeStat {
             };
         }
         let rel = e.path.as_str();
+        if e.kind == EntryKind::Absent
+            && let Some(r) = self.absent_below_node_modules(rel)
+        {
+            return r;
+        }
         if rel.split('/').any(|c| SKIP_DIRS.contains(&c)) {
             return Err(Unverified::Untracked(format!(
                 "{rel}: inside a directory vci does not track"
@@ -370,6 +400,128 @@ impl TreeStat {
 }
 
 impl TreeStat {
+    /// An absent entry `rel` below a `node_modules` directory (the first
+    /// directory vci does not walk on its way; npm's hidden lockfile
+    /// `node_modules/.package-lock.json`, which pnpm never writes and tools
+    /// look for): absent before the run and absent now, as any other absent
+    /// entry must be, when that can be told. It can when the first missing
+    /// component of `rel` is that `node_modules` directory itself (whose
+    /// parent the snapshot walked) or a name directly in it (the snapshot
+    /// listed it). `None` (not vouched for: the caller refuses it as
+    /// untracked) when the first missing component is deeper, inside a
+    /// package, which only the package's version identifies.
+    fn absent_below_node_modules(&self, rel: &str) -> Option<Result<(), Unverified>> {
+        let parts: Vec<&str> = rel.split('/').collect();
+        let i = parts.iter().position(|c| SKIP_DIRS.contains(c))?;
+        if parts[i] != "node_modules" || i + 1 >= parts.len() {
+            return None;
+        }
+        let nm = self.root.join(parts[..=i].join("/"));
+        if self.skip.iter().any(|s| nm.starts_with(s))
+            || self.nested.iter().any(|n| nm.starts_with(n) && nm != *n)
+        {
+            return None;
+        }
+        // The first component, from the top, that is missing now.
+        let mut missing = None;
+        for j in 0..parts.len() {
+            let p = self.root.join(parts[..=j].join("/"));
+            match std::fs::symlink_metadata(&p) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    missing = Some((j, p));
+                    break;
+                }
+                Err(err) => {
+                    return Some(Err(Unverified::Changed(format!("{rel}: {err}"))));
+                }
+            }
+        }
+        let Some((j, first)) = missing else {
+            return Some(Err(Unverified::Changed(format!(
+                "{rel}: existed during the run"
+            ))));
+        };
+        let parent_walked = |p: &Utf8Path| {
+            p.parent().is_some_and(|d| {
+                d == self.root
+                    || (self.map.get(d).is_some_and(|k| k.kind == 1)
+                        && !self.nested.iter().any(|n| d.starts_with(n)))
+            })
+        };
+        if j <= i {
+            // `first` has no untracked component: the walk recorded it if
+            // it existed, as every child of a directory it walked.
+            if !parent_walked(&first) {
+                return None;
+            }
+            return Some(match self.map.get(&first) {
+                None => Ok(()),
+                Some(_) => Err(Unverified::Changed(format!(
+                    "{rel}: {} existed before the run",
+                    first.strip_prefix(&self.root).unwrap_or(&first)
+                ))),
+            });
+        }
+        if j != i + 1 {
+            return None;
+        }
+        // A name directly in the `node_modules` directory: it is the same
+        // directory as before the run (not replaced) and its listing then
+        // did not hold the name.
+        let before = self.map.get(&nm)?;
+        let now = std::fs::symlink_metadata(&nm).ok().map(|m| key(&m))?;
+        if before.kind != 1 || now.kind != 1 || before.ino != now.ino {
+            return Some(Err(Unverified::Changed(format!(
+                "{rel}: {} was replaced during the run",
+                parts[..=i].join("/")
+            ))));
+        }
+        let names = self.node_modules.get(&nm)?.as_ref()?;
+        Some(if names.contains(&parts[j].to_lowercase()) {
+            Err(Unverified::Changed(format!(
+                "{rel}: {} existed before the run",
+                parts[..=j].join("/")
+            )))
+        } else {
+            Ok(())
+        })
+    }
+
+    /// An absent entry `rel` anywhere below a `node_modules` directory (the
+    /// first directory vci does not walk on its way) that the unit's run
+    /// only ever found absent (a probe, never a read, a listing, a stat or
+    /// a load: what the test saw there was nothing) and that is absent now,
+    /// when the manifest records it: what the manifest says is what the
+    /// test saw. (Absent before the run, which the snapshot cannot tell
+    /// inside a package, says nothing more: neither notices a path that
+    /// came and went during the run, and the test saw it absent each time
+    /// it looked.) The `build/` of a package whose prebuilt addon was
+    /// loaded, recorded so that a later local build runs the file again.
+    pub fn probed_absent_below_node_modules(&self, e: &InputEntry) -> bool {
+        if e.kind != EntryKind::Absent {
+            return false;
+        }
+        let rel = e.path.as_str();
+        let parts: Vec<&str> = rel.split('/').collect();
+        let Some(i) = parts.iter().position(|c| SKIP_DIRS.contains(c)) else {
+            return false;
+        };
+        if parts[i] != "node_modules" || i + 1 >= parts.len() {
+            return false;
+        }
+        let nm = self.root.join(parts[..=i].join("/"));
+        if self.skip.iter().any(|s| nm.starts_with(s))
+            || self.nested.iter().any(|n| nm.starts_with(n) && nm != *n)
+        {
+            return false;
+        }
+        matches!(
+            std::fs::symlink_metadata(e.path.to_abs(&self.root)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
     /// Names and kinds of `dir`'s children in the snapshot, without `skip`.
     fn children_before(
         &self,
@@ -669,6 +821,103 @@ mod tests {
             before.changes().unwrap(),
             vec![".".to_owned(), "inner".to_owned()]
         );
+    }
+
+    fn absent(rel: &str) -> InputEntry {
+        InputEntry {
+            path: vci_core::RepoPath::new(rel).unwrap(),
+            kind: EntryKind::Absent,
+            exec: false,
+            size: 0,
+            hash: String::new(),
+        }
+    }
+
+    /// vex-web (vci 2.10.3): a library looked for npm's hidden lockfile,
+    /// `node_modules/.package-lock.json`, which pnpm never writes. The
+    /// absent entry was refused as inside a directory vci does not track,
+    /// so the file could never be attested. Absent before the run (the
+    /// snapshot lists every `node_modules` directory it meets) and absent
+    /// after is what any absent entry must be.
+    #[test]
+    fn an_absent_name_directly_in_node_modules_is_checked() {
+        let t = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/.pnpm/ms@2.1.3/node_modules/ms")).unwrap();
+        std::fs::write(root.join("node_modules/.modules.yaml"), "x").unwrap();
+        std::fs::create_dir_all(root.join("web/node_modules/@fx")).unwrap();
+        let before = TreeStat::snapshot(&root).unwrap();
+        let lock = absent("node_modules/.package-lock.json");
+        assert_eq!(before.unchanged(&lock), Ok(()));
+        // The first missing component is the name in node_modules.
+        assert_eq!(
+            before.unchanged(&absent("web/node_modules/.pnpm/lock.yaml")),
+            Ok(())
+        );
+        // ... or a node_modules directory that is not there at all.
+        assert_eq!(
+            before.unchanged(&absent("lib/node_modules/.package-lock.json")),
+            Ok(())
+        );
+        // Deeper, inside a package: only its version identifies it.
+        assert!(matches!(
+            before.unchanged(&absent(
+                "node_modules/.pnpm/ms@2.1.3/node_modules/ms/x.node"
+            )),
+            Err(Unverified::Untracked(_))
+        ));
+        // Not absent then: there before the run (whatever its letter case).
+        assert!(matches!(
+            before.unchanged(&absent("node_modules/.Modules.yaml/x")),
+            Err(Unverified::Changed(_))
+        ));
+        // Not absent now: it appeared during the run.
+        std::fs::write(root.join("node_modules/.package-lock.json"), "{}").unwrap();
+        assert!(matches!(
+            before.unchanged(&lock),
+            Err(Unverified::Changed(_))
+        ));
+        // Created and removed again in the run's directory is as before.
+        std::fs::remove_file(root.join("node_modules/.package-lock.json")).unwrap();
+        assert_eq!(before.unchanged(&lock), Ok(()));
+        // There before the run, removed during it.
+        std::fs::write(root.join("node_modules/.yarn-state.yml"), "x").unwrap();
+        let before = TreeStat::snapshot(&root).unwrap();
+        std::fs::remove_file(root.join("node_modules/.yarn-state.yml")).unwrap();
+        assert!(matches!(
+            before.unchanged(&absent("node_modules/.yarn-state.yml")),
+            Err(Unverified::Changed(_))
+        ));
+        // A node_modules directory replaced during the run.
+        let before = TreeStat::snapshot(&root).unwrap();
+        std::fs::rename(root.join("web/node_modules"), root.join("web/nm-old")).unwrap();
+        std::fs::create_dir_all(root.join("web/node_modules")).unwrap();
+        assert!(matches!(
+            before.unchanged(&absent("web/node_modules/.package-lock.json")),
+            Err(Unverified::Changed(_))
+        ));
+        // One created during the run, which the snapshot never listed.
+        let before = TreeStat::snapshot(&root).unwrap();
+        std::fs::create_dir_all(root.join("lib/node_modules")).unwrap();
+        assert!(
+            before
+                .unchanged(&absent("lib/node_modules/.package-lock.json"))
+                .is_err()
+        );
+        // Absent entries elsewhere vci does not walk are still refused.
+        assert!(matches!(
+            before.unchanged(&absent(".git/x")),
+            Err(Unverified::Untracked(_))
+        ));
+        // And so is anything present in node_modules.
+        let file = InputEntry {
+            kind: EntryKind::File,
+            ..absent("node_modules/.modules.yaml")
+        };
+        assert!(matches!(
+            before.unchanged(&file),
+            Err(Unverified::Untracked(_))
+        ));
     }
 
     fn git(dir: &Utf8Path, args: &[&str]) {
