@@ -759,6 +759,67 @@ git-meta store. What remains between vci and plain is the cost of a process per 
 tests use on its own (about 66 files, 0.1 s), collects its garbage and copies the pages it writes (0.08 s of system
 time), where a Rails worker pays that once for all of its files.
 
+**Slot zygotes (vci 2.12, `rails_zygote`).** Most of what a file's process loads on its own after the fork, other
+files' processes load too: on vex-api's shard of 908 files, half of their 56,711 loads were of 130 files (123 gem
+files, from Action Pack, Action View, Action Mailer, Active Record's associations, and 7 application files: two
+token models, a concern and four authentication services that the tests' common setup loads, loaded by 896 of the
+908 files). A slot now loads those once, in a process between it and its files:
+
+- each slot runs the batch's first files from its boot, as before, and each of those processes notes the Ruby files
+  it loaded after the fork (`loads-<group>-<slot>.txt` in the run's output directory). The first files are spread over the
+  batch (every n-th file), not its first directory. There are twice as many as the slots, 16 at least, and only in a
+  batch of at least four times that many files: a smaller batch gets no zygote;
+- once that many have ended, each slot forks a *zygote*, which loads, in the order the files loaded them: the files
+  of the bundle's gems (and Ruby's own library files) that at least a tenth of those files loaded; and with
+  `rails_zygote = "common"` also the application's files that Rails' loaders autoload (outside `test/` and `spec/`)
+  that at least 90% of them loaded, each by its constant, as a test autoloads it. It then writes the lines its files
+  share (as the slot did) and collects its garbage, and runs the slot's remaining files, each forked from it;
+- what the zygote loads is recorded in it before any file's process forks from it, as what the boot loads is: it is
+  an input of every file forked from it, whether or not the file would have loaded it (a superset of what the file's
+  own process recorded before). The files sampled only decide what is loaded, never what is recorded. A gem's files
+  cost no precision: a gem is recorded by name and version, and the toolchain records the whole bundle, so a change
+  to a gem already runs every file. Neither do the absent load-path candidates in `lib/` and `vendor/` that a gem
+  file's own requires look for (`lib/active_record/associations/preloader.rb`), which a file that requires it records
+  anyway. An application file under `"common"` does: a file that never loaded it runs again when it changes;
+- a preload that raises, or takes longer than a minute, ends the zygote before it takes a file, and its slot runs its
+  files as before (`vci: N slot zygote(s) failed, their slots ran their files as before: ...`). With `VCI_TIMING=1`
+  vci says what the zygotes preloaded (`vci: 12 slot zygote(s) preloaded what 35 files of the batch loaded: up to 127
+  gem or Ruby files and 7 application files (643 records, 511 in the repository outside gems), ...`: the 7 files and
+  the absent load-path candidates above), and each file's CPU time (`vci: a file's process used 0.45
+  CPU-s on average ...`).
+
+`rails_zygote` is set in the project's table of `vci.toml` (or at the top in the single-project form): `"gems"`, the
+default, preloads gem and Ruby files only; `"common"` also the application files; `"off"` forks every file from its
+slot, as before. `VCI_RAILS_ZYGOTE` (`off`, `gems`, `common`) in vci's environment overrides it. It is not part of
+`vci:config`: an attestation made with any setting is accepted with any other, as each records a superset of what
+the file loaded. Diagnostic switches: `VCI_RAILS_ZYGOTE_HINTS` (a file of absolute paths, one a line: each zygote
+forms at once and preloads those, classified as above) and `VCI_RAILS_ZYGOTE_SAMPLES` (how many files to wait for).
+
+Measured and left out: leaving a file's process with `exit!` once its output is written, instead of Ruby's own exit
+(finalizers; Ruby 3.4 does not free the heap at exit unless `RUBY_FREE_AT_EXIT` is set): over three interleaved
+pairs on 303 of the shard's files a file's process used 0.62 CPU-seconds either way. Turning off the garbage
+collector's full marks in a file's process (`VCI_RAILS_EXPERIMENT=nomajor`): with zygotes a file's process ran 0.1
+of them on average, and its CPU time did not change (0.46 and 0.45 against 0.45 and 0.48).
+
+Measured on 14 November 2026 on the same shard (908 files, 12 slots, a local SQLite store, release builds, runs of
+each build interleaved) on the 14-core laptop while other agents' jobs kept its load average between 35 and 180, so
+every figure is inflated against an idle machine and only the comparisons within a round hold. A file's process used
+0.48 CPU-seconds on average with `"common"` (0.52, 0.45, 0.48, 0.48 and 0.48 in five rounds), 0.52 with `"gems"`
+(0.61, 0.48, 0.47) and 0.57 with `"off"` (0.63, 0.53, 0.54); its top-level requires took 68 ms instead of 123 ms (20
+of them instead of 29). The zygotes formed after 35 files and each preloaded 127 to 162 gem or Ruby files and, with
+`"common"`, the 7 application files above, in 0.2 to 1.3 s (0.6 to 5.2 s with their shared output). The whole `vci
+run` in the last two rounds, against vci 2.11.1 and plain `bin/rails test` run the same way: 2.11.1 83 s and 78 s (the
+batch 67 s and 66 s), 540 and 501 CPU-seconds; `"common"` 65 s and 64 s (the batch 52 s both times), 480 and 482
+CPU-seconds; `"gems"` 481 CPU-seconds (its wall time, 142 s, fell in a load spike); plain 163 s (a load spike) and 59 s,
+460 and 303 CPU-seconds. Precision, from each file's own loads with the zygote's 7 application files added, replayed
+over the 30 most recent commits that touched vex-api: 1,207 file runs either way, none more; 84 more inputs in all
+(0.09 a file). Not measured: vex's 8-core CI runners, a plan, a push or the git-meta store. What still separates a
+file's process from a Rails worker's share of the work: the application files each loads on its own (about 30, most
+of them used by few other files), the collector's hooks on every file operation of its tests, its own output (0.05 s,
+where 2.11.1's took 0.10 s: what the zygote loaded is in the lines it shares, and its gem files are checked against
+their archives once, in the zygote; of the rest, a third is folding absent paths into listings, with a `git
+check-ignore` of its own), and the memory pages it copies from its slot (0.09 s of system time).
+
 The collector (`ruby/vci-collector/vci_collector.rb`, plain Ruby, nothing is installed into your project) is loaded
 through `RUBYOPT` before `bin/rails`, Bundler and Rails. It sets these run conditions:
 
@@ -1484,7 +1545,7 @@ binary), `VCI_JOBS` (parallel pytest or `go test` processes in `vci run`, and th
 in full in every round, each observing its inputs on its own, as 2.10.0 did: the same verdicts and text, slower; for
 comparing, see [Verification](#verification-vci-plan)), `VCI_RAILS_JOBS` (the slots of a Rails batch: files at once, each slot with a database of its own as Rails' parallel workers have; `1`: one at a time; default: `PARALLEL_WORKERS` above 1, `VCI_JOBS`, or the number of CPUs, capped by `parallelize(workers:)`, for projects that call Rails' `parallelize`; `PARALLEL_WORKERS=1` or `workers: 1` turns them off), `VCI_METRICS` (since 2.5: every vci command appends one JSON line to `<git common dir>/vci-metrics.jsonl` with its version, command, flag names (never their values), exit code, duration, machine (OS, architecture, CPUs, CI or not) and every step it timed, the lines `VCI_TIMING` prints; `vci metrics [--last N] [--command C] [--format json]` gives each step's median, 95th percentile and maximum over recent commands; `VCI_METRICS=<file>` writes elsewhere, `VCI_METRICS=0` writes nothing; in GitHub Actions `vci ci` also adds its slowest steps to the job's step summary; the log keeps about its last 4 MB), `VCI_RAILS_SHARD_SECONDS` (a Minitest file whose last run took at least twice this many seconds runs as shards of about this long, one process each, in a batch's slots; default 30, `0`: off; since 2.3), `VCI_RAILS_FILE_TIMEOUT` (seconds a Rails test file's process may run, in a batch's slot or on its own, before it is stopped; default 600, `0`: no limit; a stopped file fails, is not attested and is not run again, and a file still running after two minutes is named on stderr; since 2.7.2), `VCI_NODE_TEST_FILE_TIMEOUT` (seconds a node:test file's processes may run in `vci run` and `vci ci --key` before
 they are stopped with their process group; default 600, `0`: no limit; a stopped file fails and is not attested;
-since 2.11.1), `VCI_RAILS_PER_FILE` (`1`: `vci run` starts one Ruby process per Rails file instead of booting once per runner and forking one process per file), `VCI_RAILS_SHARED_OUTPUT` (`0`: in a Rails batch, each file's process writes all of its output instead of only what it does not share with the other files of its boot), `VCI_RAILS_OWN_OUTPUT` (`0`, since 2.11: in a Rails batch, each file's process makes all of its lines and splits off the shared ones, instead of making only the lines of what it recorded after the fork; the same lines either way), `VCI_RAILS_PRELOAD_ROUTES` (`0`, since 2.11: a Rails batch does not draw the application's routes in its boot; see "What a batch file's process costs"), `VCI_RAILS_PROFILE` (`1`, since 2.7.34: each Rails file's process prints one `vci-profile` line with its top-level requires' time and count, the routes' first draw, the garbage collector's time and count (since 2.11 also its major and minor collections), its own time from the fork, and since 2.11 its user and system CPU time; the batch's output carries them), `VCI_RAILS_EXPERIMENT` (since 2.7.34, measurement switches of a Rails batch, comma separated, each measured on vex's runners and found not to change a file's process beyond noise: `eager` eager-loads the application and draws its routes in the batch's process before the slots fork, so every file records them as inputs; `routes` draws the routes only (since 2.11 a batch does it by default with `rails_inputs = "loose"`); `warmup` calls `Process.warmup` in each slot once it is set up; `iseq` keeps each source file's compiled instruction sequence under this run's output directory, keyed by path, size and mtime, so a batch compiles a file once instead of once per process), `VCI_GO`
+since 2.11.1), `VCI_RAILS_PER_FILE` (`1`: `vci run` starts one Ruby process per Rails file instead of booting once per runner and forking one process per file), `VCI_RAILS_SHARED_OUTPUT` (`0`: in a Rails batch, each file's process writes all of its output instead of only what it does not share with the other files of its boot), `VCI_RAILS_OWN_OUTPUT` (`0`, since 2.11: in a Rails batch, each file's process makes all of its lines and splits off the shared ones, instead of making only the lines of what it recorded after the fork; the same lines either way), `VCI_RAILS_PRELOAD_ROUTES` (`0`, since 2.11: a Rails batch does not draw the application's routes in its boot; see "What a batch file's process costs"), `VCI_RAILS_ZYGOTE` (`off`, `gems` or `common`, since 2.12: overrides the project's `rails_zygote`; see "Slot zygotes"), `VCI_RAILS_ZYGOTE_HINTS` and `VCI_RAILS_ZYGOTE_SAMPLES` (since 2.12, diagnostic: a file of absolute paths every slot's zygote preloads at once; how many files' loads a zygote waits for), `VCI_RAILS_PROFILE` (`1`, since 2.7.34: each Rails file's process prints one `vci-profile` line with its top-level requires' time and count, the routes' first draw, the garbage collector's time and count (since 2.11 also its major and minor collections), its own time from the fork, and since 2.11 its user and system CPU time; the batch's output carries them; with `VCI_RAILS_PROFILE_LOADS` naming a directory, since 2.12, each also writes there the Ruby files it loaded after the fork), `VCI_RAILS_EXPERIMENT` (since 2.7.34, measurement switches of a Rails batch, comma separated, each measured on vex's runners and found not to change a file's process beyond noise: `eager` eager-loads the application and draws its routes in the batch's process before the slots fork, so every file records them as inputs; `routes` draws the routes only (since 2.11 a batch does it by default with `rails_inputs = "loose"`); `warmup` calls `Process.warmup` in each slot once it is set up; `iseq` keeps each source file's compiled instruction sequence under this run's output directory, keyed by path, size and mtime, so a batch compiles a file once instead of once per process; `nomajor`, since 2.12, turns off the garbage collector's full marks in each file's process (`GC.config(rgengc_allow_full_mark: false)`): with slot zygotes a file's process ran 0.1 full marks on average and its CPU time did not change), `VCI_GO`
 (go binary), `VCI_CARGO` (cargo binary; rustc is `$RUSTC` when declared, else `rustc` on PATH), `VCI_CARGO_JOBS` (Cargo test
 executables run at once in `vci run` and `vci ci`; default: the number of CPUs; cargo itself runs one build at a
 time), `VCI_RUBY` (ruby binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory
@@ -2867,6 +2928,8 @@ adapter = "vitest"     # or "pytest", "go", "cargo", "rails", "node-test"
 # runner = "rspec"     # rails only: "minitest" or "rspec" (unset: detected, see Quick start (RSpec)); in [[projects]] per project
 # rails_inputs = "strict"  # rails only: "loose" (default since 2.7.36: routes, initializers, boot files, migrations, locales,
                            # autoload records are not inputs) or "strict"; in [[projects]] per project
+# rails_zygote = "common"  # rails only (2.12): what a batch's slot zygote preloads, "gems" (default), "common" or "off";
+                           # see "Slot zygotes" under Quick start (Rails); in [[projects]] per project
 # ignore_inputs = ["config/credentials/**"]  # rails only: more globs (relative to the project dir) that are never inputs
 # test_script = "test" # node-test only: the package.json script that runs `node --test` (default "test"); or instead:
 # test_globs = ["src/**/*.test.ts"]                  # node-test only: test file globs (node:test's glob syntax)

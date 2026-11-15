@@ -57,6 +57,11 @@ pub struct Config {
     /// project dir) whose files are never inputs; see [`RailsInputs`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_inputs: Option<Vec<String>>,
+    /// Rails adapter (single-project form, 2.12.0): what a batch's slot
+    /// zygote preloads, `"gems"` (default), `"common"` or `"off"`; see
+    /// [`vci_adapter::RailsZygote`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rails_zygote: Option<vci_adapter::RailsZygote>,
     #[serde(default)]
     pub policy: Policy,
     #[serde(default)]
@@ -143,6 +148,10 @@ pub struct ProjectConfig {
     /// are never inputs.
     #[serde(default)]
     pub ignore_inputs: Option<Vec<String>>,
+    /// Rails adapter (2.12.0): what a batch's slot zygote preloads; see
+    /// [`vci_adapter::RailsZygote`].
+    #[serde(default)]
+    pub rails_zygote: Option<vci_adapter::RailsZygote>,
     #[serde(default)]
     pub policy: Option<PolicyOverride>,
     #[serde(default)]
@@ -210,6 +219,8 @@ pub struct ProjectSpec {
     pub rails_inputs: Option<RailsInputs>,
     /// Rails: the `ignore_inputs` setting.
     pub ignore_inputs: Vec<String>,
+    /// Rails: the `rails_zygote` setting (the default when unset).
+    pub rails_zygote: vci_adapter::RailsZygote,
     pub policy: Policy,
     pub env: EnvConfig,
     pub inputs: Vec<InputsConfig>,
@@ -364,6 +375,18 @@ fn check_runner(what: &str, adapter: &str, runner: Option<&str>) -> Result<()> {
     }
     if vci_adapter::RailsRunner::parse(r).is_none() {
         bail!("{what}: runner must be \"minitest\" or \"rspec\", got {r:?}");
+    }
+    Ok(())
+}
+
+/// `rails_zygote` is a setting of the rails adapter.
+fn check_rails_zygote(
+    what: &str,
+    adapter: &str,
+    set: Option<vci_adapter::RailsZygote>,
+) -> Result<()> {
+    if set.is_some() && adapter != "rails" {
+        bail!("{what}: `rails_zygote` is a setting of the rails adapter, not {adapter:?}");
     }
     Ok(())
 }
@@ -987,6 +1010,7 @@ impl Config {
                 self.rails_inputs,
                 self.ignore_inputs.as_deref(),
             )?;
+            check_rails_zygote("vci.toml", adapter, self.rails_zygote)?;
             check_rel("project", self.project.as_deref().unwrap_or("."))?;
             return Ok(());
         }
@@ -996,9 +1020,10 @@ impl Config {
             || self.node_test_options() != vci_adapter::NodeTestOptions::default()
             || self.rails_inputs.is_some()
             || self.ignore_inputs.is_some()
+            || self.rails_zygote.is_some()
         {
             bail!(
-                "top-level `project`/`adapter`/`runner`/`test_script`/`test_globs`/`node_args`/`rails_inputs`/`ignore_inputs` cannot be combined with [[projects]]; give each project its own"
+                "top-level `project`/`adapter`/`runner`/`test_script`/`test_globs`/`node_args`/`rails_inputs`/`ignore_inputs`/`rails_zygote` cannot be combined with [[projects]]; give each project its own"
             );
         }
         let mut names = std::collections::BTreeSet::new();
@@ -1040,6 +1065,7 @@ impl Config {
                 p.rails_inputs,
                 p.ignore_inputs.as_deref(),
             )?;
+            check_rails_zygote(&format!("project {:?}", p.name), &p.adapter, p.rails_zygote)?;
             if !dirs.insert((normalise_rel(&p.path), p.adapter.clone())) {
                 bail!(
                     "two projects use adapter {:?} in {:?}; they would list the same test files",
@@ -1147,6 +1173,7 @@ impl Config {
                     self.rails_inputs,
                 ),
                 ignore_inputs: self.ignore_inputs.clone().unwrap_or_default(),
+                rails_zygote: self.rails_zygote.unwrap_or_default(),
                 policy: Policy {
                     removed_rails_allow_db: None,
                     ..self.policy.clone()
@@ -1236,6 +1263,7 @@ impl Config {
                     },
                     rails_inputs: rails_mode(&p.adapter, p.rails_inputs),
                     ignore_inputs: p.ignore_inputs.clone().unwrap_or_default(),
+                    rails_zygote: p.rails_zygote.unwrap_or_default(),
                     policy,
                     env,
                     inputs: p.inputs.clone().unwrap_or_else(|| self.inputs.clone()),
@@ -2213,6 +2241,36 @@ mod tests {
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// `rails_zygote` (2.12.0): "gems" by default, "common" or "off" when
+    /// set, in the single-project form or a project's table; only the rails
+    /// adapter takes it.
+    #[test]
+    fn rails_zygote_setting() {
+        use vci_adapter::RailsZygote;
+        let c = Config::parse(RAILS_TEMPLATE).unwrap();
+        assert_eq!(c.project_specs()[0].rails_zygote, RailsZygote::Gems);
+        let c = Config::parse("adapter = \"rails\"\nrails_zygote = \"common\"\n").unwrap();
+        assert_eq!(c.project_specs()[0].rails_zygote, RailsZygote::Common);
+        let c = Config::parse(
+            "[[projects]]\nname = \"api\"\npath = \"api\"\nadapter = \"rails\"\nrails_zygote = \"off\"\n\n[[projects]]\nname = \"web\"\npath = \"web\"\nadapter = \"vitest\"\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert_eq!(s[0].rails_zygote, RailsZygote::Off);
+        assert_eq!(s[1].rails_zygote, RailsZygote::Gems);
+        for bad in [
+            "adapter = \"rails\"\nrails_zygote = \"all\"\n",
+            "adapter = \"pytest\"\nrails_zygote = \"gems\"\n",
+            "rails_zygote = \"gems\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n",
+            "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"go\"\nrails_zygote = \"common\"\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(RailsZygote::parse(" common "), Some(RailsZygote::Common));
+        assert_eq!(RailsZygote::parse("0"), Some(RailsZygote::Off));
+        assert_eq!(RailsZygote::parse("eager"), None);
     }
 
     /// `rails_inputs` (2.7.36): loose by default for Rails projects, none

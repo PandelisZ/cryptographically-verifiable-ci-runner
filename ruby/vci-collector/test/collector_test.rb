@@ -2185,6 +2185,64 @@ class CollectorTest < Minitest::Test
   # asks for fewer workers than vci's slots gets that many; vci's
   # PARALLEL_WORKERS (VCI_RAILS_SLOTS_ASKED=workers) overrides `workers:`,
   # as in Rails.
+  # Zygotes (2.12.0, VCI_RAILS_ZYGOTE): a slot forks a zygote that preloads
+  # what its files loaded on their own (Ruby's library files and gems; the
+  # application's files only with "common", through Rails' loaders) and runs
+  # the slot's remaining files, each forked from it. Here from a hints file
+  # (VCI_RAILS_ZYGOTE_HINTS), at once: every file finds English.rb loaded.
+  # A zygote whose preload raises (a file that is not there) takes no file:
+  # its slot runs them as before, and none finds it loaded. With "off" there
+  # is no zygote.
+  ZYGOTE_TEST = <<~RUBY
+    require "test_helper"
+    class %<name>sTest < Minitest::Test
+      def test_preloaded = assert_equal(%<want>s, $LOADED_FEATURES.any? { |f| f.end_with?("/English.rb") })
+    end
+  RUBY
+
+  def test_batch_slot_zygote_preloads_before_its_files_fork
+    english = File.join(RbConfig::CONFIG["rubylibdir"], "English.rb")
+    skip "no English.rb" unless File.file?(english)
+    put("test/test_helper.rb", "require \"minitest\"\n")
+    ids = %w[a b c d].map { |n| "test/#{n}_test.rb" }
+    slots = { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" }
+    hints = File.join(@tmp, "hints.txt")
+    [[english, "common", true], [english, "off", false], [File.join(File.dirname(english), "no_such_vci_file.rb"), "gems", false]]
+      .each do |path, mode, want|
+        File.write(hints, "#{path}\n")
+        ids.each { |id| put(id, format(ZYGOTE_TEST, name: File.basename(id, "_test.rb").upcase, want: want)) }
+        out = batch(ids, env: slots.merge("VCI_RAILS_ZYGOTE" => mode, "VCI_RAILS_ZYGOTE_HINTS" => hints))
+        z = out[:status].filter_map { |l| l["zygote"] }
+        case mode
+        when "common"
+          assert_equal 2, z.size, out[:said]
+          assert(z.all? { |x| x["gems"] == 1 && x["app"].zero? && x["samples"] == 1 }, z.inspect)
+        when "off" then assert_empty z, out[:said]
+        else assert_equal(2, z.count { |x| x["failed"].to_s.start_with?("LoadError") }, z.inspect)
+        end
+        assert_equal ids, out[:status].filter_map { |l| l["id"] if l["exit"] == 0 }.sort, "#{mode}: #{out[:said]}"
+      end
+  end
+
+  # With no hints, a zygote is planned from the batch's first files
+  # (VCI_RAILS_ZYGOTE_SAMPLES of them, spread over the batch), which run from
+  # their bare slot and each note what it loaded; the zygote preloads what
+  # they loaded (here every file requires English), then runs the rest.
+  def test_batch_slot_zygote_learns_from_the_first_files
+    skip "no English.rb" unless File.file?(File.join(RbConfig::CONFIG["rubylibdir"], "English.rb"))
+    put("test/test_helper.rb", "require \"minitest\"\n")
+    ids = (1..8).map { |n| "test/f#{n}_test.rb" }
+    ids.each_with_index do |id, i|
+      put(id, "require \"test_helper\"\nrequire \"English\"\nclass F#{i}Test < Minitest::Test\n  def test_f = assert(true)\nend\n")
+    end
+    out = batch(ids, env: { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1", "VCI_RAILS_ZYGOTE" => "gems",
+                            "VCI_RAILS_ZYGOTE_SAMPLES" => "2" })
+    z = out[:status].filter_map { |l| l["zygote"] }
+    refute_empty z, out[:said]
+    assert(z.all? { |x| x["samples"] >= 2 && x["gems"] >= 1 }, z.inspect)
+    assert_equal ids, out[:status].filter_map { |l| l["id"] if l["exit"] == 0 }.sort, out[:said]
+  end
+
   def test_batch_slots_follow_the_projects_parallelize_workers
     put("test/fake_rails.rb", RAILS_PARALLEL + <<~RUBY)
       module ActiveSupport
