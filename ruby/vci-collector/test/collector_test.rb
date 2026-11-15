@@ -2818,6 +2818,60 @@ class CollectorTest < Minitest::Test
   # A taint in a file of a worker (a child process) is in the output of
   # every later file of that worker: what the child did is unseen, and it
   # may have left what they depend on.
+  # Zygotes and workers together (2.12.0): a slot's zygote preloads first
+  # (here from hints, at once: English.rb), then forks the slot's workers;
+  # each worker's files find what the zygote loaded, a later file records
+  # what an earlier one of its worker read, and each file's line says its
+  # worker and its CPU. Learnt instead of hinted, the zygote is planned from
+  # the loads the first workers' files noted (each file's own, from its
+  # output process), and every file still passes.
+  def test_batch_zygote_forks_workers
+    english = File.join(RbConfig::CONFIG["rubylibdir"], "English.rb")
+    skip "no English.rb" unless File.file?(english)
+    worker_helper
+    put("test/data/a.txt", "a")
+    worker_test("a", "assert $LOADED_FEATURES.any? { |f| f.end_with?(\"/English.rb\") }\n    File.read(\"test/data/a.txt\")")
+    %w[b c d e f].each { |n| worker_test(n, "assert $LOADED_FEATURES.any? { |f| f.end_with?(\"/English.rb\") }") }
+    ids = %w[a b c d e f].map { |n| "test/#{n}_test.rb" }
+    hints = File.join(@tmp, "hints.txt")
+    File.write(hints, "#{english}\n")
+    out = workers(ids, 3, env: { "VCI_RAILS_SLOTS_ASKED" => "1", "VCI_RAILS_ZYGOTE" => "gems",
+                                 "VCI_RAILS_ZYGOTE_HINTS" => hints })
+    z = out[:status].filter_map { |l| l["zygote"] }
+    assert_equal 2, z.size, out[:said]
+    assert(z.all? { |x| x["gems"] == 1 && !x.key?("failed") }, z.inspect)
+    lines = out[:status].select { |l| l["id"] }
+    assert_equal ids, lines.filter_map { |l| l["id"] if l["exit"] == 0 }.sort, out[:said]
+    assert(lines.all? { |l| l["worker"].is_a?(Array) && l["cpu"].is_a?(Array) }, lines.inspect)
+    assert_equal %w[test/data/a.txt], paths(out["test/b_test.rb"], "read").sort
+    assert_empty paths(out["test/d_test.rb"], "read")
+
+    # Learnt: every file requires English itself; two files' loads plan it.
+    ids = (1..8).map { |n| "test/f#{n}_test.rb" }
+    ids.each_with_index do |id, i|
+      put(id, "require \"test_helper\"\nrequire \"English\"\nclass F#{i}Test < Minitest::Test\n  def test_f = assert(true)\nend\n")
+    end
+    out = workers(ids, 2, env: { "VCI_RAILS_SLOTS_ASKED" => "1", "VCI_RAILS_ZYGOTE" => "gems",
+                                 "VCI_RAILS_ZYGOTE_SAMPLES" => "2" })
+    z = out[:status].filter_map { |l| l["zygote"] }
+    refute_empty z, out[:said]
+    assert(z.all? { |x| x["samples"].to_i >= 2 && x["gems"].to_i >= 1 }, z.inspect)
+    assert_equal ids, out[:status].filter_map { |l| l["id"] if l["exit"] == 0 }.sort, out[:said]
+    # Only a worker's first file notes its loads (a later one's understate
+    # what a file loads on its own).
+    firsts = out[:status].filter_map { |l| l["id"] if l["worker"] && l["worker"][1].zero? }
+    noted = Dir[File.join(@out, "batch", "loads-*.txt")].sum { |f| File.read(f).count("\n") }
+    assert_operator noted, :>=, 2
+    assert_operator noted, :<=, firsts.size, out[:status].inspect
+    # Without a zygote (more samples asked than the batch has), every
+    # worker's first file notes, and no other file.
+    out = workers(ids, 2, env: { "VCI_RAILS_SLOTS_ASKED" => "1", "VCI_RAILS_ZYGOTE" => "gems",
+                                 "VCI_RAILS_ZYGOTE_SAMPLES" => "100" })
+    assert_empty out[:status].filter_map { |l| l["zygote"] }, out[:said]
+    noted = Dir[File.join(@out, "batch", "loads-*.txt")].sum { |f| File.read(f).count("\n") }
+    assert_equal 4, noted, out[:status].inspect
+  end
+
   def test_batch_worker_taint_reaches_later_files
     worker_helper
     worker_test("a")

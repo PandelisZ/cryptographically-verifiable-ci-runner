@@ -1245,8 +1245,14 @@ module VciCollector
 
       # In a file's process run from its bare slot, at exit: the Ruby files
       # it loaded itself (after the fork), in the order it loaded them.
+      #
+      # In a worker (rails_worker_files), only its first file notes: a later
+      # file of the worker does not load again what an earlier one loaded,
+      # so its loads would understate what a file loads on its own (and
+      # with it the share of files that load an application file).
       def note!(from)
         return unless on? && Batch.target && !Batch.zygote? && !Batch.slot.nil? && from
+        return if Batch.worker_later_file?
         VciCollector.quiet do
           mods = []
           VciCollector.records.each_key.with_index do |(k, p), j|
@@ -2023,6 +2029,12 @@ module VciCollector
       # the plan compares is their content and everything they observed, as
       # inputs of the file.
 
+      # Whether this process runs, or ends, a file of a worker that is not
+      # the worker's first (Zygote.note!).
+      def worker_later_file?
+        !@worker.nil? && @worker[:place].to_i.positive?
+      end
+
       # Whether this batch runs workers.
       def worker_files?
         WORKER_FILES > 1 && RUNNER == "minitest"
@@ -2078,6 +2090,7 @@ module VciCollector
           end
           @worker[:pre] = ::Minitest::Runnable.runnables.to_h { |r| [r, true] }
           @worker[:mismatch] = nil
+          @worker[:place] = j
           become(f)
           arg = f.start_with?("-") ? "./#{f}" : f
           res = catch(:vci_worker) { [:ran, ::Minitest.run(@worker[:args] + [arg])] }

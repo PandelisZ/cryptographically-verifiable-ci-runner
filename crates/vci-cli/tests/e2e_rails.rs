@@ -4080,6 +4080,58 @@ fn rails_batch_zygote_preloads_are_inputs_of_its_files() {
     }
 }
 
+/// 2.12.0, zygotes and workers together: with `rails_zygote = "common"`
+/// (from hints) and `VCI_RAILS_WORKER_FILES=2`, each slot's zygote
+/// preloads the model and then forks the slot's workers, two files each.
+/// Every file is attested, ran in a worker, has the model as an input
+/// (also the file that never uses it), and runs again when it changes.
+#[test]
+fn rails_batch_zygote_forks_workers() {
+    const FILES: [(&str, bool); 4] = [
+        ("test/zyg/a_uses_test.rb", true),
+        ("test/zyg/b_never_test.rb", false),
+        ("test/zyg/c_uses_test.rb", true),
+        ("test/zyg/d_never_test.rb", false),
+    ];
+    let ids: Vec<&str> = FILES.iter().map(|f| f.0).collect();
+    let Some(w) = zygote_world(&FILES) else {
+        return;
+    };
+    let hints = zygote_hints(&w, &[]);
+    let stderr = zygote_run(
+        &w,
+        &ids,
+        &[
+            ("VCI_RAILS_ZYGOTE", "common"),
+            ("VCI_RAILS_ZYGOTE_HINTS", &hints),
+            ("VCI_RAILS_WORKER_FILES", "2"),
+            ("VCI_TIMING", "1"),
+        ],
+    );
+    assert!(
+        stderr.contains("slot zygote(s) preloaded what 1 files of the batch loaded: up to 0 gem or Ruby files and 1 application files"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("vci: 4 file(s) ran in 2 worker process(es) of up to 2 files each"),
+        "{stderr}"
+    );
+    for id in &ids {
+        assert!(
+            entries_of(&w.work, id).iter().any(|(p, _)| p == ZYG_MODEL),
+            "{id}: the model its worker's zygote preloaded is its input"
+        );
+    }
+    let p = w.plan(&w.work, "main");
+    assert!(ids.iter().all(|f| p.skip.contains(*f)), "{p:?}");
+    w.put(
+        ZYG_MODEL,
+        "class SharedThing\n  # changed\n  def self.value = 1\nend\n",
+    );
+    let p = w.plan(&w.work, "main");
+    assert!(ids.iter().all(|f| p.run.contains(*f)), "{p:?}");
+}
+
 /// 2.12.0: a zygote whose preload raises (an application file that fails to
 /// load) ends before it takes any file; its slot runs its files as before,
 /// each attested, and what the zygote loaded is no file's input.
