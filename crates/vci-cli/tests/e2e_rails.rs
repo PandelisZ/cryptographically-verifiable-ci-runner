@@ -4422,3 +4422,114 @@ fn rails_early_plan_and_native_libraries() {
     assert_within(&early, &full, "natives, exact");
     assert!(!early_skips(&early).contains(CAPTION), "{early}");
 }
+
+/// An attestation made with another Ruby than the one the checkout
+/// declares (every Ruby process of the run says it is 3.4.7p58, through a
+/// `ruby` wrapper that redefines the version constants first;
+/// `.ruby-version` says 3.4.9, which the full plan probes): both plans run
+/// every unit, and the early plan says why.
+#[test]
+fn rails_early_plan_runs_what_another_ruby_attested() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    // Bundler would refuse a Ruby the bundle pins: no pin, so that the
+    // only difference is the Ruby (`.ruby-version` still says 3.4.9).
+    let gemfile = w
+        .read("Gemfile")
+        .replace("ruby file: \".ruby-version\"\n", "");
+    w.put("Gemfile", &gemfile);
+    let lock = w
+        .read("Gemfile.lock")
+        .replace("RUBY VERSION\n  ruby 3.4.9\n\n", "");
+    w.put("Gemfile.lock", &lock);
+    w.git(&work, &["commit", "-q", "-am", "no ruby pin in the bundle"]);
+    let fake = w.base.join("ruby-347.rb");
+    std::fs::write(
+        &fake,
+        "v, $VERBOSE = $VERBOSE, nil\n\
+         Object.send(:remove_const, :RUBY_VERSION); RUBY_VERSION = \"3.4.7\".freeze\n\
+         Object.send(:remove_const, :RUBY_PATCHLEVEL); RUBY_PATCHLEVEL = 58\n\
+         Object.send(:remove_const, :RUBY_ENGINE_VERSION); RUBY_ENGINE_VERSION = \"3.4.7\".freeze\n\
+         $VERBOSE = v\n",
+    )
+    .unwrap();
+    let shim = w.base.join("ruby-347");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nexec '{}' -r'{}' \"$@\"\n",
+            w.ruby_bin.join("ruby").display(),
+            fake.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = [("VCI_RUBY", shim.to_str().unwrap())];
+    let mut args = vec!["run"];
+    args.extend(ALL);
+    args.extend(["--key", w.trusted.to_str().unwrap()]);
+    assert!(w.vci_env(&work, &args, &env).status.success());
+    // With that Ruby, the full plan skips everything: the records hold it.
+    let with_other = w.plan_env(&work, "main", &env);
+    if with_other.skip != set(ALL) {
+        eprintln!(
+            "SKIPPED: the run with the Ruby that says 3.4.7 attested nothing: {with_other:?}"
+        );
+        return;
+    }
+    let full = w.plan(&work, "main");
+    assert!(full.skip.is_empty(), "the probed 3.4.9 differs: {full:?}");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "attested with another Ruby");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    assert!(!skip_all(&early));
+    let reason = early["files"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("ruby (declared)"), "{reason}");
+}
+
+/// A fact the early plan reads from the checkout is missing: no lockfile
+/// (the bundle cannot be compared) runs every unit, and a mise file that
+/// exports a variable the env policy hashes runs them too, where the full
+/// plan (which reads the environment as the tests get it) may skip them.
+#[test]
+fn rails_early_plan_runs_when_a_fact_is_missing() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "{early}");
+
+    // No lockfile: the early plan runs everything (the full plan runs too:
+    // the lockfile is an input of every unit).
+    let lock = w.read("Gemfile.lock");
+    std::fs::remove_file(work.join("Gemfile.lock")).unwrap();
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(early_skips(&early).is_empty(), "{early}");
+    assert!(!skip_all(&early));
+    w.put("Gemfile.lock", &lock);
+
+    // mise would export APP_MODE (hashed) after the early plan: run.
+    w.put(
+        "mise.toml",
+        "[tools]\nruby = \"3.4.9\"\n\n[env]\nAPP_MODE = \"x\"\n",
+    );
+    let full = w.plan(&work, "main");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "mise exports APP_MODE");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    let reason = early["files"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("cannot decide without the toolchain"),
+        "{reason}"
+    );
+    std::fs::remove_file(work.join("mise.toml")).unwrap();
+
+    // Back as attested.
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "{early}");
+}
