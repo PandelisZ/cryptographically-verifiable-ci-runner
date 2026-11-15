@@ -3940,9 +3940,65 @@ fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> UnitRecord
             .map(|(_, d)| d)
     };
     if !store.caps().columns {
-        let Ok(units) = store.read_units(test_ids) else {
+        // 2.12.0: the newest record of each unit by its key (the issue time
+        // its key hint states), read in one batch; a unit whose newest one
+        // records no duration, or whose keys state no time, has the rest of
+        // its records read in a second. Before, every record of every unit
+        // was read (`read_units`): on vex's git-meta store, 112,982 values
+        // for 896 units, 8.13 s before the batch started. The hdr ids are
+        // those of the records read; supersession reads any other it needs.
+        let Ok(mut units) = store.list_units(test_ids) else {
             return out;
         };
+        let newest_by_key = |cands: &[StoredEnvelope]| -> Option<usize> {
+            cands
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| e.issued.map(|t| (t, i)))
+                .max()
+                .map(|(_, i)| i)
+        };
+        let firsts: Vec<Option<usize>> = units.iter().map(|c| newest_by_key(c)).collect();
+        {
+            let mut refs: Vec<&mut StoredEnvelope> = units
+                .iter_mut()
+                .zip(&firsts)
+                .filter_map(|(c, f)| f.and_then(|i| c.get_mut(i)))
+                .collect();
+            if store.read_values(&mut refs).is_err() {
+                return out;
+            }
+        }
+        let rest: Vec<usize> = units
+            .iter()
+            .zip(&firsts)
+            .enumerate()
+            .filter(|(_, (c, f))| {
+                f.and_then(|i| c.get(i))
+                    .filter(|e| e.error.is_none())
+                    .and_then(|e| record_duration(&e.bytes))
+                    .is_none()
+            })
+            .map(|(u, _)| u)
+            .collect();
+        if !rest.is_empty() {
+            let mut refs: Vec<&mut StoredEnvelope> = units
+                .iter_mut()
+                .zip(&firsts)
+                .enumerate()
+                .filter(|(u, _)| rest.binary_search(u).is_ok())
+                .flat_map(|(_, (c, f))| {
+                    c.iter_mut()
+                        .enumerate()
+                        .filter(move |(i, _)| Some(*i) != *f)
+                        .map(|(_, e)| e)
+                })
+                .collect();
+            if store.read_values(&mut refs).is_err() {
+                return out;
+            }
+        }
+        // A record not read has no bytes: no duration, no hdr.
         for (id, cands) in test_ids.iter().zip(units) {
             if let Some(d) = newest_read(&cands) {
                 out.durations.insert((*id).to_owned(), d);
@@ -6274,6 +6330,44 @@ mod tests {
             BTreeMap::from([("a".to_owned(), 40), ("b".to_owned(), 70)])
         );
         assert!(got.columns.is_empty());
+    }
+
+    /// Without columns (git-meta), only the newest record of each unit by
+    /// its key's issue time is read, when it records a duration; a unit
+    /// whose newest one does not, or whose keys state no time, has the rest
+    /// read. The durations are the newest's, as when every record was read.
+    #[test]
+    fn last_durations_without_columns_read_the_newest_record_by_key_first() {
+        let s = crate::store::mem::MemStore::new();
+        let put = |id: &str, sk: &str, issued: Option<i64>, value: &[u8]| {
+            let hint = issued.map(|issued| KeyHint { issued, tree: None });
+            s.put(&NewAttestation::for_test(id, SIGNER, sk, hint.as_ref(), value))
+                .unwrap();
+        };
+        // a: ten records, the newest by key records 99.
+        for i in 0..9 {
+            let f = frame_with("a", "2026-01-01T00:00:00Z", 10 + i, PREDICATE_TYPE_V2);
+            put("a", &format!("a{i}"), Some(100 + i64::from(i as u8)), &f);
+        }
+        let newest = frame_with("a", "2026-02-01T00:00:00Z", 99, PREDICATE_TYPE_V2);
+        put("a", "af", Some(500), &newest);
+        // b: the newest by key is unreadable as a record: the rest is read.
+        put("b", "b1", Some(10), &envelope_with("b", "2026-03-01T00:00:00Z", 70));
+        put("b", "b2", Some(20), b"garbage");
+        // c: keys without a time: every record read.
+        put("c", "c1", None, &envelope_with("c", "2026-03-01T00:00:00Z", 5));
+        put("c", "c2", None, &envelope_with("c", "2026-04-01T00:00:00Z", 6));
+        let got = last_durations(&s, &["a", "b", "c", "d"]);
+        assert_eq!(
+            got.durations,
+            BTreeMap::from([
+                ("a".to_owned(), 99),
+                ("b".to_owned(), 70),
+                ("c".to_owned(), 6)
+            ])
+        );
+        // a: 1 of 10; b: 2; c: 2.
+        assert_eq!(s.values_read(), 1 + 1 + 1 + 2, "newest first, then the rest of b and c");
     }
 
     /// Supersession's pre-filter takes the columns [`last_durations`]

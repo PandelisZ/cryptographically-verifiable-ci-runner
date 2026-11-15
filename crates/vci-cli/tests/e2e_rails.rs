@@ -4107,3 +4107,276 @@ fn rails_inputs_loose_skips_boot_file_changes_and_strict_does_not() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// `vci plan --early` (2.12.0): the plan made before the toolchain is set up.
+// ---------------------------------------------------------------------------
+
+/// The fixture's policy with the early plan's opt-in (`toolchain =
+/// "declared"`, which the early plan decides only under `libraries =
+/// "any"`).
+const EARLY_TOML: &str = r#"project = "."
+adapter = "rails"
+
+[policy]
+platform = "any"
+max_ttl = "30d"
+libraries = "any"
+toolchain = "declared"
+
+[env]
+hash = ["APP_MODE", "TZ"]
+"#;
+
+/// A Ruby the early plan would fail with, had it started one: it must not.
+const NO_RUBY: &str = "/nonexistent/the-early-plan-starts-no-ruby";
+
+impl World {
+    /// `vci plan --early --format json` (with `args`), with no Ruby: its
+    /// JSON, which must carry the early answer, and the process's output.
+    fn early(&self, dir: &Path, base: &str, args: &[&str], env: &[(&str, &str)]) -> Value {
+        let mut a = vec!["plan", "--early", "--base-ref", base, "--format", "json"];
+        a.extend(args);
+        let mut env = env.to_vec();
+        env.push(("VCI_RUBY", NO_RUBY));
+        let out = self.vci_env(dir, &a, &env);
+        assert!(out.status.success(), "vci plan --early exits 0 whatever happens");
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(v["early"]["skipAll"].is_boolean(), "{v}");
+        v
+    }
+
+    /// Commit `vci_toml` on a new branch `name` from main (the base the
+    /// plans read policy from), and come back to the working tree as it was.
+    fn base_with(&self, name: &str, vci_toml: &str) {
+        let dir = self.base.join(format!("wt-{name}"));
+        self.git(
+            &self.work,
+            &["worktree", "add", "-q", "-b", name, dir.to_str().unwrap(), "main"],
+        );
+        std::fs::write(dir.join("vci.toml"), vci_toml).unwrap();
+        self.git(&dir, &["commit", "-q", "-am", &format!("policy {name}")]);
+    }
+}
+
+fn early_skips(v: &Value) -> BTreeSet<String> {
+    v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["skip"].as_bool() == Some(true))
+        .map(|f| f["testId"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn skip_all(v: &Value) -> bool {
+    v["early"]["skipAll"].as_bool().unwrap()
+}
+
+/// The early plan's guarantee: it never skips a unit the full plan runs,
+/// and says "skip all" only when the full plan runs nothing.
+fn assert_within(early: &Value, full: &Plan, what: &str) {
+    let e = early_skips(early);
+    assert!(
+        e.is_subset(&full.skip),
+        "{what}: the early plan skipped {:?}, which the full plan runs",
+        e.difference(&full.skip).collect::<Vec<_>>()
+    );
+    if skip_all(early) {
+        assert!(
+            full.run.is_empty() && !full.run_all,
+            "{what}: early says skip all, the full plan runs {:?}",
+            full.run
+        );
+    }
+}
+
+/// The early plan, with no Ruby at all, skips what the full plan skips
+/// when nothing the toolchain is declared by changed, and runs (never
+/// skips) whatever the full plan runs: a changed input, a changed Ruby
+/// version file, files that disagree on the Ruby version, a changed
+/// lockfile, a collector it cannot read, and a base it cannot read. Its
+/// three output formats carry the same answer.
+#[test]
+fn rails_early_plan_never_skips_what_the_full_plan_runs() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+
+    // Nothing changed: every unit skips, in both plans.
+    let full = w.plan(&work, "main");
+    assert_eq!(full.skip, set(ALL), "{full:?}");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "unchanged");
+    assert!(skip_all(&early), "{early}");
+    assert_eq!(early_skips(&early), set(ALL));
+    assert_eq!(early["early"]["skipped"], 4);
+    assert_eq!(early["early"]["run"], 0);
+
+    // Text and github formats.
+    let out = w.vci_env(&work, &["plan", "--early", "--base-ref", "main"], &[("VCI_RUBY", NO_RUBY)]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.lines().any(|l| l.starts_with("early: skip all: 4 unit(s) skipped")),
+        "{text}"
+    );
+    let gh_out = w.base.join("github-output");
+    let out = w.vci_env(
+        &work,
+        &["plan", "--early", "--base-ref", "main", "--format", "github"],
+        &[("VCI_RUBY", NO_RUBY), ("GITHUB_OUTPUT", gh_out.to_str().unwrap())],
+    );
+    assert!(out.status.success());
+    let gh = std::fs::read_to_string(&gh_out).unwrap();
+    for l in ["skip_all=true", "skipped_count=4", "run_count=0", "run_all=false"] {
+        assert!(gh.lines().any(|x| x == l), "{l} in {gh}");
+    }
+    // --json-file writes the same plan.
+    let saved = w.base.join("early.json");
+    w.early(&work, "main", &["--json-file", saved.to_str().unwrap()], &[]);
+    let v: Value = serde_json::from_slice(&std::fs::read(&saved).unwrap()).unwrap();
+    assert_eq!(v["early"]["skipAll"], true);
+
+    // An input of A changed: both run A, the early plan says run.
+    let calc = w.read("lib/calc.rb");
+    w.put("lib/calc.rb", &format!("{calc}\n# changed\n"));
+    let full = w.plan(&work, "main");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "an input changed");
+    assert!(full.run.contains(A), "{full:?}");
+    assert!(!skip_all(&early));
+    assert_eq!(early_skips(&early), full.skip, "the same verdicts here");
+    // The partitions of `vci ci --partition I/2`: only the one A is in has
+    // something to run.
+    let parts: Vec<bool> = ["1/2", "2/2"]
+        .iter()
+        .map(|p| skip_all(&w.early(&work, "main", &["--partition", p], &[])))
+        .collect();
+    assert_eq!(parts.iter().filter(|s| !**s).count(), 1, "{parts:?}");
+    w.put("lib/calc.rb", &calc);
+
+    // Another Ruby version declared: every unit runs in both.
+    w.put(".ruby-version", "3.4.8\n");
+    let full = w.plan(&work, "main");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "another .ruby-version");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    w.put(".ruby-version", "3.4.9\n");
+
+    // Version files that disagree (mise.toml says another Ruby): the early
+    // plan cannot tell which one the job installs, and runs.
+    w.put("mise.toml", "[tools]\nruby = \"3.4.8\"\n");
+    let full = w.plan(&work, "main");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "mise.toml disagrees");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    let reason = early["files"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("toolchain"), "{reason}");
+    std::fs::remove_file(work.join("mise.toml")).unwrap();
+
+    // The lockfile changed (a global input of every unit): both run all.
+    let lock = w.read("Gemfile.lock");
+    w.put("Gemfile.lock", &format!("{lock}\n"));
+    let early = w.early(&work, "main", &[], &[]);
+    let full = w.plan(&work, "main");
+    assert_within(&early, &full, "Gemfile.lock changed");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    w.put("Gemfile.lock", &lock);
+
+    // The collector's version cannot be read: a fact missing, so run.
+    let empty = w.base.join("no-collector");
+    std::fs::create_dir_all(&empty).unwrap();
+    let early = w.early(
+        &work,
+        "main",
+        &[],
+        &[("VCI_RUBY_COLLECTOR", empty.to_str().unwrap())],
+    );
+    assert!(early_skips(&early).is_empty(), "{early}");
+    assert!(!skip_all(&early));
+
+    // Back as attested: skip all again.
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "{early}");
+
+    // A base it cannot read: run, and still exit 0.
+    let early = w.early(&work, "no-such-ref", &[], &[]);
+    assert!(!skip_all(&early), "{early}");
+}
+
+/// The early plan decides a project only when the base policy opts in
+/// (`toolchain = "declared"`) and the toolchain facts it cannot read are not
+/// compared by the full plan either (`libraries = "any"`); otherwise it runs
+/// it. The full plan is the same whatever `toolchain` says.
+#[test]
+fn rails_early_plan_needs_the_base_policy() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+    w.base_with("probed", &EARLY_TOML.replace("toolchain = \"declared\"\n", ""));
+    w.base_with("exact", &EARLY_TOML.replace("libraries = \"any\"\n", ""));
+
+    // Without the opt-in: the project runs everything, unlisted.
+    let full = w.plan(&work, "probed");
+    assert_eq!(full.skip, set(ALL), "the full plan does not read it");
+    let early = w.early(&work, "probed", &[], &[]);
+    assert_within(&early, &full, "no opt-in");
+    assert!(!skip_all(&early));
+    let why = early["early"]["why"].as_str().unwrap();
+    assert!(why.contains("policy.toolchain = \\\"declared\\\"") || why.contains("policy.toolchain"), "{why}");
+
+    // libraries = "exact": the library versions are Ruby's to read.
+    let full = w.plan(&work, "exact");
+    let early = w.early(&work, "exact", &[], &[]);
+    assert_within(&early, &full, "libraries exact");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    let reason = early["files"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("toolchain"), "{reason}");
+
+    // `vci explain` of a full plan under the opt-in still probes: the base
+    // policy changes nothing there.
+    let full = w.plan(&work, "main");
+    assert_eq!(full.skip, set(ALL));
+}
+
+/// A native library the attestation records (libvips through Active
+/// Storage) comes from the system packages the job installs after the
+/// early plan: under `libraries = "any"` (by library name) the early plan
+/// takes it as declared, under "exact" (file and hash) it runs the file.
+/// Skipped where libvips is not installed.
+#[test]
+fn rails_early_plan_and_native_libraries() {
+    let Some(w) = World::build(EARLY_TOML, copy_vips_fixture) else {
+        return;
+    };
+    let vips = Command::new(w.ruby_bin.join("bundle"))
+        .args(["exec", "ruby", "-e", "require 'vips'"])
+        .current_dir(&w.work)
+        .env("PATH", w.path_env())
+        .env_remove("RUBYOPT")
+        .output()
+        .unwrap();
+    if !vips.status.success() {
+        eprintln!("SKIPPED: libvips is not installed (`brew install vips`)");
+        return;
+    }
+    let work = w.work.clone();
+    const CAPTION: &str = "test/models/caption_test.rb";
+    w.run(&work, &[CAPTION], &w.trusted);
+    let full = w.plan(&work, "main");
+    assert!(full.skip.contains(CAPTION), "{full:?}");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "natives, any");
+    assert!(early_skips(&early).contains(CAPTION), "{early}");
+
+    w.base_with("exact", &EARLY_TOML.replace("libraries = \"any\"\n", ""));
+    let full = w.plan(&work, "exact");
+    let early = w.early(&work, "exact", &[], &[]);
+    assert_within(&early, &full, "natives, exact");
+    assert!(!early_skips(&early).contains(CAPTION), "{early}");
+}

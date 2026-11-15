@@ -174,6 +174,7 @@ pub struct PolicyOverride {
     pub node_exact: Option<bool>,
     pub allow_superuser_mismatch: Option<bool>,
     pub rails_autoload_lookups: Option<bool>,
+    pub toolchain: Option<ToolchainTrust>,
 }
 
 /// Per-project env keys; each one given replaces the top-level key.
@@ -463,6 +464,26 @@ pub enum Platform {
     Exact,
 }
 
+/// Whether `vci plan --early` may take a project's toolchain from what the
+/// checkout declares (`policy.toolchain`, since 2.12.0). The full plan
+/// (`vci plan`, `vci ci`) always probes the toolchain and is not changed by
+/// this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolchainTrust {
+    /// The default: the early plan cannot decide the project (it answers
+    /// "run"), because only a probe of the installed toolchain says what the
+    /// full plan compares.
+    #[default]
+    Probed,
+    /// Rails: the early plan, which runs before the toolchain is installed,
+    /// compares an attestation's toolchain with what the checkout declares
+    /// (the exact Ruby version of the version files, Bundler, Rails and the
+    /// gems of `Gemfile.lock`, the collector of this vci) instead of probing
+    /// it; see docs/REFERENCE.md, "The early plan".
+    Declared,
+}
+
 /// How native libraries and the interpreter's library versions are compared
 /// (`policy.libraries`). Ordered from the loosest to the strictest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
@@ -597,6 +618,14 @@ pub struct Policy {
     /// `vci run` reads allows it.
     #[serde(default)]
     pub rails_autoload_lookups: bool,
+    /// `vci plan --early` (2.12.0): "declared" lets the early plan, which
+    /// runs before the toolchain is installed, take a Rails project's
+    /// toolchain from what the checkout declares; "probed" (the default)
+    /// makes the early plan answer "run" for the project. See
+    /// [`ToolchainTrust`]. Read from the base commit. Never changes what
+    /// the full plan decides.
+    #[serde(default)]
+    pub toolchain: ToolchainTrust,
 }
 
 fn default_max_ttl() -> String {
@@ -624,6 +653,7 @@ impl Default for Policy {
             node_exact: false,
             allow_superuser_mismatch: false,
             rails_autoload_lookups: false,
+            toolchain: ToolchainTrust::Probed,
         }
     }
 }
@@ -1204,6 +1234,9 @@ impl Config {
                     }
                     if let Some(v) = o.rails_autoload_lookups {
                         policy.rails_autoload_lookups = v;
+                    }
+                    if let Some(v) = o.toolchain {
+                        policy.toolchain = v;
                     }
                 }
                 let mut env = self.env.clone();

@@ -11,6 +11,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod cmds;
 mod config;
 mod ctx;
+mod early;
 mod envcmd;
 mod envpolicy;
 mod externals;
@@ -108,6 +109,15 @@ enum Cmd {
         /// Only this `[[projects]]` entry (by name; repeatable): the other projects are not listed, probed or verified. Not for the single-project form.
         #[arg(long = "project", value_name = "NAME")]
         project: Vec<String>,
+        /// Plan before the toolchain is installed (right after the checkout) and answer whether every unit is skipped: a Rails project whose base vci.toml sets `[projects.policy] toolchain = "declared"` is checked against the toolchain its checkout declares; every other project, and anything that cannot be decided, runs. Writes nothing to the store; exits 0 whatever happens.
+        #[arg(long)]
+        early: bool,
+        /// With --early: answer for partition I of N (as `vci ci --partition I/N` splits what runs): whether this partition has nothing to run.
+        #[arg(long, value_name = "I/N", requires = "early")]
+        partition: Option<partition::Partition>,
+        /// Also write the plan as JSON (what `--format json` prints) to FILE, so that a later step reads this plan instead of planning again.
+        #[arg(long, value_name = "FILE")]
+        json_file: Option<Utf8PathBuf>,
     },
     /// Plan, run the remaining tests, and write an audit log of the skips (with --key or --oidc: attest what runs).
     #[command(group(clap::ArgGroup::new("signing").args(["key", "oidc"])))]
@@ -371,27 +381,41 @@ fn main() {
             format,
             fetch,
             project,
-        } => plan::plan(&plan::PlanOptions {
-            base_ref,
-            only: None,
-            fetch: fetch_remote(fetch),
-            projects: project,
-        })
-        .and_then(|res| {
+            early,
+            partition,
+            json_file,
+        } => {
             let format = match format {
                 Format::Text => "text",
                 Format::Json => "json",
                 Format::Github => "github",
             };
-            // A workflow annotation, except where stdout is JSON.
-            if let Some(w) = &res.fetch_failed
-                && format != "json"
-            {
-                println!("::warning title=vci::{}", w.replace(['\r', '\n'], " "));
+            let opts = plan::PlanOptions {
+                base_ref,
+                only: None,
+                fetch: fetch_remote(fetch),
+                projects: project,
+                early,
+            };
+            if early {
+                Ok(plan::early(&opts, partition, format, json_file.as_deref()))
+            } else {
+                plan::plan(&opts)
+                    .and_then(|res| {
+                        if let Some(f) = &json_file {
+                            plan::write_json(&res, f)?;
+                        }
+                        // A workflow annotation, except where stdout is JSON.
+                        if let Some(w) = &res.fetch_failed
+                            && format != "json"
+                        {
+                            println!("::warning title=vci::{}", w.replace(['\r', '\n'], " "));
+                        }
+                        plan::print(&res, format)
+                    })
+                    .map(|()| 0)
             }
-            plan::print(&res, format)
-        })
-        .map(|()| 0),
+        }
         Cmd::Ci {
             base_ref,
             audit_log,
@@ -472,6 +496,7 @@ fn main() {
                 only: Some(id.clone()),
                 fetch: None,
                 projects: vec![],
+                early: false,
             })?;
             plan::explain(&res, &id)
         }),
