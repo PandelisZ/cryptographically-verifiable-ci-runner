@@ -2314,23 +2314,25 @@ mod tests {
         }
     }
 
-    /// `rails_zygote` (2.12.0): "gems" by default, "common" or "off" when
+    /// `rails_zygote` (2.12.0): "off" by default, "gems" or "common" when
     /// set, in the single-project form or a project's table; only the rails
     /// adapter takes it.
     #[test]
     fn rails_zygote_setting() {
         use vci_adapter::RailsZygote;
         let c = Config::parse(RAILS_TEMPLATE).unwrap();
+        assert_eq!(c.project_specs()[0].rails_zygote, RailsZygote::Off);
+        let c = Config::parse("adapter = \"rails\"\nrails_zygote = \"gems\"\n").unwrap();
         assert_eq!(c.project_specs()[0].rails_zygote, RailsZygote::Gems);
         let c = Config::parse("adapter = \"rails\"\nrails_zygote = \"common\"\n").unwrap();
         assert_eq!(c.project_specs()[0].rails_zygote, RailsZygote::Common);
         let c = Config::parse(
-            "[[projects]]\nname = \"api\"\npath = \"api\"\nadapter = \"rails\"\nrails_zygote = \"off\"\n\n[[projects]]\nname = \"web\"\npath = \"web\"\nadapter = \"vitest\"\n",
+            "[[projects]]\nname = \"api\"\npath = \"api\"\nadapter = \"rails\"\nrails_zygote = \"gems\"\n\n[[projects]]\nname = \"web\"\npath = \"web\"\nadapter = \"vitest\"\n",
         )
         .unwrap();
         let s = c.project_specs();
-        assert_eq!(s[0].rails_zygote, RailsZygote::Off);
-        assert_eq!(s[1].rails_zygote, RailsZygote::Gems);
+        assert_eq!(s[0].rails_zygote, RailsZygote::Gems);
+        assert_eq!(s[1].rails_zygote, RailsZygote::Off);
         for bad in [
             "adapter = \"rails\"\nrails_zygote = \"all\"\n",
             "adapter = \"pytest\"\nrails_zygote = \"gems\"\n",

@@ -2228,6 +2228,22 @@ class CollectorTest < Minitest::Test
   # (VCI_RAILS_ZYGOTE_SAMPLES of them, spread over the batch), which run from
   # their bare slot and each note what it loaded; the zygote preloads what
   # they loaded (here every file requires English), then runs the rest.
+  # A zygote forms only in a batch that leaves each slot at least 20 files
+  # after the samples (twice the slots, 16 at least): on vex-api, 100 files
+  # over 12 slots (about 6 a slot) used more CPU with zygotes than without.
+  def test_batch_zygote_forms_only_when_each_slot_keeps_enough_files
+    script = "puts \"MIN=\#{[100, 200, 263, 264, 908].map { |n| VciCollector::Batch::Zygote.min_samples(n).inspect }.join(\",\")}\"\n"
+    min = lambda do |slots|
+      out = probe_run(script, env: { "VCI_RAILS_SLOTS" => slots.to_s })
+      line = out.lines.find { |l| l.start_with?("MIN=") }
+      assert line, out
+      line.delete_prefix("MIN=").strip
+    end
+    assert_equal "nil,nil,nil,24,24", min.call(12)
+    assert_equal "nil,16,16,16,16", min.call(8)
+    assert_equal "16,16,16,16,16", min.call(2)
+  end
+
   def test_batch_slot_zygote_learns_from_the_first_files
     skip "no English.rb" unless File.file?(File.join(RbConfig::CONFIG["rubylibdir"], "English.rb"))
     put("test/test_helper.rb", "require \"minitest\"\n")

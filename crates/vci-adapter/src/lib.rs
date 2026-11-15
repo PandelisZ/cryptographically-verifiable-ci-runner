@@ -181,12 +181,15 @@ pub struct RunHints {
 #[serde(rename_all = "lowercase")]
 pub enum RailsZygote {
     /// No zygote: every file's process forks from its slot (vci before
-    /// 2.12.0).
+    /// 2.12.0). The default: each file records exactly the inputs it
+    /// recorded under 2.11, and a slot holds one process less.
+    #[default]
     Off,
     /// The gem files (and Ruby's own library files) that at least a tenth
     /// of the files sampled loaded. No precision is lost: gems and Ruby are
-    /// recorded by version, and the toolchain records the whole bundle.
-    #[default]
+    /// recorded by version, and the toolchain records the whole bundle; but
+    /// a file records as externals the gems the zygote loaded that it
+    /// never used (on vex-api 75 of 100 files gained three).
     Gems,
     /// Those, and the application's autoloaded files that at least 90% of
     /// the files sampled loaded: each becomes an input of every later file

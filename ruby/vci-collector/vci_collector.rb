@@ -1218,15 +1218,22 @@ module VciCollector
         !ZYGOTE.nil? && !OUT.nil? && Batch.on?
       end
 
+      # Files each slot must still have to run after the samples for a
+      # zygote to form: its preload and its own garbage collection cost 0.7
+      # to 1.7 s a slot on vex-api, which about 6 files a slot did not repay
+      # (100 files over 12 slots used 4% more CPU than no zygote) and 13 to
+      # 16 repaid with nothing to spare (200 files: the same CPU).
+      FILES_PER_SLOT = 20
+
       # How many files' loads a zygote is planned from: twice the slots, at
       # least 16 (VCI_RAILS_ZYGOTE_SAMPLES: that many, a diagnostic switch),
-      # and at most a quarter of the batch's work (a batch of fewer files
-      # gets no zygote; with the switch, fewer than the work).
+      # in a batch that leaves each slot FILES_PER_SLOT files after them (a
+      # smaller batch gets no zygote; with the switch, fewer than the work).
       def min_samples(work)
         asked = SAMPLES.to_i
         return (asked < work ? asked : nil) if asked.positive?
         n = [2 * SLOTS, 16].max
-        n <= work / 4 ? n : nil
+        work - n >= FILES_PER_SLOT * SLOTS ? n : nil
       end
 
       # The first `need` pieces of `work` spread over it (each the next of
