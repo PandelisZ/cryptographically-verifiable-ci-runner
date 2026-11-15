@@ -2856,6 +2856,33 @@ class CollectorTest < Minitest::Test
     ids.each { |id| assert_equal "passed", out[id].last["state"], id }
   end
 
+  # VCI_RAILS_FILE_TIMEOUT holds for each file of a worker, from when the
+  # file before it ended: three files of 1.6 s each run in a worker under a
+  # 3 s limit; a file that sleeps past it stops its worker, has no result
+  # (timed out), and the file after it runs in a fresh worker.
+  def test_batch_worker_file_timeout_is_each_files
+    worker_helper
+    %w[a b c].each { |n| worker_test(n, "sleep 1.6") }
+    worker_test("d", "sleep 30")
+    worker_test("e")
+    worker_test("f")
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb test/d_test.rb test/e_test.rb test/f_test.rb]
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    out = workers(ids, 5, env: { "VCI_RAILS_FILE_TIMEOUT" => "3" })
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 28
+    lines = out[:status].select { |l| l["id"] }
+    assert_equal({ "done" => true }, out[:status].last, out[:said])
+    %w[test/a_test.rb test/b_test.rb test/c_test.rb].each do |id|
+      assert_equal ["test/a_test.rb", 0], lines.find { |l| l["id"] == id }["worker"].then { |w| [w[0], 0] }, out[:said]
+      assert_equal 0, lines.find { |l| l["id"] == id }["exit"], out[:said]
+    end
+    d = lines.find { |l| l["id"] == "test/d_test.rb" }
+    assert_equal 3, d["timed_out"], out[:status].inspect + out[:said].to_s
+    assert_nil out["test/d_test.rb"]
+    assert_equal ["test/e_test.rb", 4], lines.find { |l| l["id"] == "test/e_test.rb" }["worker"], out[:said]
+    assert_equal 0, lines.find { |l| l["id"] == "test/e_test.rb" }["exit"], out[:said]
+  end
+
   # A batch file's output lines as vci reads them (rails.rs, read_batch):
   # when they name the lines the files of their boot share, those lines
   # (their content as named, but those dropped), then the file's own.

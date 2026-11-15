@@ -1633,7 +1633,7 @@ module VciCollector
             progress = File.join(OUT.to_s, "batch", "worker-#{i}-#{idx}-#{off}")
             pid = fork_own
             run_worker(chunk, progress, idx, off) if pid.nil?
-            watch = watch_file(pid, chunk.first, FILE_TIMEOUT * chunk.size)
+            watch = watch_worker(pid, chunk, progress, off)
             _, st = Process.wait2(pid)
             watch&.dig(:thread)&.kill
             first = 1 if first.zero? && !st.success?
@@ -1685,26 +1685,76 @@ module VciCollector
       # A thread that names the file `pid` runs after two minutes and stops
       # it after FILE_TIMEOUT seconds (TERM, then KILL ten seconds later);
       # `fired` says it did. Nil without a limit.
-      def watch_file(pid, f, limit = FILE_TIMEOUT)
-        return nil unless limit.positive?
+      def watch_file(pid, f)
+        return nil unless FILE_TIMEOUT.positive?
 
         state = { fired: false }
         slot = @slot
         state[:thread] = Thread.new do
-          warn_at = [120, limit].min
+          warn_at = [120, FILE_TIMEOUT].min
           sleep warn_at
-          if warn_at < limit
+          if warn_at < FILE_TIMEOUT
             $stderr.puts "vci_collector: #{f} still running after #{warn_at}s (slot #{slot})"
-            sleep limit - warn_at
+            sleep FILE_TIMEOUT - warn_at
           end
           state[:fired] = true
-          $stderr.puts "vci_collector: #{f} ran past #{limit}s (VCI_RAILS_FILE_TIMEOUT) in slot #{slot}; stopping it"
+          $stderr.puts "vci_collector: #{f} ran past #{FILE_TIMEOUT}s (VCI_RAILS_FILE_TIMEOUT) in slot #{slot}; stopping it"
           begin
             Process.kill("TERM", pid)
             sleep 10
             Process.kill("KILL", pid)
           rescue Errno::ESRCH
             nil
+          end
+        end
+        state
+      end
+
+      # watch_file for a worker running `chunk` (from place `off`): the limit
+      # is each file's, from when the file before it said its result in the
+      # worker's progress file (worker_progress), so that a worker of K files
+      # is stopped as soon as one of them runs past FILE_TIMEOUT, as that
+      # file's own process would be. Nil without a limit.
+      def watch_worker(pid, chunk, progress, off)
+        return nil unless FILE_TIMEOUT.positive?
+
+        state = { fired: false }
+        slot = @slot
+        state[:thread] = Thread.new do
+          seen = -1
+          since = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          warned = false
+          loop do
+            sleep 1
+            size = VciCollector.quiet { Real.exist?(progress) ? Real.stat(progress).size : 0 }
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            if size != seen
+              seen = size
+              since = now
+              warned = false
+              next
+            end
+            done = VciCollector.quiet do
+              Real.exist?(progress) ? File.read(progress).scan(/^done (\d+)$/).map { |(d)| d.to_i }.max : nil
+            end
+            f = chunk[(done.nil? ? off : done + 1) - off] || chunk.last
+            if !warned && now - since >= [120, FILE_TIMEOUT].min && FILE_TIMEOUT > 120
+              warned = true
+              $stderr.puts "vci_collector: #{f} still running after 120s (slot #{slot}, in a worker)"
+            end
+            next if now - since < FILE_TIMEOUT
+
+            state[:fired] = true
+            $stderr.puts "vci_collector: #{f} ran past #{FILE_TIMEOUT}s (VCI_RAILS_FILE_TIMEOUT) in slot #{slot}; " \
+                         "stopping its worker"
+            begin
+              Process.kill("TERM", pid)
+              sleep 10
+              Process.kill("KILL", pid)
+            rescue Errno::ESRCH
+              nil
+            end
+            break
           end
         end
         state
@@ -1963,7 +2013,7 @@ module VciCollector
         f = chunk[nxt - off]
         how = st.signaled? ? "signal #{st.termsig}" : "exit #{st.exitstatus}"
         if fired
-          status(id: f, exit: nil, slot: @slot, timed_out: FILE_TIMEOUT * chunk.size, at: batch_at)
+          status(id: f, exit: nil, slot: @slot, timed_out: FILE_TIMEOUT, at: batch_at)
         else
           status(id: f, why: "the worker process of slot #{@slot} that ran it ended (#{how}) before it said its " \
                              "result: it runs on its own")
