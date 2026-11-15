@@ -813,7 +813,18 @@ ranging from 0.57 to 1.22). At 8 slots, as on vex's 8-core runners, `"gems"` was
 0.94 of its wall time. Those 8-slot runs had the laptop's 14 cores, not an 8-core Linux runner. In the review's model
 of vex's CI jobs (the Ruby batch is 23% of a vci job, and a zygote forms only in a third of them) neither setting
 changes vex's runner time measurably (14.3 runner-hours a day either way): a zygote is a choice for suites whose
-runs are mostly full. `VCI_RAILS_ZYGOTE` (`off`, `gems`, `common`) in vci's environment overrides it. It is not part of
+runs are mostly full.
+
+Measured again after the review's fixes (14 November 2026, 22:49 to 23:02, vex-api's shard 2 of 2, 908
+files, 12 slots, a local SQLite store, release builds, three lock sessions with the builds in a different order in
+each, load average 9 to 67 on the 14-core laptop shared with other agents, so only comparisons within a session
+hold). CPU is the user and system time of every process of the run. 2.11.1: 79.4, 76.0 and 99.9 s, 560, 544 and 575
+CPU-seconds (its Ruby batch 66.3, 64.9 and 87.7 s). The new default (`"off"`): 70.1, 83.2 and 89.0 s, 551, 560 and
+584 CPU-seconds (batch 59.4, 72.0 and 77.2 s): the same as 2.11.1 within the noise, as it should be. `"gems"`: 64.6,
+70.3 and 79.9 s, 510, 516 and 556 CPU-seconds (batch 53.8, 59.1 and 67.2 s), 0.91 to 0.97 of 2.11.1's CPU in the
+same session. Plain `bin/rails test`: 50.7 s and 336 CPU-seconds (one run). The input roots of the 907 attested files:
+the default's differed from 2.11.1's in 60, exactly as many as between two 2.11.1 runs (random ids in absent
+`public/` paths); `"gems"`' differed in 808. `VCI_RAILS_ZYGOTE` (`off`, `gems`, `common`) in vci's environment overrides it. It is not part of
 `vci:config`: an attestation made with any setting is accepted with any other, as each records a superset of what
 the file loaded. Diagnostic switches: `VCI_RAILS_ZYGOTE_HINTS` (a file of absolute paths, one a line: each zygote
 forms at once and preloads those, classified as above) and `VCI_RAILS_ZYGOTE_SAMPLES` (how many files to wait for).
