@@ -394,13 +394,59 @@ fn version_files_in(dir: &Utf8Path) -> Result<Vec<Utf8PathBuf>, String> {
 
 /// The identifiers `config/database.yml`'s ERB may use besides its own
 /// local variables and `ENV` read by a literal name: Ruby's literals and
-/// keywords and the methods of strings, numbers and arrays that compute a
-/// value from what they are given.
+/// keywords, the methods of strings, numbers, arrays and `URI` objects that
+/// compute a value from what they are given, and `URI` itself (Ruby's own
+/// library, which the probe loads without the application).
 const DB_ERB_WORDS: &[&str] = &[
-    "nil", "true", "false", "if", "unless", "else", "elsif", "end", "then", "and", "or", "not",
-    "fetch", "presence", "present?", "blank?", "empty?", "nil?", "to_i", "to_s", "to_f", "to_sym",
-    "max", "min", "strip", "downcase", "upcase", "split", "first", "last",
+    "nil",
+    "true",
+    "false",
+    "if",
+    "unless",
+    "else",
+    "elsif",
+    "end",
+    "then",
+    "and",
+    "or",
+    "not",
+    "begin",
+    "fetch",
+    "presence",
+    "present?",
+    "blank?",
+    "empty?",
+    "nil?",
+    "to_i",
+    "to_s",
+    "to_f",
+    "to_sym",
+    "max",
+    "min",
+    "strip",
+    "downcase",
+    "upcase",
+    "split",
+    "first",
+    "last",
+    "join",
+    "URI",
+    "parse",
+    "decode_www_form_component",
+    "encode_www_form_component",
+    "user",
+    "password",
+    "port",
+    "host",
+    "path",
+    "scheme",
+    "query",
+    "userinfo",
 ];
+
+/// The libraries `config/database.yml`'s ERB may `require` (by a literal
+/// name): Ruby's own, whose code the application cannot change.
+const DB_ERB_REQUIRES: &[&str] = &["uri"];
 
 /// The variables `config/database.yml` (in `project_dir`) reads in its ERB,
 /// by literal name (`ENV["X"]`, `ENV.fetch("X"...)`, `ENV.key?("X")`), or
@@ -442,8 +488,8 @@ fn erb_tags(text: &str) -> Result<Vec<&str>, String> {
     Ok(out)
 }
 
-/// One Ruby string literal at the start of `s` (`"..."` without `#{`, or
-/// `'...'`): its text and the rest of `s`.
+/// One single-quoted Ruby string at the start of `s` (`'...'`, or a
+/// double-quoted one without interpolation): its text and the rest of `s`.
 fn ruby_string(s: &str) -> Option<(&str, &str)> {
     let q = s.chars().next().filter(|c| *c == '"' || *c == '\'')?;
     let body = &s[1..];
@@ -453,39 +499,152 @@ fn ruby_string(s: &str) -> Option<(&str, &str)> {
             esc = false;
         } else if c == '\\' {
             esc = true;
+        } else if q == '"' && body[i..].starts_with("#{") {
+            return None;
         } else if c == q {
-            let lit = &body[..i];
-            if q == '"' && lit.contains("#{") {
-                return None;
-            }
-            return Some((lit, &body[i + 1..]));
+            return Some((&body[..i], &body[i + 1..]));
         }
     }
     None
 }
 
+/// Length of the identifier at the start of `s` (with a trailing `?` or
+/// `!` of a method name).
+fn ruby_ident(s: &str) -> usize {
+    let n = s
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
+        .map_or(s.len(), |(i, _)| i);
+    if s[n..].starts_with(['?', '!']) && !s[n..].starts_with("!=") {
+        n + 1
+    } else {
+        n
+    }
+}
+
+/// The ERB scanner of [`erb_env`]: the local variables the file assigns,
+/// and the variables read so far.
+struct ErbScan<'a> {
+    locals: Vec<&'a str>,
+    vars: Vec<String>,
+}
+
+impl<'a> ErbScan<'a> {
+    /// Scan the Ruby code `s`; with `interp` (inside `#{...}`), up to the
+    /// `}` that closes it, returning what follows.
+    fn code(&mut self, mut s: &'a str, interp: bool) -> Result<&'a str, String> {
+        let mut depth = 0usize;
+        while let Some(c) = s.chars().next() {
+            if c.is_whitespace() || c == ';' {
+                s = &s[c.len_utf8()..];
+            } else if c == '\'' {
+                s = ruby_string(s).ok_or("an unclosed string")?.1;
+            } else if c == '"' {
+                s = self.dq_string(&s[1..])?;
+            } else if c.is_ascii_digit() {
+                let n = s
+                    .find(|c: char| !(c.is_ascii_digit() || c == '_' || c == '.'))
+                    .unwrap_or(s.len());
+                s = &s[n..];
+            } else if c.is_ascii_alphabetic() || c == '_' {
+                let n = ruby_ident(s);
+                let word = &s[..n];
+                s = &s[n..];
+                if word == "ENV" {
+                    s = self.env(s)?;
+                } else if word == "require" {
+                    let r = s.trim_start();
+                    let r = r.strip_prefix('(').unwrap_or(r).trim_start();
+                    let (lib, rest) = ruby_string(r).ok_or("`require` of a computed name")?;
+                    if !DB_ERB_REQUIRES.contains(&lib) {
+                        return Err(format!("`require {lib:?}`"));
+                    }
+                    s = rest.trim_start();
+                    s = s.strip_prefix(')').unwrap_or(s);
+                } else if !DB_ERB_WORDS.contains(&word) && !self.locals.contains(&word) {
+                    return Err(format!("`{word}`, which the early plan cannot follow"));
+                }
+            } else if c == ':' && s.starts_with("::") {
+                return Err("a constant path".into());
+            } else if c == '%' && s[1..].starts_with(|c: char| !c.is_whitespace() && c != '=') {
+                return Err("a % literal".into());
+            } else if matches!(c, '$' | '@' | '`') {
+                return Err(format!("`{c}`"));
+            } else if c == '{' {
+                depth += 1;
+                s = &s[1..];
+            } else if c == '}' {
+                if depth == 0 && interp {
+                    return Ok(&s[1..]);
+                }
+                depth = depth.saturating_sub(1);
+                s = &s[1..];
+            } else {
+                s = &s[c.len_utf8()..];
+            }
+        }
+        if interp {
+            return Err("an unclosed #{".into());
+        }
+        Ok(s)
+    }
+
+    /// A double-quoted string after its opening quote, each `#{...}` in it
+    /// scanned as code: what follows its closing quote.
+    fn dq_string(&mut self, mut s: &'a str) -> Result<&'a str, String> {
+        loop {
+            let mut chars = s.char_indices();
+            let mut next = None;
+            while let Some((i, c)) = chars.next() {
+                if c == '\\' {
+                    chars.next();
+                } else if c == '"' {
+                    return Ok(&s[i + 1..]);
+                } else if s[i..].starts_with("#{") {
+                    next = Some(i + 2);
+                    break;
+                }
+            }
+            let Some(at) = next else {
+                return Err("an unclosed string".into());
+            };
+            s = self.code(&s[at..], true)?;
+        }
+    }
+
+    /// `ENV` followed by `[`, `.fetch(`, `.key?(` ... and a literal name.
+    fn env(&mut self, s: &'a str) -> Result<&'a str, String> {
+        let lit = if let Some(r) = s.strip_prefix('[') {
+            ruby_string(r.trim_start())
+                .and_then(|(l, r)| r.trim_start().strip_prefix(']').map(|r| (l, r)))
+        } else if let Some(r) = s.strip_prefix('.') {
+            let m = ruby_ident(r);
+            if ["fetch", "key?", "has_key?", "include?", "member?"].contains(&&r[..m]) {
+                r[m..]
+                    .trim_start()
+                    .strip_prefix('(')
+                    .and_then(|r| ruby_string(r.trim_start()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (name, rest) = lit.ok_or("`ENV` other than by a literal name")?;
+        self.vars.push(name.to_owned());
+        Ok(rest)
+    }
+}
+
 fn erb_env(text: &str) -> Result<Vec<String>, String> {
     let tags = erb_tags(text)?;
-    let ident = |s: &str| -> usize {
-        let n = s
-            .char_indices()
-            .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
-            .map_or(s.len(), |(i, _)| i);
-        if s[n..].starts_with(['?', '!']) && !s[n..].starts_with("!=") {
-            n + 1
-        } else {
-            n
-        }
-    };
     // The local variables the tags assign (`name = ...`).
     let mut locals: Vec<&str> = Vec::new();
     for code in &tags {
         let mut s = code.trim_start();
-        while !s.is_empty() {
-            let c = s.chars().next().unwrap();
+        while let Some(c) = s.chars().next() {
             if c.is_ascii_lowercase() || c == '_' {
-                let n = ident(s);
-                let (name, rest) = s.split_at(n);
+                let (name, rest) = s.split_at(ruby_ident(s));
                 let r = rest.trim_start();
                 if r.starts_with('=')
                     && !r.starts_with("==")
@@ -500,64 +659,15 @@ fn erb_env(text: &str) -> Result<Vec<String>, String> {
             }
         }
     }
-    let mut vars = Vec::new();
+    let mut scan = ErbScan {
+        locals,
+        vars: Vec::new(),
+    };
     for code in &tags {
-        let mut s: &str = code;
-        while let Some(c) = s.chars().next() {
-            if c.is_whitespace() {
-                s = &s[c.len_utf8()..];
-            } else if c == '"' || c == '\'' {
-                let (_, rest) = ruby_string(s).ok_or_else(|| {
-                    format!("an interpolated or unclosed string in its ERB: {code:?}")
-                })?;
-                s = rest;
-            } else if c.is_ascii_digit() {
-                let n = s
-                    .find(|c: char| !(c.is_ascii_digit() || c == '_' || c == '.'))
-                    .unwrap_or(s.len());
-                s = &s[n..];
-            } else if c.is_ascii_alphabetic() || c == '_' {
-                let n = ident(s);
-                let word = &s[..n];
-                s = &s[n..];
-                if word == "ENV" {
-                    let lit = if let Some(r) = s.strip_prefix('[') {
-                        ruby_string(r.trim_start())
-                            .and_then(|(l, r)| r.trim_start().strip_prefix(']').map(|r| (l, r)))
-                    } else if let Some(r) = s.strip_prefix('.') {
-                        let m = ident(r);
-                        if ["fetch", "key?", "has_key?", "include?", "member?"].contains(&&r[..m]) {
-                            r[m..]
-                                .trim_start()
-                                .strip_prefix('(')
-                                .and_then(|r| ruby_string(r.trim_start()))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    let (name, rest) = lit.ok_or_else(|| {
-                        format!("its ERB uses ENV other than by a literal name: {code:?}")
-                    })?;
-                    vars.push(name.to_owned());
-                    s = rest;
-                } else if !DB_ERB_WORDS.contains(&word) && !locals.contains(&word) {
-                    return Err(format!(
-                        "its ERB uses `{word}`, which the early plan cannot follow: {code:?}"
-                    ));
-                }
-            } else if c == ':' && s.starts_with("::") {
-                return Err(format!("its ERB names a constant path: {code:?}"));
-            } else if c == '%' && s[1..].starts_with(|c: char| !c.is_whitespace()) {
-                return Err(format!("its ERB uses a % literal: {code:?}"));
-            } else if matches!(c, '$' | '@' | '`') {
-                return Err(format!("its ERB uses `{c}`: {code:?}"));
-            } else {
-                s = &s[c.len_utf8()..];
-            }
-        }
+        scan.code(code, false)
+            .map_err(|e| format!("its ERB uses {e}: {:?}", code.trim()))?;
     }
+    let mut vars = scan.vars;
     vars.sort();
     vars.dedup();
     Ok(vars)
@@ -1396,7 +1506,7 @@ BUNDLED WITH
     /// short), and ERB the early plan cannot follow.
     #[test]
     fn database_yml_erb_names_its_variables_or_is_undecided() {
-        let vex = r#"default: &default
+        let vex = r##"default: &default
   adapter: sqlite3
   max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
   pool: <%= ENV.fetch("VEX_PRIMARY_DB_POOL") { [ENV.fetch("RAILS_MAX_THREADS", 5).to_i, ENV.fetch('MAINTENANCE_JOB_THREADS', 8).to_i].max * 2 } %>
@@ -1407,13 +1517,27 @@ test:
   url: <%= test_database_url %>
   cache: <%= ENV.fetch("CACHE_DATABASE_URL", ENV["DATABASE_URL"]) %>
   literal: "<%%= not erb %>"
-"#;
+production:
+  url: <%= begin
+      require "uri"
+      url = ENV.fetch("QUEUE_DATABASE_URL", ENV["DATABASE_URL"])
+      if ENV["QUEUE_REPLICA_PGBOUNCER"].present?
+        connection = URI.parse(url)
+        user = URI.decode_www_form_component(connection.user).split("|").first
+        connection.userinfo = "#{URI.encode_www_form_component("#{user}|#{ENV.fetch('QUEUE_REPLICA_PGBOUNCER')}")}:#{connection.password}"
+        url = connection.to_s
+      end
+      url
+    end %>
+"##;
         assert_eq!(
             erb_env(vex).unwrap(),
             vec![
                 "CACHE_DATABASE_URL",
                 "DATABASE_URL",
                 "MAINTENANCE_JOB_THREADS",
+                "QUEUE_DATABASE_URL",
+                "QUEUE_REPLICA_PGBOUNCER",
                 "RAILS_MAX_THREADS",
                 "VEX_PRIMARY_DB_POOL",
                 "VEX_TEST_DATABASE_URL"
@@ -1427,6 +1551,8 @@ test:
             "a: <%= ENV[name] %>",
             "a: <%= ENV.to_h[\"X\"] %>",
             "a: <%= ENV.fetch(\"#{x}\") %>",
+            "a: <%= \"#{File.read(\"x\")}\" %>",
+            "a: <%= require \"./config/x\" %>",
             "a: <%= Rails.env %>",
             "a: <%= File.read(\"x\") %>",
             "a: <%= `uname` %>",
