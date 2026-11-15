@@ -163,6 +163,51 @@ pub struct RunHints {
     /// the routes files out of every manifest; `VCI_RAILS_PRELOAD_ROUTES=0`
     /// turns it off).
     pub rails_preload_routes: bool,
+    /// Rails (2.12.0): what each slot's zygote of a batch preloads (the
+    /// project's `rails_zygote`; `VCI_RAILS_ZYGOTE` in vci's environment
+    /// overrides it).
+    pub rails_zygote: RailsZygote,
+}
+
+/// `rails_zygote` (2.12.0): what a Rails batch's slot loads, in a zygote
+/// process it forks once the batch's first files have shown what they load,
+/// before it forks the rest of its files from that zygote (each records
+/// what the zygote loaded as its own inputs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RailsZygote {
+    /// No zygote: every file's process forks from its slot (vci before
+    /// 2.12.0).
+    Off,
+    /// The gem files (and Ruby's own library files) that at least a tenth
+    /// of the files sampled loaded. No precision is lost: gems and Ruby are
+    /// recorded by version, and the toolchain records the whole bundle.
+    #[default]
+    Gems,
+    /// Those, and the application's autoloaded files that at least 90% of
+    /// the files sampled loaded: each becomes an input of every later file
+    /// of the slot.
+    Common,
+}
+
+impl RailsZygote {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Gems => "gems",
+            Self::Common => "common",
+        }
+    }
+
+    /// `off`, `gems` or `common`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "off" | "0" => Some(Self::Off),
+            "gems" => Some(Self::Gems),
+            "common" => Some(Self::Common),
+            _ => None,
+        }
+    }
 }
 
 /// A test file as reported by the runner's list command.

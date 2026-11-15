@@ -3777,6 +3777,233 @@ fn rails_batch_routes_drawn_in_the_boot_are_inputs_of_every_file() {
     assert!(p.skip.contains("test/models/b_test.rb"), "{p:?}");
 }
 
+/// The model the zygote tests preload, and a test file using it or not.
+const ZYG_MODEL: &str = "app/models/shared_thing.rb";
+const ZYG_MODEL_RB: &str = "class SharedThing\n  def self.value = 1\nend\n";
+
+fn zygote_file(n: usize, uses: bool) -> String {
+    let body = if uses {
+        "assert_equal 1, SharedThing.value"
+    } else {
+        "assert_equal 2, 1 + 1"
+    };
+    format!(
+        "require \"test_helper\"\n\nclass Zyg{n}Test < ActiveSupport::TestCase\n  test \"it\" do\n    {body}\n  end\nend\n"
+    )
+}
+
+/// A world with [`ZYG_MODEL`] and `files` (`(path, uses the model)`),
+/// committed.
+fn zygote_world(files: &[(&str, bool)]) -> Option<World> {
+    let w = World::new()?;
+    // Format-1 records: entries_of reads the stored manifests.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
+    w.put(ZYG_MODEL, ZYG_MODEL_RB);
+    for (i, (f, uses)) in files.iter().enumerate() {
+        w.put(f, &zygote_file(i, *uses));
+    }
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "zygote files"]);
+    Some(w)
+}
+
+/// `vci run` of `files` in two slots with `env`: every file attested; its
+/// stderr.
+fn zygote_run(w: &World, files: &[&str], env: &[(&str, &str)]) -> String {
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let mut args = vec!["run"];
+    args.extend(files);
+    args.extend(["--key", key.as_str()]);
+    let mut all = vec![("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "2")];
+    all.extend_from_slice(env);
+    let out = w.vci_env(&w.work, &args, &all);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!("vci: {} attested, 0 not attested", files.len())),
+        "{stderr}"
+    );
+    stderr
+}
+
+/// The hints file of a zygote preloading [`ZYG_MODEL`] (and `more`), as
+/// absolute paths of the world's checkout.
+fn zygote_hints(w: &World, more: &[&str]) -> String {
+    let real = std::fs::canonicalize(&w.work).unwrap();
+    let mut text = String::new();
+    for p in std::iter::once(&ZYG_MODEL).chain(more) {
+        text.push_str(&format!("{}\n", real.join(p).display()));
+    }
+    let path = real.join("tmp/zygote-hints.txt");
+    std::fs::write(&path, text).unwrap();
+    path.to_str().unwrap().to_owned()
+}
+
+/// 2.12.0, `rails_zygote = "common"`: a slot's zygote, formed at once from
+/// a hints file (`VCI_RAILS_ZYGOTE_HINTS`), preloads an application model
+/// before its slot's files fork from it. The model is an input of every one
+/// of them, of the file that uses it (whose process found it loaded and
+/// did not load it itself) and of the file that never does: a change to it
+/// runs both again. With `rails_zygote = "gems"` the same hints preload no
+/// application file, and with "off" there is no zygote: the file that does
+/// not use the model does not have it, and a change to it does not run it.
+#[test]
+fn rails_batch_zygote_preloads_are_inputs_of_its_files() {
+    const FILES: [(&str, bool); 2] = [
+        ("test/zyg/a_uses_test.rb", true),
+        ("test/zyg/b_never_test.rb", false),
+    ];
+    let ids: Vec<&str> = FILES.iter().map(|f| f.0).collect();
+    let has = |w: &World, id: &str| entries_of(&w.work, id).iter().any(|(p, _)| p == ZYG_MODEL);
+    let change = |w: &World| {
+        w.put(
+            ZYG_MODEL,
+            "class SharedThing\n  # changed\n  def self.value = 1\nend\n",
+        )
+    };
+
+    let Some(w) = zygote_world(&FILES) else {
+        return;
+    };
+    let hints = zygote_hints(&w, &[]);
+    let stderr = zygote_run(
+        &w,
+        &ids,
+        &[
+            ("VCI_RAILS_ZYGOTE", "common"),
+            ("VCI_RAILS_ZYGOTE_HINTS", &hints),
+        ],
+    );
+    assert!(
+        stderr.contains("slot zygote(s) preloaded what 1 files of the batch loaded: up to 0 gem or Ruby files and 1 application files"),
+        "{stderr}"
+    );
+    for id in &ids {
+        assert!(
+            has(&w, id),
+            "{id}: the model its zygote preloaded is its input"
+        );
+    }
+    let p = w.plan(&w.work, "main");
+    assert!(ids.iter().all(|f| p.skip.contains(*f)), "{p:?}");
+    change(&w);
+    let p = w.plan(&w.work, "main");
+    assert!(ids.iter().all(|f| p.run.contains(*f)), "{p:?}");
+
+    for mode in ["gems", "off"] {
+        let Some(w) = zygote_world(&FILES) else {
+            return;
+        };
+        let hints = zygote_hints(&w, &[]);
+        let stderr = zygote_run(
+            &w,
+            &ids,
+            &[
+                ("VCI_RAILS_ZYGOTE", mode),
+                ("VCI_RAILS_ZYGOTE_HINTS", &hints),
+            ],
+        );
+        assert!(!stderr.contains("zygote"), "{mode}: {stderr}");
+        assert!(has(&w, FILES[0].0), "{mode}");
+        assert!(!has(&w, FILES[1].0), "{mode}");
+        change(&w);
+        let p = w.plan(&w.work, "main");
+        assert!(p.run.contains(FILES[0].0), "{mode}: {p:?}");
+        assert!(p.skip.contains(FILES[1].0), "{mode}: {p:?}");
+    }
+}
+
+/// 2.12.0: a zygote whose preload raises (an application file that fails to
+/// load) ends before it takes any file; its slot runs its files as before,
+/// each attested, and what the zygote loaded is no file's input.
+#[test]
+fn rails_batch_zygote_that_fails_to_preload_falls_back() {
+    const FILES: [(&str, bool); 2] = [
+        ("test/zyg/a_uses_test.rb", true),
+        ("test/zyg/b_never_test.rb", false),
+    ];
+    let ids: Vec<&str> = FILES.iter().map(|f| f.0).collect();
+    let Some(w) = zygote_world(&FILES) else {
+        return;
+    };
+    w.put(
+        "app/models/broken_preload.rb",
+        "raise \"not loadable before a test asks\"\n",
+    );
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "broken"]);
+    let hints = zygote_hints(&w, &["app/models/broken_preload.rb"]);
+    let stderr = zygote_run(
+        &w,
+        &ids,
+        &[
+            ("VCI_RAILS_ZYGOTE", "common"),
+            ("VCI_RAILS_ZYGOTE_HINTS", &hints),
+        ],
+    );
+    assert!(
+        stderr.contains("slot zygote(s) failed, their slots ran their files as before: RuntimeError: not loadable before a test asks"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("slot zygote(s) preloaded"), "{stderr}");
+    for id in &ids {
+        let e = entries_of(&w.work, id);
+        assert!(
+            !e.iter().any(|(p, _)| p == "app/models/broken_preload.rb"),
+            "{id}: {e:?}"
+        );
+    }
+    assert!(
+        !entries_of(&w.work, FILES[1].0)
+            .iter()
+            .any(|(p, _)| p == ZYG_MODEL)
+    );
+}
+
+/// 2.12.0, the first run, with no history: the slots run the batch's first
+/// files (`VCI_RAILS_ZYGOTE_SAMPLES=2` of them, spread over the batch) from
+/// their bare boot, then each forks a zygote preloading what those loaded
+/// (the model every file uses, and the models of the fixtures every test
+/// loads), and run the rest from it. Every file has the model as an input
+/// and runs again when it changes.
+#[test]
+fn rails_batch_zygote_learns_from_the_first_files() {
+    let files: Vec<(String, bool)> = (0..8)
+        .map(|i| (format!("test/zyg/f{i}_test.rb"), true))
+        .collect();
+    let refs: Vec<(&str, bool)> = files.iter().map(|(f, u)| (f.as_str(), *u)).collect();
+    let ids: Vec<&str> = refs.iter().map(|f| f.0).collect();
+    let Some(w) = zygote_world(&refs) else { return };
+    let stderr = zygote_run(
+        &w,
+        &ids,
+        &[
+            ("VCI_RAILS_ZYGOTE", "common"),
+            ("VCI_RAILS_ZYGOTE_SAMPLES", "2"),
+        ],
+    );
+    // At least the two files sampled (a slot looks once its file ended);
+    // the model, and those the fixtures load (Widget, ApplicationRecord).
+    assert!(
+        stderr.contains(" slot zygote(s) preloaded what ")
+            && stderr.contains(" files of the batch loaded: ")
+            && stderr.contains(" 3 application files"),
+        "{stderr}"
+    );
+    for id in &ids {
+        assert!(
+            entries_of(&w.work, id).iter().any(|(p, _)| p == ZYG_MODEL),
+            "{id}"
+        );
+    }
+    w.put(
+        ZYG_MODEL,
+        "class SharedThing\n  # changed\n  def self.value = 1\nend\n",
+    );
+    let p = w.plan(&w.work, "main");
+    assert!(ids.iter().all(|f| p.run.contains(*f)), "{p:?}");
+}
+
 /// `policy.rails_autoload_lookups` (2.6.0): Zeitwerk's listing of an
 /// autoload directory is not an input; the constant names a test looked up
 /// without loading are. A file added to app/models that defines a constant

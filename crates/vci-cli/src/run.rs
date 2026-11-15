@@ -2996,6 +2996,7 @@ pub fn run_units(
                     rails_preload_routes: project.rails_inputs
                         == Some(crate::config::RailsInputs::Loose)
                         && vci_adapter::preload_routes_wanted(),
+                    rails_zygote: project.rails_zygote,
                 },
             )?;
             Ok((go_tree, out))
