@@ -4979,3 +4979,160 @@ fn rails_early_plan_runs_when_a_fact_is_missing() {
     let early = w.early(&work, "main", &[], &[]);
     assert!(skip_all(&early), "{early}");
 }
+
+/// Every mise config file in the checkout is a declaration the early plan
+/// reads (vci 2.12.0 review): besides `mise.toml` and its kin, mise reads
+/// `mise/`, `.mise/` and `.config/mise/` (their `config.toml`,
+/// `config.<env>.toml`, `config.local.toml` and `conf.d/*.toml`) and
+/// `.config/mise.<env>.toml`. A file there that names another Ruby, or
+/// exports a variable the env policy hashes, is what the job's setup
+/// installs or exports after the early plan: the early plan runs every
+/// unit (it skipped all of them before). One that names the declared Ruby
+/// and exports nothing compared changes nothing.
+#[test]
+fn rails_early_plan_reads_every_mise_config_file() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "attested: {early}");
+    let ruby = "[tools]\nruby = \"3.4.7\"\n";
+    let env = "[env]\nAPP_MODE = \"other\"\n";
+    let mut wrong = Vec::new();
+    for (file, text) in [
+        ("mise/config.toml", ruby),
+        ("mise/config.ci.toml", ruby),
+        ("mise/conf.d/ruby.toml", ruby),
+        (".mise/conf.d/ruby.toml", ruby),
+        (".mise/config.local.toml", ruby),
+        (".config/mise/conf.d/ruby.toml", ruby),
+        (".config/mise/config.local.toml", ruby),
+        (".config/mise/config.ci.toml", ruby),
+        (".config/mise/mise.toml", ruby),
+        (".config/mise.ci.toml", ruby),
+        ("mise.ci.local.toml", ruby),
+        ("mise/config.toml", env),
+        (".config/mise/conf.d/env.toml", env),
+    ] {
+        w.put(file, text);
+        let early = w.early(&work, "main", &[], &[("MISE_ENV", "ci")]);
+        if skip_all(&early) || !early_skips(&early).is_empty() {
+            wrong.push(format!(
+                "{file} ({}): early skipped {:?}",
+                text.trim().replace('\n', " "),
+                early_skips(&early)
+            ));
+        }
+        let top = file.split('/').next().unwrap();
+        let p = work.join(top);
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p).unwrap();
+        } else {
+            std::fs::remove_file(&p).unwrap();
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "WRONG SKIPS by the early plan:\n{}",
+        wrong.join("\n")
+    );
+    // The declared Ruby and a variable nobody compares: still skip all.
+    w.put(
+        ".config/mise/conf.d/same.toml",
+        "[tools]\nruby = \"3.4.9\"\n\n[env]\nNOT_COMPARED = \"1\"\n",
+    );
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "{early}");
+    std::fs::remove_dir_all(work.join(".config")).unwrap();
+    // A config file mise reads that is not TOML: undecided, run.
+    w.put("mise/config.toml", "[tools\n");
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(!skip_all(&early), "{early}");
+    std::fs::remove_dir_all(work.join("mise")).unwrap();
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "restored: {early}");
+}
+
+/// The variables that choose a Ruby for the version managers the job's
+/// setup may use (`MISE_RUBY_VERSION`, `RBENV_VERSION`, `ASDF_RUBY_VERSION`,
+/// chruby's `RUBY_VERSION`), and those that point mise at other config
+/// files, set where the early plan runs: one naming another Ruby, or one
+/// it cannot read as an exact version, runs every unit; one naming the
+/// declared Ruby changes nothing.
+#[test]
+fn rails_early_plan_and_ruby_version_variables() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+    for (k, v) in [
+        ("MISE_RUBY_VERSION", "3.4.7"),
+        ("RBENV_VERSION", "3.4.7"),
+        ("ASDF_RUBY_VERSION", "3.4.7"),
+        ("RUBY_VERSION", "3.4.7"),
+        ("MISE_RUBY_VERSION", "3.4"),
+        ("MISE_CONFIG_FILE", "/elsewhere/mise.toml"),
+        ("MISE_OVERRIDE_CONFIG_FILENAMES", "other.toml"),
+    ] {
+        let early = w.early(&work, "main", &[], &[(k, v)]);
+        assert!(
+            !skip_all(&early) && early_skips(&early).is_empty(),
+            "WRONG SKIP with {k}={v}: {early}"
+        );
+    }
+    let early = w.early(&work, "main", &[], &[("MISE_RUBY_VERSION", "3.4.9")]);
+    assert!(skip_all(&early), "{early}");
+}
+
+/// config/database.yml picks the adapter in ERB from a variable the env
+/// policy passes to the tests without comparing it (`ignore`): the full
+/// plan's probe reports another adapter (toolchain: database) and runs;
+/// the early plan, which does not read the adapter, must run too (it
+/// skipped all). A variable the policy hashes, or strips, decides.
+#[test]
+fn rails_early_plan_database_adapter_from_erb() {
+    let toml = EARLY_TOML.replace(
+        "hash = [\"APP_MODE\", \"TZ\"]\n",
+        "hash = [\"APP_MODE\", \"TZ\"]\nignore = [\"DB_ADAPTER\"]\n",
+    );
+    let Some(w) = World::build(&toml, |dir: &Path| {
+        copy_rails_fixture(dir);
+        let yml = std::fs::read_to_string(dir.join("config/database.yml"))
+            .unwrap()
+            .replace(
+                "adapter: sqlite3",
+                "adapter: <%= ENV.fetch(\"DB_ADAPTER\", \"sqlite3\") %>",
+            );
+        std::fs::write(dir.join("config/database.yml"), yml).unwrap();
+    }) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+    let full = w.plan(&work, "main");
+    assert_eq!(full.skip, set(ALL), "attested: {full:?}");
+    let env = [("DB_ADAPTER", "postgresql")];
+    let full = w.plan_env(&work, "main", &env);
+    let early = w.early(&work, "main", &[], &env);
+    assert_within(&early, &full, "adapter from an ignored variable");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    let reason = early["files"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("cannot decide without the toolchain"),
+        "{reason}"
+    );
+    // The variable hashed instead (the env check compares it): decided.
+    w.base_with(
+        "hashed",
+        &EARLY_TOML.replace(
+            "hash = [\"APP_MODE\", \"TZ\"]\n",
+            "hash = [\"APP_MODE\", \"TZ\", \"DB_ADAPTER\"]\n",
+        ),
+    );
+    let early = w.early(&work, "hashed", &[], &[]);
+    let full = w.plan(&work, "hashed");
+    assert_within(&early, &full, "adapter from a hashed variable");
+}

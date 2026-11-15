@@ -19,19 +19,44 @@ use vci_core::Toolchain;
 use crate::config::Libraries;
 
 /// The files that may declare the Ruby version in each directory from the
-/// project dir up to the repository root (rbenv, chruby, asdf and mise read
-/// them; the full plan records the same list as global inputs), besides
-/// mise's environment files (`mise.<env>.toml`, `.mise.<env>.toml`).
-const RUBY_VERSION_FILES: &[&str] = &[
-    ".ruby-version",
-    ".tool-versions",
-    "mise.toml",
-    ".mise.toml",
-    "mise.local.toml",
-    ".mise.local.toml",
-    ".mise/config.toml",
-    ".config/mise.toml",
-    ".config/mise/config.toml",
+/// project dir up to the repository root besides mise's config files
+/// ([`version_files_in`]): rbenv, chruby, asdf and mise read them.
+const RUBY_VERSION_FILES: &[&str] = &[".ruby-version", ".tool-versions"];
+
+/// The directories of a directory whose `*.toml` files (at any depth) mise
+/// reads as config: `config.toml`, `config.<env>.toml`, `config.local.toml`,
+/// `mise.toml`, `conf.d/*.toml`. The early plan reads every one of them,
+/// which is more than mise reads for one `MISE_ENV`: a file of another
+/// environment can only make it run more.
+const MISE_CONFIG_DIRS: &[&str] = &["mise", ".mise", ".config/mise"];
+
+/// At most this many entries in [`MISE_CONFIG_DIRS`] of one directory (an
+/// error past it: the unit runs).
+const MISE_CONFIG_DIR_ENTRIES: usize = 1000;
+
+/// Variables that choose the Ruby for a version manager the job's setup
+/// may use (mise, rbenv, asdf, and chruby's `RUBY_VERSION`, which the
+/// official Ruby images set too): each one set where the early plan runs
+/// must name the declared Ruby exactly.
+const RUBY_VERSION_VARS: &[&str] = &[
+    "MISE_RUBY_VERSION",
+    "RTX_RUBY_VERSION",
+    "RBENV_VERSION",
+    "ASDF_RUBY_VERSION",
+    "RUBY_VERSION",
+];
+
+/// Variables that point mise at config files other than the checkout's
+/// (or at none of them): set where the early plan runs, the declared Ruby
+/// and the variables mise exports cannot be read from the checkout.
+const MISE_CONFIG_VARS: &[&str] = &[
+    "MISE_CONFIG_FILE",
+    "MISE_DEFAULT_CONFIG_FILENAME",
+    "MISE_DEFAULT_TOOL_VERSIONS_FILENAME",
+    "MISE_OVERRIDE_CONFIG_FILENAMES",
+    "MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES",
+    "MISE_IGNORED_CONFIG_PATHS",
+    "MISE_CEILING_PATHS",
 ];
 
 /// The test frameworks the collector's probe names (`runner_version`), in
@@ -62,6 +87,13 @@ pub struct Declared {
     /// `_.source` and the like name every variable they could set as
     /// `file: _.<directive>`.
     pub mise_env: Result<Vec<(String, String)>, String>,
+    /// The variables `config/database.yml`'s ERB reads, by literal name
+    /// ([`database_env`]): the adapters of the test environment's databases
+    /// (`rubyDb`, which the full plan's probe reports) depend on nothing
+    /// else but the file itself (an input of every unit) and
+    /// `DATABASE_URL`/`*_DATABASE_URL` (hashed). An error: the ERB does
+    /// something else the early plan cannot follow.
+    pub db_env: Result<Vec<String>, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,9 +120,29 @@ pub struct Lockfile {
 /// `bundle_gemfile`: `BUNDLE_GEMFILE` where the tests would run (a Gemfile
 /// other than the project's cannot be told apart from the checkout).
 pub fn declare(root: &Utf8Path, project_dir: &Utf8Path, bundle_gemfile: Option<&str>) -> Declared {
+    declare_with(root, project_dir, bundle_gemfile, &|k| {
+        std::env::var_os(k).map(|v| v.to_string_lossy().into_owned())
+    })
+}
+
+/// [`declare`] with the environment the early plan runs in read through
+/// `var`.
+pub fn declare_with(
+    root: &Utf8Path,
+    project_dir: &Utf8Path,
+    bundle_gemfile: Option<&str>,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Declared {
+    let redirected = mise_redirected(var);
     Declared {
-        ruby: declared_ruby(root, project_dir),
-        mise_env: mise_env(root, project_dir),
+        ruby: match &redirected {
+            Err(e) => Err(e.clone()),
+            Ok(()) => declared_ruby(root, project_dir).and_then(|r| ruby_from_env(r, var)),
+        },
+        mise_env: match &redirected {
+            Err(e) => Err(e.clone()),
+            Ok(()) => mise_env(root, project_dir),
+        },
         lock: match bundle_gemfile.filter(|g| !g.is_empty()) {
             Some(g) => Err(format!(
                 "BUNDLE_GEMFILE is set ({g}): the early plan reads only the project's own lockfile"
@@ -99,7 +151,45 @@ pub fn declare(root: &Utf8Path, project_dir: &Utf8Path, bundle_gemfile: Option<&
         },
         collector: collector_version(project_dir),
         rails_app: project_dir.join("config/environment.rb").is_file(),
+        db_env: database_env(project_dir),
     }
+}
+
+/// An error when a variable of [`MISE_CONFIG_VARS`] is set (not empty).
+fn mise_redirected(var: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
+    match MISE_CONFIG_VARS
+        .iter()
+        .find(|k| var(k).is_some_and(|v| !v.is_empty()))
+    {
+        Some(k) => Err(format!(
+            "{k} is set: mise reads config files other than the checkout's"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The declared Ruby `r`, checked against the variables of
+/// [`RUBY_VERSION_VARS`] set where the early plan runs: each must name
+/// `r`'s version exactly (they are added to its files as `$NAME`).
+fn ruby_from_env(
+    mut r: DeclaredRuby,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<DeclaredRuby, String> {
+    for k in RUBY_VERSION_VARS {
+        let Some(v) = var(k).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let v = exact_ruby(&v).map_err(|e| format!("${k}: {e}"))?;
+        if v != r.version {
+            return Err(format!(
+                "the version files declare {} ({}), and ${k} says {v}",
+                r.version,
+                r.files.join(", ")
+            ));
+        }
+        r.files.push(format!("${k}"));
+    }
+    Ok(r)
 }
 
 fn rel(root: &Utf8Path, p: &Utf8Path) -> String {
@@ -221,7 +311,7 @@ pub fn mise_env(root: &Utf8Path, project_dir: &Utf8Path) -> Result<Vec<(String, 
     let mut out = Vec::new();
     let mut dir = Some(project_dir);
     while let Some(d) = dir {
-        for f in version_files_in(d) {
+        for f in version_files_in(d)? {
             if !f.is_file() {
                 continue;
             }
@@ -238,27 +328,239 @@ pub fn mise_env(root: &Utf8Path, project_dir: &Utf8Path) -> Result<Vec<(String, 
     Ok(out)
 }
 
-/// The files of `dir` that may declare Ruby: [`RUBY_VERSION_FILES`] and
-/// mise's environment files.
-fn version_files_in(dir: &Utf8Path) -> Vec<Utf8PathBuf> {
+/// Whether mise reads a file of this name as config in a project directory
+/// or in its `.config/`: `mise.toml`, `mise.local.toml`,
+/// `mise.<env>.toml`, `mise.<env>.local.toml`, each also with a leading dot.
+fn mise_file_name(n: &str) -> bool {
+    let stem = n.strip_prefix('.').unwrap_or(n);
+    stem.starts_with("mise.") && stem.ends_with(".toml")
+}
+
+/// The files of `dir` that may declare Ruby or export variables:
+/// [`RUBY_VERSION_FILES`], mise's config files beside them and in
+/// `.config/` ([`mise_file_name`]), and every `*.toml` in
+/// [`MISE_CONFIG_DIRS`] (at any depth). An error when a directory cannot be
+/// listed or holds too many entries.
+fn version_files_in(dir: &Utf8Path) -> Result<Vec<Utf8PathBuf>, String> {
     let mut out: Vec<Utf8PathBuf> = RUBY_VERSION_FILES.iter().map(|n| dir.join(n)).collect();
-    if let Ok(rd) = dir.read_dir_utf8() {
-        let mut env_files: Vec<Utf8PathBuf> = rd
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_owned())
-            .filter(|n| {
-                let stem = n.strip_prefix('.').unwrap_or(n);
-                stem.starts_with("mise.")
-                    && n.ends_with(".toml")
-                    && stem != "mise.toml"
-                    && stem != "mise.local.toml"
-            })
-            .map(|n| dir.join(n))
-            .collect();
-        env_files.sort();
-        out.extend(env_files);
+    for d in [dir.to_owned(), dir.join(".config")] {
+        let rd = match d.read_dir_utf8() {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => continue,
+            Err(e) => return Err(format!("listing {d}: {e}")),
+        };
+        let mut names: Vec<Utf8PathBuf> = Vec::new();
+        for e in rd {
+            let e = e.map_err(|e| format!("listing {d}: {e}"))?;
+            if mise_file_name(e.file_name()) {
+                names.push(d.join(e.file_name()));
+            }
+        }
+        names.sort();
+        out.extend(names);
     }
-    out
+    for sub in MISE_CONFIG_DIRS {
+        let top = dir.join(sub);
+        if !top.is_dir() {
+            continue;
+        }
+        let mut stack = vec![top.clone()];
+        let mut found = Vec::new();
+        let mut n = 0usize;
+        while let Some(d) = stack.pop() {
+            let rd = d.read_dir_utf8().map_err(|e| format!("listing {d}: {e}"))?;
+            for e in rd {
+                let e = e.map_err(|e| format!("listing {d}: {e}"))?;
+                n += 1;
+                if n > MISE_CONFIG_DIR_ENTRIES {
+                    return Err(format!(
+                        "{top} holds more than {MISE_CONFIG_DIR_ENTRIES} entries"
+                    ));
+                }
+                let p = e.path().to_owned();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension() == Some("toml") {
+                    found.push(p);
+                }
+            }
+        }
+        found.sort();
+        out.extend(found);
+    }
+    Ok(out)
+}
+
+/// The identifiers `config/database.yml`'s ERB may use besides its own
+/// local variables and `ENV` read by a literal name: Ruby's literals and
+/// keywords and the methods of strings, numbers and arrays that compute a
+/// value from what they are given.
+const DB_ERB_WORDS: &[&str] = &[
+    "nil", "true", "false", "if", "unless", "else", "elsif", "end", "then", "and", "or", "not",
+    "fetch", "presence", "present?", "blank?", "empty?", "nil?", "to_i", "to_s", "to_f", "to_sym",
+    "max", "min", "strip", "downcase", "upcase", "split", "first", "last",
+];
+
+/// The variables `config/database.yml` (in `project_dir`) reads in its ERB,
+/// by literal name (`ENV["X"]`, `ENV.fetch("X"...)`, `ENV.key?("X")`), or
+/// why the early plan cannot tell what its ERB depends on: `ENV` used any
+/// other way, an interpolated string, a global, instance or class variable,
+/// a constant path, a shell command, a `%` literal, or an identifier that is
+/// none of [`DB_ERB_WORDS`] and no local variable the file assigns (the
+/// application's code, `File`, `Rails`, ...). No such file: no variable.
+pub fn database_env(project_dir: &Utf8Path) -> Result<Vec<String>, String> {
+    let path = project_dir.join("config/database.yml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("config/database.yml: {e}")),
+    };
+    erb_env(&text).map_err(|e| format!("config/database.yml: {e}"))
+}
+
+/// The Ruby code of each ERB tag of `text` (`<%`, `<%=`, `<%-`; not `<%%`
+/// or `<%#`).
+fn erb_tags(text: &str) -> Result<Vec<&str>, String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("<%") {
+        let after = &rest[i + 2..];
+        if let Some(a) = after.strip_prefix('%') {
+            rest = a;
+            continue;
+        }
+        let end = after.find("%>").ok_or("an ERB tag is not closed")?;
+        let code = &after[..end];
+        rest = &after[end + 2..];
+        if code.starts_with('#') {
+            continue;
+        }
+        let code = code.strip_prefix(['=', '-']).unwrap_or(code);
+        out.push(code.strip_suffix('-').unwrap_or(code));
+    }
+    Ok(out)
+}
+
+/// One Ruby string literal at the start of `s` (`"..."` without `#{`, or
+/// `'...'`): its text and the rest of `s`.
+fn ruby_string(s: &str) -> Option<(&str, &str)> {
+    let q = s.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let body = &s[1..];
+    let mut esc = false;
+    for (i, c) in body.char_indices() {
+        if esc {
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == q {
+            let lit = &body[..i];
+            if q == '"' && lit.contains("#{") {
+                return None;
+            }
+            return Some((lit, &body[i + 1..]));
+        }
+    }
+    None
+}
+
+fn erb_env(text: &str) -> Result<Vec<String>, String> {
+    let tags = erb_tags(text)?;
+    let ident = |s: &str| -> usize {
+        let n = s
+            .char_indices()
+            .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
+            .map_or(s.len(), |(i, _)| i);
+        if s[n..].starts_with(['?', '!']) && !s[n..].starts_with("!=") {
+            n + 1
+        } else {
+            n
+        }
+    };
+    // The local variables the tags assign (`name = ...`).
+    let mut locals: Vec<&str> = Vec::new();
+    for code in &tags {
+        let mut s = code.trim_start();
+        while !s.is_empty() {
+            let c = s.chars().next().unwrap();
+            if c.is_ascii_lowercase() || c == '_' {
+                let n = ident(s);
+                let (name, rest) = s.split_at(n);
+                let r = rest.trim_start();
+                if r.starts_with('=')
+                    && !r.starts_with("==")
+                    && !r.starts_with("=~")
+                    && !r.starts_with("=>")
+                {
+                    locals.push(name);
+                }
+                s = rest;
+            } else {
+                s = &s[c.len_utf8()..];
+            }
+        }
+    }
+    let mut vars = Vec::new();
+    for code in &tags {
+        let mut s: &str = code;
+        while let Some(c) = s.chars().next() {
+            if c.is_whitespace() {
+                s = &s[c.len_utf8()..];
+            } else if c == '"' || c == '\'' {
+                let (_, rest) = ruby_string(s).ok_or_else(|| {
+                    format!("an interpolated or unclosed string in its ERB: {code:?}")
+                })?;
+                s = rest;
+            } else if c.is_ascii_digit() {
+                let n = s
+                    .find(|c: char| !(c.is_ascii_digit() || c == '_' || c == '.'))
+                    .unwrap_or(s.len());
+                s = &s[n..];
+            } else if c.is_ascii_alphabetic() || c == '_' {
+                let n = ident(s);
+                let word = &s[..n];
+                s = &s[n..];
+                if word == "ENV" {
+                    let lit = if let Some(r) = s.strip_prefix('[') {
+                        ruby_string(r.trim_start())
+                            .and_then(|(l, r)| r.trim_start().strip_prefix(']').map(|r| (l, r)))
+                    } else if let Some(r) = s.strip_prefix('.') {
+                        let m = ident(r);
+                        if ["fetch", "key?", "has_key?", "include?", "member?"].contains(&&r[..m]) {
+                            r[m..]
+                                .trim_start()
+                                .strip_prefix('(')
+                                .and_then(|r| ruby_string(r.trim_start()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let (name, rest) = lit.ok_or_else(|| {
+                        format!("its ERB uses ENV other than by a literal name: {code:?}")
+                    })?;
+                    vars.push(name.to_owned());
+                    s = rest;
+                } else if !DB_ERB_WORDS.contains(&word) && !locals.contains(&word) {
+                    return Err(format!(
+                        "its ERB uses `{word}`, which the early plan cannot follow: {code:?}"
+                    ));
+                }
+            } else if c == ':' && s.starts_with("::") {
+                return Err(format!("its ERB names a constant path: {code:?}"));
+            } else if c == '%' && s[1..].starts_with(|c: char| !c.is_whitespace()) {
+                return Err(format!("its ERB uses a % literal: {code:?}"));
+            } else if matches!(c, '$' | '@' | '`') {
+                return Err(format!("its ERB uses `{c}`: {code:?}"));
+            } else {
+                s = &s[c.len_utf8()..];
+            }
+        }
+    }
+    vars.sort();
+    vars.dedup();
+    Ok(vars)
 }
 
 /// The exact Ruby version the checkout declares for the project: every
@@ -270,7 +572,7 @@ pub fn declared_ruby(root: &Utf8Path, project_dir: &Utf8Path) -> Result<Declared
     let mut found: Vec<(String, String)> = Vec::new();
     let mut dir = Some(project_dir);
     while let Some(d) = dir {
-        for f in version_files_in(d) {
+        for f in version_files_in(d)? {
             if !f.is_file() {
                 continue;
             }
@@ -463,9 +765,14 @@ const UNDECIDED: &str = "early plan: cannot decide without the toolchain";
 ///   encodings must be what a Rails application's probe reports (UTF-8 for
 ///   both), the time zone data loaded exactly when the lock has `tzinfo`,
 ///   SQLite loaded only when it has `sqlite3`, and the collector this vci's;
-/// - the database adapters (`rubyDb`) are not compared: they come from
-///   `config/database.yml` and `DATABASE_URL`, which every file that reads
-///   them records as inputs.
+/// - the database adapters (`rubyDb`) are not compared: the probe reads
+///   them from `config/database.yml` (an input of every unit) with its
+///   ERB, and `DATABASE_URL`/`*_DATABASE_URL` (hashed). The ERB may read
+///   variables ([`database_env`]): each one must be fixed for the tests
+///   (`set`), compared (`hash`, built-in hash) or kept from them (strict
+///   mode removes every other one), which `db_var_decided` says; one passed
+///   to the tests uncompared (`ignore`) could pick another adapter, and ERB
+///   the early plan cannot follow could read anything: the unit runs.
 ///
 /// Any declaration that could not be read is a difference (the unit runs).
 pub fn toolchain_diff(
@@ -474,8 +781,33 @@ pub fn toolchain_diff(
     tc: &Toolchain,
     d: &Declared,
     compared_env: &dyn Fn(&str) -> bool,
+    db_var_decided: &dyn Fn(&str) -> bool,
 ) -> Vec<(&'static str, String, String)> {
     let mut out = Vec::new();
+    match &d.db_env {
+        Ok(vars) => {
+            let open: Vec<&str> = vars
+                .iter()
+                .map(String::as_str)
+                .filter(|k| !db_var_decided(k))
+                .collect();
+            if !open.is_empty() {
+                out.push((
+                    UNDECIDED,
+                    format!("database adapters {:?}", tc.ruby_db),
+                    format!(
+                        "config/database.yml reads {}, which the env policy passes to the tests without comparing it",
+                        open.join(", ")
+                    ),
+                ));
+            }
+        }
+        Err(e) => out.push((
+            UNDECIDED,
+            format!("database adapters {:?}", tc.ruby_db),
+            e.clone(),
+        )),
+    }
     // A variable the toolchain setup exports after the early plan (mise's
     // `[env]`) that the project's env policy compares: the early plan sees
     // the environment without it. A directive (`_.file`) could set any.
@@ -944,6 +1276,7 @@ BUNDLED WITH
             collector: Ok("0.5.0".into()),
             rails_app: true,
             mise_env: Ok(vec![("mise.toml".into(), "CARGO_TARGET_DIR".into())]),
+            db_env: Ok(vec!["RAILS_MAX_THREADS".into()]),
         }
     }
 
@@ -954,12 +1287,13 @@ BUNDLED WITH
     #[test]
     fn the_declared_toolchain_matches_only_what_the_checkout_declares() {
         let d = declared();
-        assert!(toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env).is_empty());
+        assert!(toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env, &|_| true).is_empty());
         // Every library version is read by Ruby: undecided under "exact".
-        let whats: Vec<&str> = toolchain_diff(false, Libraries::Exact, &tc(), &d, &no_env)
-            .into_iter()
-            .map(|x| x.0)
-            .collect();
+        let whats: Vec<&str> =
+            toolchain_diff(false, Libraries::Exact, &tc(), &d, &no_env, &|_| true)
+                .into_iter()
+                .map(|x| x.0)
+                .collect();
         assert_eq!(whats, vec![UNDECIDED]);
         type Edit = fn(&mut Toolchain);
         let cases: Vec<(&str, Edit)> = vec![
@@ -1005,23 +1339,25 @@ BUNDLED WITH
         for (what, edit) in cases {
             let mut t = tc();
             edit(&mut t);
-            let d = toolchain_diff(false, Libraries::Any, &t, &declared(), &no_env);
+            let d = toolchain_diff(false, Libraries::Any, &t, &declared(), &no_env, &|_| true);
             assert!(d.iter().any(|x| x.0 == what), "{what}: {d:?}");
         }
         // Who runs the tests: accepted under allow_superuser_mismatch.
         let mut t = tc();
         t.superuser = !t.superuser;
-        assert!(toolchain_diff(true, Libraries::Any, &t, &declared(), &no_env).is_empty());
+        assert!(
+            toolchain_diff(true, Libraries::Any, &t, &declared(), &no_env, &|_| true).is_empty()
+        );
         // A declaration that could not be read decides nothing.
         let mut d = declared();
         d.ruby = Err("no file declares the Ruby version".into());
-        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env).is_empty());
+        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env, &|_| true).is_empty());
         let mut d = declared();
         d.lock = Err("Gemfile.lock: missing".into());
-        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env).is_empty());
+        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env, &|_| true).is_empty());
         let mut d = declared();
         d.collector = Err("not found".into());
-        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env).is_empty());
+        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env, &|_| true).is_empty());
         // mise exports a variable the env policy compares, or any through
         // a directive: undecided; one it does not compare: decided.
         for k in ["RUBY_YJIT_ENABLE", "_.file"] {
@@ -1030,10 +1366,11 @@ BUNDLED WITH
                 .as_mut()
                 .unwrap()
                 .push(("mise.toml".into(), k.into()));
-            let whats: Vec<&str> = toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env)
-                .into_iter()
-                .map(|x| x.0)
-                .collect();
+            let whats: Vec<&str> =
+                toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env, &|_| true)
+                    .into_iter()
+                    .map(|x| x.0)
+                    .collect();
             assert_eq!(whats, vec![UNDECIDED], "{k}");
         }
         assert_eq!(
@@ -1042,7 +1379,7 @@ BUNDLED WITH
         );
         let mut d = declared();
         d.rails_app = false;
-        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env).is_empty());
+        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env, &|_| true).is_empty());
     }
 
     #[test]
@@ -1053,5 +1390,157 @@ BUNDLED WITH
                 .is_some()
         );
         assert!(native("native:libvips.so.42", Libraries::Exact).is_err());
+    }
+
+    /// The variables config/database.yml's ERB reads (vex's file, in
+    /// short), and ERB the early plan cannot follow.
+    #[test]
+    fn database_yml_erb_names_its_variables_or_is_undecided() {
+        let vex = r#"default: &default
+  adapter: sqlite3
+  max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+  pool: <%= ENV.fetch("VEX_PRIMARY_DB_POOL") { [ENV.fetch("RAILS_MAX_THREADS", 5).to_i, ENV.fetch('MAINTENANCE_JOB_THREADS', 8).to_i].max * 2 } %>
+<% test_database_url = ENV["VEX_TEST_DATABASE_URL"].presence || "sqlite3:storage/test.sqlite3" %>
+<%# a comment: Rails.env %>
+test:
+  <<: *default
+  url: <%= test_database_url %>
+  cache: <%= ENV.fetch("CACHE_DATABASE_URL", ENV["DATABASE_URL"]) %>
+  literal: "<%%= not erb %>"
+"#;
+        assert_eq!(
+            erb_env(vex).unwrap(),
+            vec![
+                "CACHE_DATABASE_URL",
+                "DATABASE_URL",
+                "MAINTENANCE_JOB_THREADS",
+                "RAILS_MAX_THREADS",
+                "VEX_PRIMARY_DB_POOL",
+                "VEX_TEST_DATABASE_URL"
+            ]
+        );
+        assert_eq!(
+            erb_env("test:\n  adapter: sqlite3\n").unwrap(),
+            Vec::<String>::new()
+        );
+        for bad in [
+            "a: <%= ENV[name] %>",
+            "a: <%= ENV.to_h[\"X\"] %>",
+            "a: <%= ENV.fetch(\"#{x}\") %>",
+            "a: <%= Rails.env %>",
+            "a: <%= File.read(\"x\") %>",
+            "a: <%= `uname` %>",
+            "a: <%= %x(uname) %>",
+            "a: <%= $x %>",
+            "a: <%= @x %>",
+            "a: <%= ::Foo %>",
+            "a: <%= helper_from_the_app %>",
+            "a: <%= ENV.fetch(\"X\") { |k| k } %>",
+            "a: <%= 1 ",
+        ] {
+            assert!(erb_env(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// mise's config files in a directory: beside the version files, in
+    /// `.config/`, and every `*.toml` under `mise/`, `.mise/` and
+    /// `.config/mise/`.
+    #[test]
+    fn every_mise_config_file_is_a_version_file() {
+        let t = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(t.path()).unwrap();
+        for f in [
+            "mise.toml",
+            ".mise.ci.local.toml",
+            "mise/config.toml",
+            "mise/conf.d/a.toml",
+            ".mise/config.local.toml",
+            ".config/mise.ci.toml",
+            ".config/mise/conf.d/b.toml",
+            ".config/mise/config.ci.toml",
+            ".config/nextest.toml",
+            "mise/README.md",
+            "other.toml",
+        ] {
+            write(root, f, "");
+        }
+        let mut got: Vec<String> = version_files_in(root)
+            .unwrap()
+            .iter()
+            .filter(|p| p.is_file())
+            .map(|p| rel(root, p))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ".config/mise.ci.toml",
+                ".config/mise/conf.d/b.toml",
+                ".config/mise/config.ci.toml",
+                ".mise.ci.local.toml",
+                ".mise/config.local.toml",
+                "mise.toml",
+                "mise/conf.d/a.toml",
+                "mise/config.toml",
+            ]
+        );
+        write(
+            root,
+            ".config/mise/conf.d/c.toml",
+            "[tools]\nruby = \"3.4.7\"\n",
+        );
+        write(root, ".ruby-version", "3.4.9\n");
+        let e = declared_ruby(root, root).unwrap_err();
+        assert!(e.contains(".config/mise/conf.d/c.toml"), "{e}");
+    }
+
+    /// The version variables where the early plan runs must name the
+    /// declared Ruby; one that points mise elsewhere decides nothing.
+    #[test]
+    fn ruby_version_variables_must_agree() {
+        let t = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(t.path()).unwrap();
+        write(root, ".ruby-version", "3.4.9\n");
+        let with = |k: &'static str, v: &'static str| {
+            declare_with(root, root, None, &move |n| (n == k).then(|| v.to_owned())).ruby
+        };
+        assert_eq!(with("NONE", "").unwrap().files, vec![".ruby-version"]);
+        assert_eq!(
+            with("MISE_RUBY_VERSION", "3.4.9").unwrap().files,
+            vec![".ruby-version", "$MISE_RUBY_VERSION"]
+        );
+        for (k, v) in [
+            ("MISE_RUBY_VERSION", "3.4.7"),
+            ("RBENV_VERSION", "3.4.7"),
+            ("ASDF_RUBY_VERSION", "3.4"),
+            ("RUBY_VERSION", "3.4.8"),
+            ("MISE_CONFIG_FILE", "/x/mise.toml"),
+        ] {
+            assert!(with(k, v).is_err(), "{k}={v}");
+        }
+        let d = declare_with(root, root, None, &|n| {
+            (n == "MISE_CONFIG_FILE").then(|| "/x".to_owned())
+        });
+        assert!(d.mise_env.is_err());
+    }
+
+    /// A variable config/database.yml reads that the tests get uncompared,
+    /// or ERB the early plan cannot follow: undecided.
+    #[test]
+    fn database_variables_passed_uncompared_are_undecided() {
+        let mut d = declared();
+        d.db_env = Ok(vec!["DB_ADAPTER".into(), "RAILS_MAX_THREADS".into()]);
+        let decided = |k: &str| k != "DB_ADAPTER";
+        let rows = toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env, &decided);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, UNDECIDED);
+        assert!(rows[0].2.contains("DB_ADAPTER"), "{rows:?}");
+        assert!(toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env, &|_| true).is_empty());
+        d.db_env = Err("its ERB uses `Rails`".into());
+        let rows = toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env, &|_| true);
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![UNDECIDED]
+        );
     }
 }

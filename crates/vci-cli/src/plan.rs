@@ -5507,12 +5507,25 @@ impl Verifier<'_> {
                     || crate::envpolicy::list_matches(&env.builtin_hash, k)
                     || crate::envpolicy::list_matches(&env.loose_hash, k)
             };
+            // A variable config/database.yml's ERB reads decides the
+            // adapters only when the tests get it fixed, compared or not
+            // at all (strict mode removes the unlisted ones).
+            let db_var_decided = |k: &str| match env.classify(k) {
+                crate::envpolicy::EnvClass::Set
+                | crate::envpolicy::EnvClass::Hash
+                | crate::envpolicy::EnvClass::BuiltinHash => true,
+                crate::envpolicy::EnvClass::Stripped => env.mode == crate::config::EnvMode::Strict,
+                crate::envpolicy::EnvClass::Ignore | crate::envpolicy::EnvClass::BuiltinIgnore => {
+                    false
+                }
+            };
             let tdiff = crate::early::toolchain_diff(
                 self.project.policy.allow_superuser_mismatch,
                 libraries,
                 tc,
                 d,
                 &compared,
+                &db_var_decided,
             );
             if !tdiff.is_empty() {
                 return Err(Failure {
