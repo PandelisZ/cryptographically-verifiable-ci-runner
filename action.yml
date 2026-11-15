@@ -47,6 +47,14 @@ inputs:
       its test id. With signing-key or oidc each job attests its own share.
       Empty: the whole suite in this job.
     default: ""
+  early-timeout:
+    description: >
+      `command: early` only (since 2.12.0): seconds the early plan may take,
+      fetch included, before it is stopped and the step answers
+      `skip_all=false` (the job sets up its toolchain and plans in full, as
+      when nothing could be skipped). `0`: no limit. Needs `timeout`
+      (coreutils; on a runner without it there is no limit).
+    default: "90"
   working-directory:
     description: Directory inside the repository to run vci from.
     default: .
@@ -253,11 +261,17 @@ runs:
         BASE: ${{ inputs.base-ref }}
         REMOTE: ${{ inputs.remote }}
         PARTITION: ${{ inputs.partition }}
+        EARLY_TIMEOUT: ${{ inputs.early-timeout }}
       run: |
         args=(--early --fetch "$REMOTE" --base-ref "$BASE" --format github)
         for p in $PROJECT; do args+=(--project "$p"); done
         if [ -n "$PARTITION" ]; then args+=(--partition "$PARTITION"); fi
-        vci plan "${args[@]}" || echo "skip_all=false" >> "$GITHUB_OUTPUT"
+        # A plan past its time limit (a slow fetch) is stopped: run.
+        limit=()
+        if [ "${EARLY_TIMEOUT:-0}" != "0" ] && command -v timeout > /dev/null; then
+          limit=(timeout -k 10 "$EARLY_TIMEOUT")
+        fi
+        "${limit[@]}" vci plan "${args[@]}" || echo "skip_all=false" >> "$GITHUB_OUTPUT"
         if ! grep -q '^skip_all=' "$GITHUB_OUTPUT" 2>/dev/null; then
           echo "skip_all=false" >> "$GITHUB_OUTPUT"
         fi

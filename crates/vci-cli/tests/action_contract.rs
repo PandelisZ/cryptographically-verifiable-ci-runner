@@ -245,6 +245,21 @@ fn the_action_plans_once_and_fetches_while_planning() {
         "{script}"
     );
     assert!(script.contains("skip_all=false"), "fails open: {script}");
+    // A slow early plan (its fetch) is stopped and answers "run".
+    assert!(
+        script.contains("limit=(timeout -k 10 \"$EARLY_TIMEOUT\")")
+            && script
+                .contains("\"${limit[@]}\" vci plan \"${args[@]}\" || echo \"skip_all=false\""),
+        "{script}"
+    );
+    assert!(
+        early
+            .body
+            .contains("EARLY_TIMEOUT: ${{ inputs.early-timeout }}"),
+        "{}",
+        early.body
+    );
+    assert!(action.contains("\n  early-timeout:\n"), "the input");
     assert!(
         run_script_of(plan).contains("vci plan --fetch \"$REMOTE\" --base-ref \"$BASE\""),
         "{}",
