@@ -378,11 +378,12 @@ fn check_runner(what: &str, adapter: &str, runner: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `rails_worker_files` (2.12.0) is a setting of the rails adapter, at least
-/// 1. With K above 1, a slot of a Minitest batch runs up to K test files in
-/// one process, one after the other, and each file's inputs are everything
-/// that process observed up to the end of that file (the earlier files of
-/// the process included): faster, less precise. 1 is one process per file.
+/// `rails_worker_files` (2.12.0) is a setting of the rails adapter, at
+/// least one. With K above 1, a slot of a Minitest batch runs up to K test
+/// files in one process, one after the other, and each file's inputs are
+/// everything that process observed up to the end of that file (the earlier
+/// files of the process included): faster, less precise. 1 is one process
+/// per file.
 fn check_rails_worker_files(what: &str, adapter: &str, k: Option<u32>) -> Result<()> {
     let Some(k) = k else {
         return Ok(());
@@ -2299,6 +2300,33 @@ mod tests {
             "adapter = \"rails\"\nignore_inputs = [\"\"]\n",
             "rails_inputs = \"strict\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n",
             "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"go\"\nignore_inputs = [\"x\"]\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// `rails_worker_files` (2.12.0): unset by default (one process per
+    /// file), at least 1, a setting of the rails adapter only, per project
+    /// in `[[projects]]`.
+    #[test]
+    fn rails_worker_files_setting() {
+        let c = Config::parse(RAILS_TEMPLATE).unwrap();
+        assert_eq!(c.project_specs()[0].rails_worker_files, None);
+        let c = Config::parse("adapter = \"rails\"\nrails_worker_files = 5\n").unwrap();
+        assert_eq!(c.project_specs()[0].rails_worker_files, Some(5));
+        let c = Config::parse(
+            "[[projects]]\nname = \"api\"\npath = \"api\"\nadapter = \"rails\"\nrails_worker_files = 3\n\n[[projects]]\nname = \"web\"\npath = \"web\"\nadapter = \"vitest\"\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert_eq!(s[0].rails_worker_files, Some(3));
+        assert_eq!(s[1].rails_worker_files, None);
+        for bad in [
+            "adapter = \"rails\"\nrails_worker_files = 0\n",
+            "adapter = \"rails\"\nrails_worker_files = -1\n",
+            "adapter = \"pytest\"\nrails_worker_files = 2\n",
+            "rails_worker_files = 2\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n",
+            "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"go\"\nrails_worker_files = 2\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
