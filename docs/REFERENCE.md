@@ -916,6 +916,22 @@ precision on a store built up by partial runs (each figure here starts from one 
 run's workers group the files that run, which may come from unrelated directories, so a file's inputs after it can
 be wider than here).
 
+**Zygotes and workers together.** The two settings combine: a slot's zygote forms as above and then forks the slot's
+workers instead of its files' processes, so a worker's files find what the zygote preloaded and record it as inputs,
+as a file's own process does. The zygote is planned from what the first file of each of the first workers loaded
+after the fork: a later file of a worker loads nothing an earlier one already loaded, so its loads would understate
+what a file loads on its own (with every worker file noting, `"common"` preloaded none of vex-api's 7 application
+files on a sample of 100 of its files at K = 3; with only the first, all 7). The figures above for K = 5 were measured
+against one process per file *without* zygotes. Measured again on 14 November against the merged 2.12 engine (vex-api's
+shard 2 of 2, 908 files, 12 slots, a local SQLite store, release builds, interleaved, load average 8 to 44 on the
+14-core laptop): with the default `rails_zygote = "gems"`, five runs took 56.8 to 64.2 s (median 60.3 s) and 453 to
+469 CPU-seconds (median 465); K = 5 took 94 s and 119 s and 462 and 491 CPU-seconds, and K = 5 with `"common"` 86 s
+and 80 s and 469 and 450. Once the zygote has loaded the gems, a worker saves no CPU worth the name over a file's own
+process, and its batch ends later: its runs of five sorted files leave some slots 20 to 30 s behind the others (a
+slot's files added up to 50 to 79 s at least and 73 to 101 s at most, against 41 to 43 s for every slot with one
+process per file). `rails_worker_files` therefore stays 1 by default, and on vex it is not worth its precision with
+zygotes on.
+
 The collector (`ruby/vci-collector/vci_collector.rb`, plain Ruby, nothing is installed into your project) is loaded
 through `RUBYOPT` before `bin/rails`, Bundler and Rails. It sets these run conditions:
 
