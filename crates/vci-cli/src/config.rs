@@ -57,6 +57,11 @@ pub struct Config {
     /// project dir) whose files are never inputs; see [`RailsInputs`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_inputs: Option<Vec<String>>,
+    /// Rails adapter (single-project form, 2.12.0): how many test files one
+    /// process of a batch's slot runs one after the other (default 1: one
+    /// process per file); see [`check_rails_worker_files`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rails_worker_files: Option<u32>,
     #[serde(default)]
     pub policy: Policy,
     #[serde(default)]
@@ -143,6 +148,9 @@ pub struct ProjectConfig {
     /// are never inputs.
     #[serde(default)]
     pub ignore_inputs: Option<Vec<String>>,
+    /// Rails adapter (2.12.0): test files per process of a batch's slot.
+    #[serde(default)]
+    pub rails_worker_files: Option<u32>,
     #[serde(default)]
     pub policy: Option<PolicyOverride>,
     #[serde(default)]
@@ -210,6 +218,8 @@ pub struct ProjectSpec {
     pub rails_inputs: Option<RailsInputs>,
     /// Rails: the `ignore_inputs` setting.
     pub ignore_inputs: Vec<String>,
+    /// Rails: the `rails_worker_files` setting (`None`: 1).
+    pub rails_worker_files: Option<u32>,
     pub policy: Policy,
     pub env: EnvConfig,
     pub inputs: Vec<InputsConfig>,
@@ -364,6 +374,24 @@ fn check_runner(what: &str, adapter: &str, runner: Option<&str>) -> Result<()> {
     }
     if vci_adapter::RailsRunner::parse(r).is_none() {
         bail!("{what}: runner must be \"minitest\" or \"rspec\", got {r:?}");
+    }
+    Ok(())
+}
+
+/// `rails_worker_files` (2.12.0) is a setting of the rails adapter, at least
+/// 1. With K above 1, a slot of a Minitest batch runs up to K test files in
+/// one process, one after the other, and each file's inputs are everything
+/// that process observed up to the end of that file (the earlier files of
+/// the process included): faster, less precise. 1 is one process per file.
+fn check_rails_worker_files(what: &str, adapter: &str, k: Option<u32>) -> Result<()> {
+    let Some(k) = k else {
+        return Ok(());
+    };
+    if adapter != "rails" {
+        bail!("{what}: `rails_worker_files` is a setting of the rails adapter, not {adapter:?}");
+    }
+    if k == 0 {
+        bail!("{what}: rails_worker_files must be at least 1 (1: one process per test file)");
     }
     Ok(())
 }
@@ -987,6 +1015,7 @@ impl Config {
                 self.rails_inputs,
                 self.ignore_inputs.as_deref(),
             )?;
+            check_rails_worker_files("vci.toml", adapter, self.rails_worker_files)?;
             check_rel("project", self.project.as_deref().unwrap_or("."))?;
             return Ok(());
         }
@@ -996,9 +1025,10 @@ impl Config {
             || self.node_test_options() != vci_adapter::NodeTestOptions::default()
             || self.rails_inputs.is_some()
             || self.ignore_inputs.is_some()
+            || self.rails_worker_files.is_some()
         {
             bail!(
-                "top-level `project`/`adapter`/`runner`/`test_script`/`test_globs`/`node_args`/`rails_inputs`/`ignore_inputs` cannot be combined with [[projects]]; give each project its own"
+                "top-level `project`/`adapter`/`runner`/`test_script`/`test_globs`/`node_args`/`rails_inputs`/`ignore_inputs`/`rails_worker_files` cannot be combined with [[projects]]; give each project its own"
             );
         }
         let mut names = std::collections::BTreeSet::new();
@@ -1039,6 +1069,11 @@ impl Config {
                 &p.adapter,
                 p.rails_inputs,
                 p.ignore_inputs.as_deref(),
+            )?;
+            check_rails_worker_files(
+                &format!("project {:?}", p.name),
+                &p.adapter,
+                p.rails_worker_files,
             )?;
             if !dirs.insert((normalise_rel(&p.path), p.adapter.clone())) {
                 bail!(
@@ -1147,6 +1182,7 @@ impl Config {
                     self.rails_inputs,
                 ),
                 ignore_inputs: self.ignore_inputs.clone().unwrap_or_default(),
+                rails_worker_files: self.rails_worker_files,
                 policy: Policy {
                     removed_rails_allow_db: None,
                     ..self.policy.clone()
@@ -1236,6 +1272,7 @@ impl Config {
                     },
                     rails_inputs: rails_mode(&p.adapter, p.rails_inputs),
                     ignore_inputs: p.ignore_inputs.clone().unwrap_or_default(),
+                    rails_worker_files: p.rails_worker_files,
                     policy,
                     env,
                     inputs: p.inputs.clone().unwrap_or_else(|| self.inputs.clone()),

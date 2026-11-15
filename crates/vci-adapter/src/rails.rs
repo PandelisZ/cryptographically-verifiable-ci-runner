@@ -96,6 +96,27 @@ pub fn preload_routes_wanted() -> bool {
     std::env::var(RAILS_PRELOAD_ROUTES_ENV).map_or(true, |v| v.trim() != "0")
 }
 
+/// Rails (2.12.0): how many test files one process of a batch's slot runs
+/// one after the other, a worker (the project's `rails_worker_files`, which
+/// this variable overrides in vci's environment; passed to the collector
+/// when above 1). Each file's inputs are then everything its worker
+/// observed up to the end of that file.
+pub const RAILS_WORKER_FILES_ENV: &str = "VCI_RAILS_WORKER_FILES";
+
+/// The worker size of the run in progress ([`worker_files`]).
+static WORKER_FILES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Test files per worker: `VCI_RAILS_WORKER_FILES` in vci's environment (a
+/// positive number), else the project's setting; at least 1.
+fn worker_files(configured: u32) -> u32 {
+    std::env::var(RAILS_WORKER_FILES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|k| *k > 0)
+        .unwrap_or(configured)
+        .max(1)
+}
+
 /// Set by vci for a batch (2.3.0): the files to run as several processes,
 /// each a share of the file's test methods, as lines `<k>\t<test id>`
 /// (see [`shard_counts`]).
@@ -1185,6 +1206,12 @@ impl RailsAdapter {
         if PRELOAD_ROUTES.load(std::sync::atomic::Ordering::Relaxed) {
             cmd.env(RAILS_PRELOAD_ENV, "routes");
         }
+        let workers = WORKER_FILES.load(std::sync::atomic::Ordering::Relaxed);
+        if workers > 1 && runner == RailsRunner::Minitest {
+            cmd.env(RAILS_WORKER_FILES_ENV, workers.to_string());
+        } else {
+            cmd.env_remove(RAILS_WORKER_FILES_ENV);
+        }
         // Measurement switches of the collector (see its EXPERIMENT and
         // Profile): passed on as set in vci's environment.
         for k in ["VCI_RAILS_EXPERIMENT", "VCI_RAILS_PROFILE"] {
@@ -1353,6 +1380,17 @@ impl RailsAdapter {
                     .as_bytes(),
                 );
             }
+        }
+        if !slots.workers.is_empty() {
+            let n: u64 = slots.workers.values().sum();
+            let most = slots.workers.values().max().copied().unwrap_or(0);
+            log.extend_from_slice(
+                format!(
+                    "vci: {n} file(s) ran in {} worker process(es) of up to {workers} files each (rails_worker_files), {most} at most: each file's inputs are what its worker observed up to its end\n",
+                    slots.workers.len(),
+                )
+                .as_bytes(),
+            );
         }
         if slots.groups.len() > 1 {
             let mut g = slots.groups.clone();
@@ -1554,6 +1592,8 @@ struct SlotStats {
     /// `Batch.preload_routes!`), per group: its time (ms), what it
     /// recorded, and how many of those records are in the repository.
     preload_routes: Vec<(u64, u64, u64)>,
+    /// Workers (2.12.0): the files a worker ran, by its first file.
+    workers: BTreeMap<String, u64>,
 }
 
 /// The slots of a batch run, and what decided their number (the value of
@@ -1639,6 +1679,8 @@ fn read_batch(
     // id => the slot that ran it.
     let mut slot_of: BTreeMap<String, u64> = BTreeMap::new();
     let mut slots: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    // id => its place in a worker (2.12.0), when one ran it.
+    let mut in_worker: BTreeMap<String, u64> = BTreeMap::new();
     // id => the limit its process ran past (VCI_RAILS_FILE_TIMEOUT, 2.7.2).
     let mut timed_out: BTreeMap<String, u64> = BTreeMap::new();
     let mut stats = SlotStats::default();
@@ -1704,6 +1746,15 @@ fn read_batch(
                 if let Some(s) = v.get("slot").and_then(Value::as_u64) {
                     slots.insert(s);
                     slot_of.insert(id.to_owned(), s);
+                }
+                if let Some(w) = v.get("worker").and_then(Value::as_array)
+                    && let (Some(first), Some(at)) = (
+                        w.first().and_then(Value::as_str),
+                        w.get(1).and_then(Value::as_u64),
+                    )
+                {
+                    in_worker.insert(id.to_owned(), at);
+                    *stats.workers.entry(first.to_owned()).or_insert(0) += 1;
                 }
                 if let Some(ms) = v.get("ms").and_then(Value::as_u64) {
                     stats.file_ms.push(ms);
@@ -1811,14 +1862,20 @@ fn read_batch(
         // boot and database: an earlier file of the slot may have left what
         // its tests collide with (a Rails worker has the same exposure).
         // The retry's result is the file's; this one counts for nothing.
-        if c != Some(0) && slots.len() > 1 {
+        // A file that failed in a worker (2.12.0) too: the files before it
+        // in its process may have left what made it fail.
+        if c != Some(0) && (slots.len() > 1 || in_worker.contains_key(*f)) {
             let slot = slot_of
                 .get(*f)
                 .map_or_else(|| "a slot".to_owned(), |s| format!("slot {s}"));
+            let place = match in_worker.get(*f) {
+                Some(at) => format!(", file {} of its worker process", at + 1),
+                None => String::new(),
+            };
             fallback.push((
                 f.to_string(),
                 format!(
-                    "its process failed in {slot} (exit {}): it runs again on its own",
+                    "its process failed in {slot}{place} (exit {}): it runs again on its own",
                     c.map_or_else(|| "signal".to_owned(), |c| c.to_string())
                 ),
             ));
@@ -2667,6 +2724,10 @@ impl Adapter for RailsAdapter {
         );
         PRELOAD_ROUTES.store(
             hints.rails_preload_routes,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        WORKER_FILES.store(
+            worker_files(hints.rails_worker_files),
             std::sync::atomic::Ordering::Relaxed,
         );
         let last_ms = &hints.last_ms;

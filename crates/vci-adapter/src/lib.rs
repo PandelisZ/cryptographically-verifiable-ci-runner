@@ -163,6 +163,10 @@ pub struct RunHints {
     /// the routes files out of every manifest; `VCI_RAILS_PRELOAD_ROUTES=0`
     /// turns it off).
     pub rails_preload_routes: bool,
+    /// Rails (2.12.0): the project's `rails_worker_files`, test files per
+    /// process of a batch's slot (0 or 1: one process per file;
+    /// `VCI_RAILS_WORKER_FILES` in vci's environment overrides it).
+    pub rails_worker_files: u32,
 }
 
 /// A test file as reported by the runner's list command.

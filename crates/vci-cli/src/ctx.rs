@@ -186,6 +186,8 @@ pub struct Project {
     pub config_hash: String,
     /// Rails: the `rails_inputs` setting (`None` for the other adapters).
     pub rails_inputs: Option<crate::config::RailsInputs>,
+    /// Rails: the `rails_worker_files` setting (`None`: 1).
+    pub rails_worker_files: Option<u32>,
     /// The globs (relative to the project dir) whose paths are left out of
     /// this project's manifests ([`crate::config::ignored_inputs`]).
     pub ignored_inputs: Vec<String>,
@@ -452,6 +454,7 @@ impl Ctx {
             projects.push(Project {
                 config_hash,
                 rails_inputs: spec.rails_inputs,
+                rails_worker_files: spec.rails_worker_files,
                 ignored_inputs,
                 ignored_noted: Default::default(),
                 adapter_options: options,

@@ -98,6 +98,7 @@ const SCRUB: &[&str] = &[
     "VCI_OUT",
     "VCI_RUBY",
     "VCI_RAILS_PER_FILE",
+    "VCI_RAILS_WORKER_FILES",
     "VCI_JOBS",
     "APP_MODE",
     "RUBYOPT",
@@ -3680,6 +3681,172 @@ fn rails_slots_give_what_one_process_per_file_gives() {
             "slot {i}"
         );
     }
+}
+
+/// Workers (2.12.0, `rails_worker_files = 3`): a slot runs up to 3 test
+/// files (sorted) in one process, and each file's manifest holds what its
+/// worker observed up to its end: the earlier files of the worker, their
+/// reads. A change to a file only an earlier file of the worker read runs
+/// the later files again too (the price in precision), not the files of
+/// another worker. A new file that joins a worker runs nothing else again
+/// (the others' inputs are unchanged); their next run records it. A file
+/// that fails only after an earlier file of its worker (a global that file
+/// set) runs again on its own and is attested from there, and the files
+/// after it run in a fresh worker. `VCI_RAILS_WORKER_FILES=1` in vci's
+/// environment is one process per file again.
+#[test]
+fn rails_worker_files_run_several_files_in_one_process() {
+    const SLOTS: &[(&str, &str)] = &[("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "2")];
+    const A: &str = "test/workers/a_test.rb";
+    const A2: &str = "test/workers/ab_test.rb";
+    const B: &str = "test/workers/b_test.rb";
+    const C: &str = "test/workers/c_test.rb";
+    const D: &str = "test/workers/d_test.rb";
+    const ONLY_A: &str = "worker_data/only_a.txt";
+    const ONLY_A2: &str = "worker_data/only_a2.txt";
+    let toml = VCI_TOML.replace(
+        "adapter = \"rails\"\n",
+        "adapter = \"rails\"\nrails_worker_files = 3\n",
+    );
+    let Some(w) = World::build(&toml, copy_rails_fixture) else {
+        return;
+    };
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
+    let plain = |name: &str| {
+        format!(
+            "require \"test_helper\"\n\nclass {name}Test < ActiveSupport::TestCase\n  test \"passes\" do\n    assert true\n  end\nend\n"
+        )
+    };
+    let reads = |name: &str, file: &str| {
+        format!(
+            "require \"test_helper\"\n\n$vci_worker_{} = true\n\nclass {name}Test < ActiveSupport::TestCase\n  test \"reads\" do\n    assert_equal \"ok\", File.read(Rails.root.join(\"{file}\")).strip\n  end\nend\n",
+            name.to_lowercase()
+        )
+    };
+    w.put(A, &reads("A", ONLY_A));
+    w.put(ONLY_A, "ok\n");
+    w.put(B, &plain("B"));
+    w.put(C, &plain("C"));
+    w.put(D, &plain("D"));
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "worker files"]);
+    let run = |w: &World, files: &[&str], env: &[(&str, &str)]| {
+        let key = w.trusted.to_str().unwrap().to_owned();
+        let mut args = vec!["run"];
+        args.extend(files);
+        args.extend(["--key", key.as_str()]);
+        let env: Vec<(&str, &str)> = SLOTS.iter().chain(env).copied().collect();
+        let out = w.vci_env(&w.work, &args, &env);
+        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+        assert!(
+            stderr.contains(&format!("vci: {} attested, 0 not attested", files.len())),
+            "{stderr}"
+        );
+        stderr
+    };
+    // Whether the attestation of `id` the run that printed `stderr` wrote
+    // (one of several for the same commit) has `path`.
+    let has_in = |w: &World, stderr: &str, id: &str, path: &str| {
+        let prefix = format!("as git-meta path:{id} ");
+        let key = stderr
+            .lines()
+            .find_map(|l| l.split_once(&prefix).map(|(_, k)| k.trim().to_owned()))
+            .unwrap_or_else(|| panic!("{id} not attested: {stderr}"));
+        let store = store_for(&w.work);
+        let stored = AttestStore::new(&store).list(Some(id)).unwrap();
+        let env = stored
+            .iter()
+            .find(|e| e.key == key)
+            .unwrap_or_else(|| panic!("{key} not stored"));
+        manifest_entries(&store_common::predicate_of(&store, &env.bytes))
+            .iter()
+            .any(|(p, _)| p == path)
+    };
+
+    let stderr = run(&w, &[D, C, B, A], &[]);
+    assert!(
+        stderr.contains("vci: 3 file(s) ran in 1 worker process(es) of up to 3 files each"),
+        "{stderr}"
+    );
+    assert!(
+        has_in(&w, &stderr, A, ONLY_A)
+            && has_in(&w, &stderr, B, ONLY_A)
+            && has_in(&w, &stderr, C, ONLY_A)
+    );
+    assert!(has_in(&w, &stderr, B, A) && has_in(&w, &stderr, C, A) && has_in(&w, &stderr, C, B));
+    assert!(!has_in(&w, &stderr, A, B), "a ran first in its worker");
+    assert!(
+        !has_in(&w, &stderr, D, ONLY_A) && !has_in(&w, &stderr, D, A),
+        "d ran in a process of its own"
+    );
+    let p = w.plan(&w.work, "main");
+    assert!([A, B, C, D].iter().all(|f| p.skip.contains(*f)), "{p:?}");
+    // A change to what only a read runs a and the files after it in its
+    // worker again; d not.
+    w.put(ONLY_A, "ok \n");
+    let p = w.plan(&w.work, "main");
+    assert!([A, B, C].iter().all(|f| p.run.contains(*f)), "{p:?}");
+    assert!(p.skip.contains(D), "{p:?}");
+    w.put(ONLY_A, "ok\n");
+    // A change to b's own source: b and c, not a.
+    w.put(B, &plain("B").replace("passes", "still passes"));
+    let p = w.plan(&w.work, "main");
+    assert!(p.run.contains(B) && p.run.contains(C), "{p:?}");
+    assert!(p.skip.contains(A) && p.skip.contains(D), "{p:?}");
+    w.put(B, &plain("B"));
+
+    // A new file that sorts between a and b: it runs; b and c, whose
+    // inputs did not change, do not. Run with the others, it joins a's
+    // worker, b is recorded after it, and c starts the next worker.
+    w.put(A2, &reads("A2", ONLY_A2));
+    w.put(ONLY_A2, "ok\n");
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "a2"]);
+    let p = w.plan(&w.work, "main");
+    assert!(p.run.contains(A2), "{p:?}");
+    assert!([A, B, C, D].iter().all(|f| p.skip.contains(*f)), "{p:?}");
+    let stderr = run(&w, &[A, A2, B, C, D], &[]);
+    assert!(
+        stderr.contains("vci: 5 file(s) ran in 2 worker process(es) of up to 3 files each"),
+        "{stderr}"
+    );
+    assert!(has_in(&w, &stderr, B, ONLY_A2) && has_in(&w, &stderr, B, A2));
+    assert!(
+        !has_in(&w, &stderr, C, ONLY_A) && !has_in(&w, &stderr, C, A) && has_in(&w, &stderr, D, C)
+    );
+    w.put(ONLY_A2, "ok \n");
+    let p = w.plan(&w.work, "main");
+    assert!([A2, B].iter().all(|f| p.run.contains(*f)), "{p:?}");
+    assert!([A, C, D].iter().all(|f| p.skip.contains(*f)), "{p:?}");
+    w.put(ONLY_A2, "ok\n");
+
+    // b fails after a (a's global), passes on its own: it runs again on its
+    // own and is attested from there; c runs in a fresh worker.
+    w.put(
+        B,
+        "require \"test_helper\"\n\nclass BTest < ActiveSupport::TestCase\n  test \"no global\" do\n    assert_nil $vci_worker_a2\n  end\nend\n",
+    );
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "b needs a fresh process"]);
+    let stderr = run(&w, &[A, A2, B, C, D], &[]);
+    assert!(
+        stderr.contains("b_test.rb: its process failed in slot")
+            && stderr.contains("file 3 of its worker process"),
+        "{stderr}"
+    );
+    assert!(
+        !has_in(&w, &stderr, B, A2),
+        "b's attestation is its own run's"
+    );
+    assert!(!has_in(&w, &stderr, C, A2), "c ran in the next worker");
+
+    // VCI_RAILS_WORKER_FILES=1: one process per file.
+    let stderr = run(&w, &[A, A2, B, C, D], &[("VCI_RAILS_WORKER_FILES", "1")]);
+    assert!(!stderr.contains("worker process(es)"), "{stderr}");
+    assert!(
+        !has_in(&w, &stderr, C, A2) && !has_in(&w, &stderr, D, C) && !has_in(&w, &stderr, A2, A)
+    );
 }
 
 /// 2.11.0: a batch draws the application's routes in its boot, before its
