@@ -58,6 +58,7 @@ pub fn ci(args: CiArgs) -> Result<i32> {
         only: None,
         fetch: args.fetch.clone(),
         projects: args.projects.clone(),
+        early: false,
     })?;
     if let Some(w) = &res.fetch_failed {
         github_warning(w);

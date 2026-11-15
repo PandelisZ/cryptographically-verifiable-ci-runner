@@ -90,10 +90,60 @@ pub const RAILS_PRELOAD_ROUTES_ENV: &str = "VCI_RAILS_PRELOAD_ROUTES";
 /// batch's boot ([`crate::RunHints::rails_preload_routes`]).
 static PRELOAD_ROUTES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set by vci for a batch (2.12.0): what each slot's zygote preloads
+/// (`gems` or `common`; unset: no zygote). In vci's own environment it
+/// overrides the project's `rails_zygote` (`off`, `gems`, `common`).
+pub const RAILS_ZYGOTE_ENV: &str = "VCI_RAILS_ZYGOTE";
+
+/// A file of paths (one a line) a slot's zygote preloads at once, instead of
+/// what the batch's first files loaded (a diagnostic switch, 2.12.0): passed
+/// to the collector as set in vci's environment.
+pub const RAILS_ZYGOTE_HINTS_ENV: &str = "VCI_RAILS_ZYGOTE_HINTS";
+
+/// How many files' loads a slot's zygote waits for (a diagnostic switch,
+/// 2.12.0; default twice the slots, at least 16, and only when the batch
+/// has four times that many): passed to the collector as set in vci's
+/// environment.
+pub const RAILS_ZYGOTE_SAMPLES_ENV: &str = "VCI_RAILS_ZYGOTE_SAMPLES";
+
+/// The run in progress's [`crate::RunHints::rails_zygote`] (0 off, 1 gems,
+/// 2 common).
+static ZYGOTE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The effective `rails_zygote`: `VCI_RAILS_ZYGOTE` in vci's environment
+/// when it names one, else the project's setting.
+pub fn zygote_wanted(set: crate::RailsZygote) -> crate::RailsZygote {
+    std::env::var(RAILS_ZYGOTE_ENV)
+        .ok()
+        .and_then(|v| crate::RailsZygote::parse(&v))
+        .unwrap_or(set)
+}
+
 /// Whether vci's environment leaves the routes' preload on (anything but
 /// `VCI_RAILS_PRELOAD_ROUTES=0`).
 pub fn preload_routes_wanted() -> bool {
     std::env::var(RAILS_PRELOAD_ROUTES_ENV).map_or(true, |v| v.trim() != "0")
+}
+
+/// Rails (2.12.0): how many test files one process of a batch's slot runs
+/// one after the other, a worker (the project's `rails_worker_files`, which
+/// this variable overrides in vci's environment; passed to the collector
+/// when above 1). Each file's inputs are then everything its worker
+/// observed up to the end of that file.
+pub const RAILS_WORKER_FILES_ENV: &str = "VCI_RAILS_WORKER_FILES";
+
+/// The worker size of the run in progress ([`worker_files`]).
+static WORKER_FILES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Test files per worker: `VCI_RAILS_WORKER_FILES` in vci's environment (a
+/// positive number), else the project's setting; at least 1.
+fn worker_files(configured: u32) -> u32 {
+    std::env::var(RAILS_WORKER_FILES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|k| *k > 0)
+        .unwrap_or(configured)
+        .max(1)
 }
 
 /// Set by vci for a batch (2.3.0): the files to run as several processes,
@@ -843,6 +893,9 @@ impl RailsAdapter {
             RAILS_SHARDS_ENV,
             RAILS_AUTOLOAD_ENV,
             RAILS_PRELOAD_ENV,
+            RAILS_ZYGOTE_ENV,
+            RAILS_ZYGOTE_HINTS_ENV,
+            RAILS_ZYGOTE_SAMPLES_ENV,
             "SPRING_SERVER_COMMAND",
             RAILS_PROBE_PIPE_ENV,
         ] {
@@ -1177,7 +1230,12 @@ impl RailsAdapter {
         if let Some(asked) = asked {
             cmd.env(RAILS_SLOTS_ASKED_ENV, asked);
         }
-        for k in [RAILS_SHARED_OUTPUT_ENV, RAILS_OWN_OUTPUT_ENV] {
+        for k in [
+            RAILS_SHARED_OUTPUT_ENV,
+            RAILS_OWN_OUTPUT_ENV,
+            RAILS_ZYGOTE_HINTS_ENV,
+            RAILS_ZYGOTE_SAMPLES_ENV,
+        ] {
             if let Ok(v) = std::env::var(k) {
                 cmd.env(k, v);
             }
@@ -1185,9 +1243,28 @@ impl RailsAdapter {
         if PRELOAD_ROUTES.load(std::sync::atomic::Ordering::Relaxed) {
             cmd.env(RAILS_PRELOAD_ENV, "routes");
         }
+        match ZYGOTE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => {
+                cmd.env(RAILS_ZYGOTE_ENV, "gems");
+            }
+            2 => {
+                cmd.env(RAILS_ZYGOTE_ENV, "common");
+            }
+            _ => {}
+        }
+        let workers = WORKER_FILES.load(std::sync::atomic::Ordering::Relaxed);
+        if workers > 1 && runner == RailsRunner::Minitest {
+            cmd.env(RAILS_WORKER_FILES_ENV, workers.to_string());
+        } else {
+            cmd.env_remove(RAILS_WORKER_FILES_ENV);
+        }
         // Measurement switches of the collector (see its EXPERIMENT and
         // Profile): passed on as set in vci's environment.
-        for k in ["VCI_RAILS_EXPERIMENT", "VCI_RAILS_PROFILE"] {
+        for k in [
+            "VCI_RAILS_EXPERIMENT",
+            "VCI_RAILS_PROFILE",
+            "VCI_RAILS_PROFILE_LOADS",
+        ] {
             if let Ok(v) = std::env::var(k) {
                 cmd.env(k, v);
             }
@@ -1306,6 +1383,48 @@ impl RailsAdapter {
                 )
                 .as_bytes(),
             );
+            if !slots.file_cpu_ms.is_empty() {
+                let n = slots.file_cpu_ms.len() as f64;
+                let u: u64 = slots.file_cpu_ms.iter().map(|c| c.0).sum();
+                let s: u64 = slots.file_cpu_ms.iter().map(|c| c.1).sum();
+                log.extend_from_slice(
+                    format!(
+                        "vci: a file's process used {:.2} CPU-s on average ({:.2} s user, {:.2} s system), {:.0} CPU-s in all\n",
+                        (u + s) as f64 / 1000.0 / n,
+                        u as f64 / 1000.0 / n,
+                        s as f64 / 1000.0 / n,
+                        (u + s) as f64 / 1000.0
+                    )
+                    .as_bytes(),
+                );
+            }
+            if !slots.zygotes.is_empty() {
+                let z = &slots.zygotes;
+                let max = |f: fn(&Zygote) -> u64| z.iter().map(f).max().unwrap_or(0);
+                log.extend_from_slice(
+                    format!(
+                        "vci: {} slot zygote(s) preloaded what {} files of the batch loaded: up to {} gem or Ruby files and {} application files ({} records, {} in the repository outside gems), in {:.2} s at most ({:.2} s with their shared output)\n",
+                        z.len(),
+                        max(|z| z.samples),
+                        max(|z| z.gems),
+                        max(|z| z.app),
+                        max(|z| z.records),
+                        max(|z| z.repo),
+                        max(|z| z.load_ms) as f64 / 1000.0,
+                        max(|z| z.ms) as f64 / 1000.0,
+                    )
+                    .as_bytes(),
+                );
+            }
+            if let Some(why) = slots.zygotes_failed.first() {
+                log.extend_from_slice(
+                    format!(
+                        "vci: {} slot zygote(s) failed, their slots ran their files as before: {why}\n",
+                        slots.zygotes_failed.len()
+                    )
+                    .as_bytes(),
+                );
+            }
             // Where the batch's wall time went: a slot's files add up to
             // its busy time; the rest it waited (the queue, a fork, the
             // database, the CPU).
@@ -1353,6 +1472,17 @@ impl RailsAdapter {
                     .as_bytes(),
                 );
             }
+        }
+        if !slots.workers.is_empty() {
+            let n: u64 = slots.workers.values().sum();
+            let most = slots.workers.values().max().copied().unwrap_or(0);
+            log.extend_from_slice(
+                format!(
+                    "vci: {n} file(s) ran in {} worker process(es) of up to {workers} files each (rails_worker_files), {most} at most: each file's inputs are what its worker observed up to its end\n",
+                    slots.workers.len(),
+                )
+                .as_bytes(),
+            );
         }
         if slots.groups.len() > 1 {
             let mut g = slots.groups.clone();
@@ -1547,6 +1677,14 @@ struct SlotStats {
     /// Each file's tests' own time as the test framework measured it
     /// (2.7.16), against its process's time (`file_ms`).
     tests_ms: Vec<u64>,
+    /// Each file's process's CPU time (2.12.0), user and system (ms), as its
+    /// slot measured it once it was waited for: from the fork to its exit,
+    /// the exit included.
+    file_cpu_ms: Vec<(u64, u64)>,
+    /// The slots' zygotes (2.12.0), as each said once its preload was
+    /// done; and why each zygote that failed did.
+    zygotes: Vec<Zygote>,
+    zygotes_failed: Vec<String>,
     /// Sums over the files of each part of building their lines (2.7.14).
     lines_parts_ms: BTreeMap<String, u64>,
     shared_ms: Vec<u64>,
@@ -1554,6 +1692,24 @@ struct SlotStats {
     /// `Batch.preload_routes!`), per group: its time (ms), what it
     /// recorded, and how many of those records are in the repository.
     preload_routes: Vec<(u64, u64, u64)>,
+    /// Workers (2.12.0): the files a worker ran, by its first file.
+    workers: BTreeMap<String, u64>,
+}
+
+/// What a slot's zygote preloaded (2.12.0, the collector's `Batch::Zygote`).
+#[derive(Debug, Default, Clone)]
+struct Zygote {
+    /// The files' loads it was planned from.
+    samples: u64,
+    /// Gem (and Ruby library) files, and application files, planned.
+    gems: u64,
+    app: u64,
+    /// What it recorded, and of that, in the repository (outside gems).
+    records: u64,
+    repo: u64,
+    /// Its preload, and the preload with its shared lines and collection.
+    load_ms: u64,
+    ms: u64,
 }
 
 /// The slots of a batch run, and what decided their number (the value of
@@ -1639,6 +1795,8 @@ fn read_batch(
     // id => the slot that ran it.
     let mut slot_of: BTreeMap<String, u64> = BTreeMap::new();
     let mut slots: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    // id => its place in a worker (2.12.0), when one ran it.
+    let mut in_worker: BTreeMap<String, u64> = BTreeMap::new();
     // id => the limit its process ran past (VCI_RAILS_FILE_TIMEOUT, 2.7.2).
     let mut timed_out: BTreeMap<String, u64> = BTreeMap::new();
     let mut stats = SlotStats::default();
@@ -1686,6 +1844,21 @@ fn read_batch(
                     .preload_routes
                     .push((g("ms"), g("records"), g("repo")));
             }
+            if let Some(z) = v.get("zygote") {
+                let g = |k: &str| z.get(k).and_then(Value::as_u64).unwrap_or(0);
+                match z.get("failed").and_then(Value::as_str) {
+                    Some(why) => stats.zygotes_failed.push(why.to_owned()),
+                    None => stats.zygotes.push(Zygote {
+                        samples: g("samples"),
+                        gems: g("gems"),
+                        app: g("app"),
+                        records: g("records"),
+                        repo: g("repo"),
+                        load_ms: g("load_ms"),
+                        ms: g("ms"),
+                    }),
+                }
+            }
             if let Some(a) = v.get("after_slots") {
                 let g = |k: &str| a.get(k).and_then(Value::as_u64).unwrap_or(0);
                 stats.after_slots = Some((g("waited_at"), g("said_ms"), g("tmp_ms")));
@@ -1705,11 +1878,26 @@ fn read_batch(
                     slots.insert(s);
                     slot_of.insert(id.to_owned(), s);
                 }
+                if let Some(w) = v.get("worker").and_then(Value::as_array)
+                    && let (Some(first), Some(at)) = (
+                        w.first().and_then(Value::as_str),
+                        w.get(1).and_then(Value::as_u64),
+                    )
+                {
+                    in_worker.insert(id.to_owned(), at);
+                    *stats.workers.entry(first.to_owned()).or_insert(0) += 1;
+                }
                 if let Some(ms) = v.get("ms").and_then(Value::as_u64) {
                     stats.file_ms.push(ms);
                     if let Some(s) = v.get("slot").and_then(Value::as_u64) {
                         *stats.slot_ms.entry(s).or_insert(0) += ms;
                     }
+                }
+                if let Some(cpu) = v.get("cpu").and_then(Value::as_array)
+                    && let [u, s] = cpu.as_slice()
+                    && let (Some(u), Some(s)) = (u.as_u64(), s.as_u64())
+                {
+                    stats.file_cpu_ms.push((u, s));
                 }
                 let c = v
                     .get("exit")
@@ -1811,14 +1999,20 @@ fn read_batch(
         // boot and database: an earlier file of the slot may have left what
         // its tests collide with (a Rails worker has the same exposure).
         // The retry's result is the file's; this one counts for nothing.
-        if c != Some(0) && slots.len() > 1 {
+        // A file that failed in a worker (2.12.0) too: the files before it
+        // in its process may have left what made it fail.
+        if c != Some(0) && (slots.len() > 1 || in_worker.contains_key(*f)) {
             let slot = slot_of
                 .get(*f)
                 .map_or_else(|| "a slot".to_owned(), |s| format!("slot {s}"));
+            let place = match in_worker.get(*f) {
+                Some(at) => format!(", file {} of its worker process", at + 1),
+                None => String::new(),
+            };
             fallback.push((
                 f.to_string(),
                 format!(
-                    "its process failed in {slot} (exit {}): it runs again on its own",
+                    "its process failed in {slot}{place} (exit {}): it runs again on its own",
                     c.map_or_else(|| "signal".to_owned(), |c| c.to_string())
                 ),
             ));
@@ -2667,6 +2861,18 @@ impl Adapter for RailsAdapter {
         );
         PRELOAD_ROUTES.store(
             hints.rails_preload_routes,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        ZYGOTE.store(
+            match zygote_wanted(hints.rails_zygote) {
+                crate::RailsZygote::Off => 0,
+                crate::RailsZygote::Gems => 1,
+                crate::RailsZygote::Common => 2,
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        WORKER_FILES.store(
+            worker_files(hints.rails_worker_files),
             std::sync::atomic::Ordering::Relaxed,
         );
         let last_ms = &hints.last_ms;

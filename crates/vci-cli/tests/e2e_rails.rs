@@ -98,6 +98,7 @@ const SCRUB: &[&str] = &[
     "VCI_OUT",
     "VCI_RUBY",
     "VCI_RAILS_PER_FILE",
+    "VCI_RAILS_WORKER_FILES",
     "VCI_JOBS",
     "APP_MODE",
     "RUBYOPT",
@@ -3682,6 +3683,172 @@ fn rails_slots_give_what_one_process_per_file_gives() {
     }
 }
 
+/// Workers (2.12.0, `rails_worker_files = 3`): a slot runs up to 3 test
+/// files (sorted) in one process, and each file's manifest holds what its
+/// worker observed up to its end: the earlier files of the worker, their
+/// reads. A change to a file only an earlier file of the worker read runs
+/// the later files again too (the price in precision), not the files of
+/// another worker. A new file that joins a worker runs nothing else again
+/// (the others' inputs are unchanged); their next run records it. A file
+/// that fails only after an earlier file of its worker (a global that file
+/// set) runs again on its own and is attested from there, and the files
+/// after it run in a fresh worker. `VCI_RAILS_WORKER_FILES=1` in vci's
+/// environment is one process per file again.
+#[test]
+fn rails_worker_files_run_several_files_in_one_process() {
+    const SLOTS: &[(&str, &str)] = &[("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "2")];
+    const A: &str = "test/workers/a_test.rb";
+    const A2: &str = "test/workers/ab_test.rb";
+    const B: &str = "test/workers/b_test.rb";
+    const C: &str = "test/workers/c_test.rb";
+    const D: &str = "test/workers/d_test.rb";
+    const ONLY_A: &str = "worker_data/only_a.txt";
+    const ONLY_A2: &str = "worker_data/only_a2.txt";
+    let toml = VCI_TOML.replace(
+        "adapter = \"rails\"\n",
+        "adapter = \"rails\"\nrails_worker_files = 3\n",
+    );
+    let Some(w) = World::build(&toml, copy_rails_fixture) else {
+        return;
+    };
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
+    let plain = |name: &str| {
+        format!(
+            "require \"test_helper\"\n\nclass {name}Test < ActiveSupport::TestCase\n  test \"passes\" do\n    assert true\n  end\nend\n"
+        )
+    };
+    let reads = |name: &str, file: &str| {
+        format!(
+            "require \"test_helper\"\n\n$vci_worker_{} = true\n\nclass {name}Test < ActiveSupport::TestCase\n  test \"reads\" do\n    assert_equal \"ok\", File.read(Rails.root.join(\"{file}\")).strip\n  end\nend\n",
+            name.to_lowercase()
+        )
+    };
+    w.put(A, &reads("A", ONLY_A));
+    w.put(ONLY_A, "ok\n");
+    w.put(B, &plain("B"));
+    w.put(C, &plain("C"));
+    w.put(D, &plain("D"));
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "worker files"]);
+    let run = |w: &World, files: &[&str], env: &[(&str, &str)]| {
+        let key = w.trusted.to_str().unwrap().to_owned();
+        let mut args = vec!["run"];
+        args.extend(files);
+        args.extend(["--key", key.as_str()]);
+        let env: Vec<(&str, &str)> = SLOTS.iter().chain(env).copied().collect();
+        let out = w.vci_env(&w.work, &args, &env);
+        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+        assert!(
+            stderr.contains(&format!("vci: {} attested, 0 not attested", files.len())),
+            "{stderr}"
+        );
+        stderr
+    };
+    // Whether the attestation of `id` the run that printed `stderr` wrote
+    // (one of several for the same commit) has `path`.
+    let has_in = |w: &World, stderr: &str, id: &str, path: &str| {
+        let prefix = format!("as git-meta path:{id} ");
+        let key = stderr
+            .lines()
+            .find_map(|l| l.split_once(&prefix).map(|(_, k)| k.trim().to_owned()))
+            .unwrap_or_else(|| panic!("{id} not attested: {stderr}"));
+        let store = store_for(&w.work);
+        let stored = AttestStore::new(&store).list(Some(id)).unwrap();
+        let env = stored
+            .iter()
+            .find(|e| e.key == key)
+            .unwrap_or_else(|| panic!("{key} not stored"));
+        manifest_entries(&store_common::predicate_of(&store, &env.bytes))
+            .iter()
+            .any(|(p, _)| p == path)
+    };
+
+    let stderr = run(&w, &[D, C, B, A], &[]);
+    assert!(
+        stderr.contains("vci: 3 file(s) ran in 1 worker process(es) of up to 3 files each"),
+        "{stderr}"
+    );
+    assert!(
+        has_in(&w, &stderr, A, ONLY_A)
+            && has_in(&w, &stderr, B, ONLY_A)
+            && has_in(&w, &stderr, C, ONLY_A)
+    );
+    assert!(has_in(&w, &stderr, B, A) && has_in(&w, &stderr, C, A) && has_in(&w, &stderr, C, B));
+    assert!(!has_in(&w, &stderr, A, B), "a ran first in its worker");
+    assert!(
+        !has_in(&w, &stderr, D, ONLY_A) && !has_in(&w, &stderr, D, A),
+        "d ran in a process of its own"
+    );
+    let p = w.plan(&w.work, "main");
+    assert!([A, B, C, D].iter().all(|f| p.skip.contains(*f)), "{p:?}");
+    // A change to what only a read runs a and the files after it in its
+    // worker again; d not.
+    w.put(ONLY_A, "ok \n");
+    let p = w.plan(&w.work, "main");
+    assert!([A, B, C].iter().all(|f| p.run.contains(*f)), "{p:?}");
+    assert!(p.skip.contains(D), "{p:?}");
+    w.put(ONLY_A, "ok\n");
+    // A change to b's own source: b and c, not a.
+    w.put(B, &plain("B").replace("passes", "still passes"));
+    let p = w.plan(&w.work, "main");
+    assert!(p.run.contains(B) && p.run.contains(C), "{p:?}");
+    assert!(p.skip.contains(A) && p.skip.contains(D), "{p:?}");
+    w.put(B, &plain("B"));
+
+    // A new file that sorts between a and b: it runs; b and c, whose
+    // inputs did not change, do not. Run with the others, it joins a's
+    // worker, b is recorded after it, and c starts the next worker.
+    w.put(A2, &reads("A2", ONLY_A2));
+    w.put(ONLY_A2, "ok\n");
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "a2"]);
+    let p = w.plan(&w.work, "main");
+    assert!(p.run.contains(A2), "{p:?}");
+    assert!([A, B, C, D].iter().all(|f| p.skip.contains(*f)), "{p:?}");
+    let stderr = run(&w, &[A, A2, B, C, D], &[]);
+    assert!(
+        stderr.contains("vci: 5 file(s) ran in 2 worker process(es) of up to 3 files each"),
+        "{stderr}"
+    );
+    assert!(has_in(&w, &stderr, B, ONLY_A2) && has_in(&w, &stderr, B, A2));
+    assert!(
+        !has_in(&w, &stderr, C, ONLY_A) && !has_in(&w, &stderr, C, A) && has_in(&w, &stderr, D, C)
+    );
+    w.put(ONLY_A2, "ok \n");
+    let p = w.plan(&w.work, "main");
+    assert!([A2, B].iter().all(|f| p.run.contains(*f)), "{p:?}");
+    assert!([A, C, D].iter().all(|f| p.skip.contains(*f)), "{p:?}");
+    w.put(ONLY_A2, "ok\n");
+
+    // b fails after a (a's global), passes on its own: it runs again on its
+    // own and is attested from there; c runs in a fresh worker.
+    w.put(
+        B,
+        "require \"test_helper\"\n\nclass BTest < ActiveSupport::TestCase\n  test \"no global\" do\n    assert_nil $vci_worker_a2\n  end\nend\n",
+    );
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "b needs a fresh process"]);
+    let stderr = run(&w, &[A, A2, B, C, D], &[]);
+    assert!(
+        stderr.contains("b_test.rb: its process failed in slot")
+            && stderr.contains("file 3 of its worker process"),
+        "{stderr}"
+    );
+    assert!(
+        !has_in(&w, &stderr, B, A2),
+        "b's attestation is its own run's"
+    );
+    assert!(!has_in(&w, &stderr, C, A2), "c ran in the next worker");
+
+    // VCI_RAILS_WORKER_FILES=1: one process per file.
+    let stderr = run(&w, &[A, A2, B, C, D], &[("VCI_RAILS_WORKER_FILES", "1")]);
+    assert!(!stderr.contains("worker process(es)"), "{stderr}");
+    assert!(
+        !has_in(&w, &stderr, C, A2) && !has_in(&w, &stderr, D, C) && !has_in(&w, &stderr, A2, A)
+    );
+}
+
 /// 2.11.0: a batch draws the application's routes in its boot, before its
 /// files' processes fork (`rails_inputs = "loose"`, the default), instead
 /// of in each file's process that needs them. A route's constraint class
@@ -3775,6 +3942,285 @@ fn rails_batch_routes_drawn_in_the_boot_are_inputs_of_every_file() {
     let p = w.plan(&w.work, "main");
     assert!(p.run.contains("test/controllers/evens_test.rb"), "{p:?}");
     assert!(p.skip.contains("test/models/b_test.rb"), "{p:?}");
+}
+
+/// The model the zygote tests preload, and a test file using it or not.
+const ZYG_MODEL: &str = "app/models/shared_thing.rb";
+const ZYG_MODEL_RB: &str = "class SharedThing\n  def self.value = 1\nend\n";
+
+fn zygote_file(n: usize, uses: bool) -> String {
+    let body = if uses {
+        "assert_equal 1, SharedThing.value"
+    } else {
+        "assert_equal 2, 1 + 1"
+    };
+    format!(
+        "require \"test_helper\"\n\nclass Zyg{n}Test < ActiveSupport::TestCase\n  test \"it\" do\n    {body}\n  end\nend\n"
+    )
+}
+
+/// A world with [`ZYG_MODEL`] and `files` (`(path, uses the model)`),
+/// committed.
+fn zygote_world(files: &[(&str, bool)]) -> Option<World> {
+    let w = World::new()?;
+    // Format-1 records: entries_of reads the stored manifests.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
+    w.put(ZYG_MODEL, ZYG_MODEL_RB);
+    for (i, (f, uses)) in files.iter().enumerate() {
+        w.put(f, &zygote_file(i, *uses));
+    }
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "zygote files"]);
+    Some(w)
+}
+
+/// `vci run` of `files` in two slots with `env`: every file attested; its
+/// stderr.
+fn zygote_run(w: &World, files: &[&str], env: &[(&str, &str)]) -> String {
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let mut args = vec!["run"];
+    args.extend(files);
+    args.extend(["--key", key.as_str()]);
+    let mut all = vec![("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "2")];
+    all.extend_from_slice(env);
+    let out = w.vci_env(&w.work, &args, &all);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!("vci: {} attested, 0 not attested", files.len())),
+        "{stderr}"
+    );
+    stderr
+}
+
+/// The hints file of a zygote preloading [`ZYG_MODEL`] (and `more`), as
+/// absolute paths of the world's checkout.
+fn zygote_hints(w: &World, more: &[&str]) -> String {
+    let real = std::fs::canonicalize(&w.work).unwrap();
+    let mut text = String::new();
+    for p in std::iter::once(&ZYG_MODEL).chain(more) {
+        text.push_str(&format!("{}\n", real.join(p).display()));
+    }
+    let path = real.join("tmp/zygote-hints.txt");
+    std::fs::write(&path, text).unwrap();
+    path.to_str().unwrap().to_owned()
+}
+
+/// 2.12.0, `rails_zygote = "common"`: a slot's zygote, formed at once from
+/// a hints file (`VCI_RAILS_ZYGOTE_HINTS`), preloads an application model
+/// before its slot's files fork from it. The model is an input of every one
+/// of them, of the file that uses it (whose process found it loaded and
+/// did not load it itself) and of the file that never does: a change to it
+/// runs both again. With `rails_zygote = "gems"` the same hints preload no
+/// application file, and with "off" there is no zygote: the file that does
+/// not use the model does not have it, and a change to it does not run it.
+#[test]
+fn rails_batch_zygote_preloads_are_inputs_of_its_files() {
+    const FILES: [(&str, bool); 2] = [
+        ("test/zyg/a_uses_test.rb", true),
+        ("test/zyg/b_never_test.rb", false),
+    ];
+    let ids: Vec<&str> = FILES.iter().map(|f| f.0).collect();
+    let has = |w: &World, id: &str| entries_of(&w.work, id).iter().any(|(p, _)| p == ZYG_MODEL);
+    let change = |w: &World| {
+        w.put(
+            ZYG_MODEL,
+            "class SharedThing\n  # changed\n  def self.value = 1\nend\n",
+        )
+    };
+
+    let Some(w) = zygote_world(&FILES) else {
+        return;
+    };
+    let hints = zygote_hints(&w, &[]);
+    let stderr = zygote_run(
+        &w,
+        &ids,
+        &[
+            ("VCI_RAILS_ZYGOTE", "common"),
+            ("VCI_RAILS_ZYGOTE_HINTS", &hints),
+        ],
+    );
+    assert!(
+        stderr.contains("slot zygote(s) preloaded what 1 files of the batch loaded: up to 0 gem or Ruby files and 1 application files"),
+        "{stderr}"
+    );
+    for id in &ids {
+        assert!(
+            has(&w, id),
+            "{id}: the model its zygote preloaded is its input"
+        );
+    }
+    let p = w.plan(&w.work, "main");
+    assert!(ids.iter().all(|f| p.skip.contains(*f)), "{p:?}");
+    change(&w);
+    let p = w.plan(&w.work, "main");
+    assert!(ids.iter().all(|f| p.run.contains(*f)), "{p:?}");
+
+    for mode in ["gems", "off"] {
+        let Some(w) = zygote_world(&FILES) else {
+            return;
+        };
+        let hints = zygote_hints(&w, &[]);
+        let stderr = zygote_run(
+            &w,
+            &ids,
+            &[
+                ("VCI_RAILS_ZYGOTE", mode),
+                ("VCI_RAILS_ZYGOTE_HINTS", &hints),
+            ],
+        );
+        assert!(!stderr.contains("zygote"), "{mode}: {stderr}");
+        assert!(has(&w, FILES[0].0), "{mode}");
+        assert!(!has(&w, FILES[1].0), "{mode}");
+        change(&w);
+        let p = w.plan(&w.work, "main");
+        assert!(p.run.contains(FILES[0].0), "{mode}: {p:?}");
+        assert!(p.skip.contains(FILES[1].0), "{mode}: {p:?}");
+    }
+}
+
+/// 2.12.0, zygotes and workers together: with `rails_zygote = "common"`
+/// (from hints) and `VCI_RAILS_WORKER_FILES=2`, each slot's zygote
+/// preloads the model and then forks the slot's workers, two files each.
+/// Every file is attested, ran in a worker, has the model as an input
+/// (also the file that never uses it), and runs again when it changes.
+#[test]
+fn rails_batch_zygote_forks_workers() {
+    const FILES: [(&str, bool); 4] = [
+        ("test/zyg/a_uses_test.rb", true),
+        ("test/zyg/b_never_test.rb", false),
+        ("test/zyg/c_uses_test.rb", true),
+        ("test/zyg/d_never_test.rb", false),
+    ];
+    let ids: Vec<&str> = FILES.iter().map(|f| f.0).collect();
+    let Some(w) = zygote_world(&FILES) else {
+        return;
+    };
+    let hints = zygote_hints(&w, &[]);
+    let stderr = zygote_run(
+        &w,
+        &ids,
+        &[
+            ("VCI_RAILS_ZYGOTE", "common"),
+            ("VCI_RAILS_ZYGOTE_HINTS", &hints),
+            ("VCI_RAILS_WORKER_FILES", "2"),
+            ("VCI_TIMING", "1"),
+        ],
+    );
+    assert!(
+        stderr.contains("slot zygote(s) preloaded what 1 files of the batch loaded: up to 0 gem or Ruby files and 1 application files"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("vci: 4 file(s) ran in 2 worker process(es) of up to 2 files each"),
+        "{stderr}"
+    );
+    for id in &ids {
+        assert!(
+            entries_of(&w.work, id).iter().any(|(p, _)| p == ZYG_MODEL),
+            "{id}: the model its worker's zygote preloaded is its input"
+        );
+    }
+    let p = w.plan(&w.work, "main");
+    assert!(ids.iter().all(|f| p.skip.contains(*f)), "{p:?}");
+    w.put(
+        ZYG_MODEL,
+        "class SharedThing\n  # changed\n  def self.value = 1\nend\n",
+    );
+    let p = w.plan(&w.work, "main");
+    assert!(ids.iter().all(|f| p.run.contains(*f)), "{p:?}");
+}
+
+/// 2.12.0: a zygote whose preload raises (an application file that fails to
+/// load) ends before it takes any file; its slot runs its files as before,
+/// each attested, and what the zygote loaded is no file's input.
+#[test]
+fn rails_batch_zygote_that_fails_to_preload_falls_back() {
+    const FILES: [(&str, bool); 2] = [
+        ("test/zyg/a_uses_test.rb", true),
+        ("test/zyg/b_never_test.rb", false),
+    ];
+    let ids: Vec<&str> = FILES.iter().map(|f| f.0).collect();
+    let Some(w) = zygote_world(&FILES) else {
+        return;
+    };
+    w.put(
+        "app/models/broken_preload.rb",
+        "raise \"not loadable before a test asks\"\n",
+    );
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "broken"]);
+    let hints = zygote_hints(&w, &["app/models/broken_preload.rb"]);
+    let stderr = zygote_run(
+        &w,
+        &ids,
+        &[
+            ("VCI_RAILS_ZYGOTE", "common"),
+            ("VCI_RAILS_ZYGOTE_HINTS", &hints),
+        ],
+    );
+    assert!(
+        stderr.contains("slot zygote(s) failed, their slots ran their files as before: RuntimeError: not loadable before a test asks"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("slot zygote(s) preloaded"), "{stderr}");
+    for id in &ids {
+        let e = entries_of(&w.work, id);
+        assert!(
+            !e.iter().any(|(p, _)| p == "app/models/broken_preload.rb"),
+            "{id}: {e:?}"
+        );
+    }
+    assert!(
+        !entries_of(&w.work, FILES[1].0)
+            .iter()
+            .any(|(p, _)| p == ZYG_MODEL)
+    );
+}
+
+/// 2.12.0, the first run, with no history: the slots run the batch's first
+/// files (`VCI_RAILS_ZYGOTE_SAMPLES=2` of them, spread over the batch) from
+/// their bare boot, then each forks a zygote preloading what those loaded
+/// (the model every file uses, and the models of the fixtures every test
+/// loads), and run the rest from it. Every file has the model as an input
+/// and runs again when it changes.
+#[test]
+fn rails_batch_zygote_learns_from_the_first_files() {
+    let files: Vec<(String, bool)> = (0..8)
+        .map(|i| (format!("test/zyg/f{i}_test.rb"), true))
+        .collect();
+    let refs: Vec<(&str, bool)> = files.iter().map(|(f, u)| (f.as_str(), *u)).collect();
+    let ids: Vec<&str> = refs.iter().map(|f| f.0).collect();
+    let Some(w) = zygote_world(&refs) else { return };
+    let stderr = zygote_run(
+        &w,
+        &ids,
+        &[
+            ("VCI_RAILS_ZYGOTE", "common"),
+            ("VCI_RAILS_ZYGOTE_SAMPLES", "2"),
+        ],
+    );
+    // At least the two files sampled (a slot looks once its file ended);
+    // the model, and those the fixtures load (Widget, ApplicationRecord).
+    assert!(
+        stderr.contains(" slot zygote(s) preloaded what ")
+            && stderr.contains(" files of the batch loaded: ")
+            && stderr.contains(" 3 application files"),
+        "{stderr}"
+    );
+    for id in &ids {
+        assert!(
+            entries_of(&w.work, id).iter().any(|(p, _)| p == ZYG_MODEL),
+            "{id}"
+        );
+    }
+    w.put(
+        ZYG_MODEL,
+        "class SharedThing\n  # changed\n  def self.value = 1\nend\n",
+    );
+    let p = w.plan(&w.work, "main");
+    assert!(ids.iter().all(|f| p.run.contains(*f)), "{p:?}");
 }
 
 /// `policy.rails_autoload_lookups` (2.6.0): Zeitwerk's listing of an
@@ -4106,4 +4552,587 @@ fn rails_inputs_loose_skips_boot_file_changes_and_strict_does_not() {
             assert!(ex.contains("failed check: global-inputs"), "{ex}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `vci plan --early` (2.12.0): the plan made before the toolchain is set up.
+// ---------------------------------------------------------------------------
+
+/// The fixture's policy with the early plan's opt-in (`toolchain =
+/// "declared"`, which the early plan decides only under `libraries =
+/// "any"`).
+const EARLY_TOML: &str = r#"project = "."
+adapter = "rails"
+
+[policy]
+platform = "any"
+max_ttl = "30d"
+libraries = "any"
+toolchain = "declared"
+
+[env]
+hash = ["APP_MODE", "TZ"]
+"#;
+
+/// A Ruby the early plan would fail with, had it started one: it must not.
+const NO_RUBY: &str = "/nonexistent/the-early-plan-starts-no-ruby";
+
+impl World {
+    /// `vci plan --early --format json` (with `args`), with no Ruby: its
+    /// JSON, which must carry the early answer, and the process's output.
+    fn early(&self, dir: &Path, base: &str, args: &[&str], env: &[(&str, &str)]) -> Value {
+        let mut a = vec!["plan", "--early", "--base-ref", base, "--format", "json"];
+        a.extend(args);
+        let mut env = env.to_vec();
+        env.push(("VCI_RUBY", NO_RUBY));
+        let out = self.vci_env(dir, &a, &env);
+        assert!(
+            out.status.success(),
+            "vci plan --early exits 0 whatever happens"
+        );
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(v["early"]["skipAll"].is_boolean(), "{v}");
+        v
+    }
+
+    /// Commit `vci_toml` on a new branch `name` from main (the base the
+    /// plans read policy from), and come back to the working tree as it was.
+    fn base_with(&self, name: &str, vci_toml: &str) {
+        let dir = self.base.join(format!("wt-{name}"));
+        self.git(
+            &self.work,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                name,
+                dir.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(dir.join("vci.toml"), vci_toml).unwrap();
+        self.git(&dir, &["commit", "-q", "-am", &format!("policy {name}")]);
+    }
+}
+
+fn early_skips(v: &Value) -> BTreeSet<String> {
+    v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["skip"].as_bool() == Some(true))
+        .map(|f| f["testId"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn skip_all(v: &Value) -> bool {
+    v["early"]["skipAll"].as_bool().unwrap()
+}
+
+/// The early plan's guarantee: it never skips a unit the full plan runs,
+/// and says "skip all" only when the full plan runs nothing.
+fn assert_within(early: &Value, full: &Plan, what: &str) {
+    let e = early_skips(early);
+    assert!(
+        e.is_subset(&full.skip),
+        "{what}: the early plan skipped {:?}, which the full plan runs",
+        e.difference(&full.skip).collect::<Vec<_>>()
+    );
+    if skip_all(early) {
+        assert!(
+            full.run.is_empty() && !full.run_all,
+            "{what}: early says skip all, the full plan runs {:?}",
+            full.run
+        );
+    }
+}
+
+/// The early plan, with no Ruby at all, skips what the full plan skips
+/// when nothing the toolchain is declared by changed, and runs (never
+/// skips) whatever the full plan runs: a changed input, a changed Ruby
+/// version file, files that disagree on the Ruby version, a changed
+/// lockfile, a collector it cannot read, and a base it cannot read. Its
+/// three output formats carry the same answer.
+#[test]
+fn rails_early_plan_never_skips_what_the_full_plan_runs() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+
+    // Nothing changed: every unit skips, in both plans.
+    let full = w.plan(&work, "main");
+    assert_eq!(full.skip, set(ALL), "{full:?}");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "unchanged");
+    assert!(skip_all(&early), "{early}");
+    assert_eq!(early_skips(&early), set(ALL));
+    assert_eq!(early["early"]["skipped"], 4);
+    assert_eq!(early["early"]["run"], 0);
+
+    // Text and github formats.
+    let out = w.vci_env(
+        &work,
+        &["plan", "--early", "--base-ref", "main"],
+        &[("VCI_RUBY", NO_RUBY)],
+    );
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("early: skip all: 4 unit(s) skipped")),
+        "{text}"
+    );
+    let gh_out = w.base.join("github-output");
+    let out = w.vci_env(
+        &work,
+        &[
+            "plan",
+            "--early",
+            "--base-ref",
+            "main",
+            "--format",
+            "github",
+        ],
+        &[
+            ("VCI_RUBY", NO_RUBY),
+            ("GITHUB_OUTPUT", gh_out.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success());
+    let gh = std::fs::read_to_string(&gh_out).unwrap();
+    for l in [
+        "skip_all=true",
+        "skipped_count=4",
+        "run_count=0",
+        "run_all=false",
+    ] {
+        assert!(gh.lines().any(|x| x == l), "{l} in {gh}");
+    }
+    // --json-file writes the same plan.
+    let saved = w.base.join("early.json");
+    w.early(
+        &work,
+        "main",
+        &["--json-file", saved.to_str().unwrap()],
+        &[],
+    );
+    let v: Value = serde_json::from_slice(&std::fs::read(&saved).unwrap()).unwrap();
+    assert_eq!(v["early"]["skipAll"], true);
+
+    // An input of A changed: both run A, the early plan says run.
+    let calc = w.read("lib/calc.rb");
+    w.put("lib/calc.rb", &format!("{calc}\n# changed\n"));
+    let full = w.plan(&work, "main");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "an input changed");
+    assert!(full.run.contains(A), "{full:?}");
+    assert!(!skip_all(&early));
+    assert_eq!(early_skips(&early), full.skip, "the same verdicts here");
+    // The partitions of `vci ci --partition I/2`: only the one A is in has
+    // something to run.
+    let parts: Vec<bool> = ["1/2", "2/2"]
+        .iter()
+        .map(|p| skip_all(&w.early(&work, "main", &["--partition", p], &[])))
+        .collect();
+    assert_eq!(parts.iter().filter(|s| !**s).count(), 1, "{parts:?}");
+    w.put("lib/calc.rb", &calc);
+
+    // Another Ruby version declared: every unit runs in both.
+    w.put(".ruby-version", "3.4.8\n");
+    let full = w.plan(&work, "main");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "another .ruby-version");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    w.put(".ruby-version", "3.4.9\n");
+
+    // Version files that disagree (mise.toml says another Ruby): the early
+    // plan cannot tell which one the job installs, and runs.
+    w.put("mise.toml", "[tools]\nruby = \"3.4.8\"\n");
+    let full = w.plan(&work, "main");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "mise.toml disagrees");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    let reason = early["files"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("toolchain"), "{reason}");
+    std::fs::remove_file(work.join("mise.toml")).unwrap();
+
+    // The lockfile changed (a global input of every unit): both run all.
+    let lock = w.read("Gemfile.lock");
+    w.put("Gemfile.lock", &format!("{lock}\n"));
+    let early = w.early(&work, "main", &[], &[]);
+    let full = w.plan(&work, "main");
+    assert_within(&early, &full, "Gemfile.lock changed");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    w.put("Gemfile.lock", &lock);
+
+    // The collector's version cannot be read: a fact missing, so run.
+    let empty = w.base.join("no-collector");
+    std::fs::create_dir_all(&empty).unwrap();
+    let early = w.early(
+        &work,
+        "main",
+        &[],
+        &[("VCI_RUBY_COLLECTOR", empty.to_str().unwrap())],
+    );
+    assert!(early_skips(&early).is_empty(), "{early}");
+    assert!(!skip_all(&early));
+
+    // Back as attested: skip all again.
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "{early}");
+
+    // A base it cannot read: run, and still exit 0.
+    let early = w.early(&work, "no-such-ref", &[], &[]);
+    assert!(!skip_all(&early), "{early}");
+}
+
+/// The early plan decides a project only when the base policy opts in
+/// (`toolchain = "declared"`) and the toolchain facts it cannot read are not
+/// compared by the full plan either (`libraries = "any"`); otherwise it runs
+/// it. The full plan is the same whatever `toolchain` says.
+#[test]
+fn rails_early_plan_needs_the_base_policy() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+    w.base_with(
+        "probed",
+        &EARLY_TOML.replace("toolchain = \"declared\"\n", ""),
+    );
+    w.base_with("exact", &EARLY_TOML.replace("libraries = \"any\"\n", ""));
+
+    // Without the opt-in: the project runs everything, unlisted.
+    let full = w.plan(&work, "probed");
+    assert_eq!(full.skip, set(ALL), "the full plan does not read it");
+    let early = w.early(&work, "probed", &[], &[]);
+    assert_within(&early, &full, "no opt-in");
+    assert!(!skip_all(&early));
+    let why = early["early"]["why"].as_str().unwrap();
+    assert!(
+        why.contains("policy.toolchain = \\\"declared\\\"") || why.contains("policy.toolchain"),
+        "{why}"
+    );
+
+    // libraries = "exact": the library versions are Ruby's to read.
+    let full = w.plan(&work, "exact");
+    let early = w.early(&work, "exact", &[], &[]);
+    assert_within(&early, &full, "libraries exact");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    let reason = early["files"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("toolchain"), "{reason}");
+
+    // `vci explain` of a full plan under the opt-in still probes: the base
+    // policy changes nothing there.
+    let full = w.plan(&work, "main");
+    assert_eq!(full.skip, set(ALL));
+}
+
+/// A native library the attestation records (libvips through Active
+/// Storage) comes from the system packages the job installs after the
+/// early plan: under `libraries = "any"` (by library name) the early plan
+/// takes it as declared, under "exact" (file and hash) it runs the file.
+/// Skipped where libvips is not installed.
+#[test]
+fn rails_early_plan_and_native_libraries() {
+    let Some(w) = World::build(EARLY_TOML, copy_vips_fixture) else {
+        return;
+    };
+    let vips = Command::new(w.ruby_bin.join("bundle"))
+        .args(["exec", "ruby", "-e", "require 'vips'"])
+        .current_dir(&w.work)
+        .env("PATH", w.path_env())
+        .env_remove("RUBYOPT")
+        .output()
+        .unwrap();
+    if !vips.status.success() {
+        eprintln!("SKIPPED: libvips is not installed (`brew install vips`)");
+        return;
+    }
+    let work = w.work.clone();
+    const CAPTION: &str = "test/models/caption_test.rb";
+    w.run(&work, &[CAPTION], &w.trusted);
+    let full = w.plan(&work, "main");
+    assert!(full.skip.contains(CAPTION), "{full:?}");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "natives, any");
+    assert!(early_skips(&early).contains(CAPTION), "{early}");
+
+    w.base_with("exact", &EARLY_TOML.replace("libraries = \"any\"\n", ""));
+    let full = w.plan(&work, "exact");
+    let early = w.early(&work, "exact", &[], &[]);
+    assert_within(&early, &full, "natives, exact");
+    assert!(!early_skips(&early).contains(CAPTION), "{early}");
+}
+
+/// An attestation made with another Ruby than the one the checkout
+/// declares (every Ruby process of the run says it is 3.4.7p58, through a
+/// `ruby` wrapper that redefines the version constants first;
+/// `.ruby-version` says 3.4.9, which the full plan probes): both plans run
+/// every unit, and the early plan says why.
+#[test]
+fn rails_early_plan_runs_what_another_ruby_attested() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    // Bundler would refuse a Ruby the bundle pins: no pin, so that the
+    // only difference is the Ruby (`.ruby-version` still says 3.4.9).
+    let gemfile = w
+        .read("Gemfile")
+        .replace("ruby file: \".ruby-version\"\n", "");
+    w.put("Gemfile", &gemfile);
+    let lock = w
+        .read("Gemfile.lock")
+        .replace("RUBY VERSION\n  ruby 3.4.9\n\n", "");
+    w.put("Gemfile.lock", &lock);
+    w.git(&work, &["commit", "-q", "-am", "no ruby pin in the bundle"]);
+    let fake = w.base.join("ruby-347.rb");
+    std::fs::write(
+        &fake,
+        "v, $VERBOSE = $VERBOSE, nil\n\
+         Object.send(:remove_const, :RUBY_VERSION); RUBY_VERSION = \"3.4.7\".freeze\n\
+         Object.send(:remove_const, :RUBY_PATCHLEVEL); RUBY_PATCHLEVEL = 58\n\
+         Object.send(:remove_const, :RUBY_ENGINE_VERSION); RUBY_ENGINE_VERSION = \"3.4.7\".freeze\n\
+         $VERBOSE = v\n",
+    )
+    .unwrap();
+    let shim = w.base.join("ruby-347");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nexec '{}' -r'{}' \"$@\"\n",
+            w.ruby_bin.join("ruby").display(),
+            fake.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = [("VCI_RUBY", shim.to_str().unwrap())];
+    let mut args = vec!["run"];
+    args.extend(ALL);
+    args.extend(["--key", w.trusted.to_str().unwrap()]);
+    assert!(w.vci_env(&work, &args, &env).status.success());
+    // With that Ruby, the full plan skips everything: the records hold it.
+    let with_other = w.plan_env(&work, "main", &env);
+    if with_other.skip != set(ALL) {
+        eprintln!(
+            "SKIPPED: the run with the Ruby that says 3.4.7 attested nothing: {with_other:?}"
+        );
+        return;
+    }
+    let full = w.plan(&work, "main");
+    assert!(full.skip.is_empty(), "the probed 3.4.9 differs: {full:?}");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "attested with another Ruby");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    assert!(!skip_all(&early));
+    let reason = early["files"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("ruby (declared)"), "{reason}");
+}
+
+/// A fact the early plan reads from the checkout is missing: no lockfile
+/// (the bundle cannot be compared) runs every unit, and a mise file that
+/// exports a variable the env policy hashes runs them too, where the full
+/// plan (which reads the environment as the tests get it) may skip them.
+#[test]
+fn rails_early_plan_runs_when_a_fact_is_missing() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "{early}");
+
+    // No lockfile: the early plan runs everything (the full plan runs too:
+    // the lockfile is an input of every unit).
+    let lock = w.read("Gemfile.lock");
+    std::fs::remove_file(work.join("Gemfile.lock")).unwrap();
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(early_skips(&early).is_empty(), "{early}");
+    assert!(!skip_all(&early));
+    w.put("Gemfile.lock", &lock);
+
+    // mise would export APP_MODE (hashed) after the early plan: run.
+    w.put(
+        "mise.toml",
+        "[tools]\nruby = \"3.4.9\"\n\n[env]\nAPP_MODE = \"x\"\n",
+    );
+    let full = w.plan(&work, "main");
+    let early = w.early(&work, "main", &[], &[]);
+    assert_within(&early, &full, "mise exports APP_MODE");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    let reason = early["files"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("cannot decide without the toolchain"),
+        "{reason}"
+    );
+    std::fs::remove_file(work.join("mise.toml")).unwrap();
+
+    // Back as attested.
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "{early}");
+}
+
+/// Every mise config file in the checkout is a declaration the early plan
+/// reads (vci 2.12.0 review): besides `mise.toml` and its kin, mise reads
+/// `mise/`, `.mise/` and `.config/mise/` (their `config.toml`,
+/// `config.<env>.toml`, `config.local.toml` and `conf.d/*.toml`) and
+/// `.config/mise.<env>.toml`. A file there that names another Ruby, or
+/// exports a variable the env policy hashes, is what the job's setup
+/// installs or exports after the early plan: the early plan runs every
+/// unit (it skipped all of them before). One that names the declared Ruby
+/// and exports nothing compared changes nothing.
+#[test]
+fn rails_early_plan_reads_every_mise_config_file() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "attested: {early}");
+    let ruby = "[tools]\nruby = \"3.4.7\"\n";
+    let env = "[env]\nAPP_MODE = \"other\"\n";
+    let mut wrong = Vec::new();
+    for (file, text) in [
+        ("mise/config.toml", ruby),
+        ("mise/config.ci.toml", ruby),
+        ("mise/conf.d/ruby.toml", ruby),
+        (".mise/conf.d/ruby.toml", ruby),
+        (".mise/config.local.toml", ruby),
+        (".config/mise/conf.d/ruby.toml", ruby),
+        (".config/mise/config.local.toml", ruby),
+        (".config/mise/config.ci.toml", ruby),
+        (".config/mise/mise.toml", ruby),
+        (".config/mise.ci.toml", ruby),
+        ("mise.ci.local.toml", ruby),
+        ("mise/config.toml", env),
+        (".config/mise/conf.d/env.toml", env),
+    ] {
+        w.put(file, text);
+        let early = w.early(&work, "main", &[], &[("MISE_ENV", "ci")]);
+        if skip_all(&early) || !early_skips(&early).is_empty() {
+            wrong.push(format!(
+                "{file} ({}): early skipped {:?}",
+                text.trim().replace('\n', " "),
+                early_skips(&early)
+            ));
+        }
+        let top = file.split('/').next().unwrap();
+        let p = work.join(top);
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p).unwrap();
+        } else {
+            std::fs::remove_file(&p).unwrap();
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "WRONG SKIPS by the early plan:\n{}",
+        wrong.join("\n")
+    );
+    // The declared Ruby and a variable nobody compares: still skip all.
+    w.put(
+        ".config/mise/conf.d/same.toml",
+        "[tools]\nruby = \"3.4.9\"\n\n[env]\nNOT_COMPARED = \"1\"\n",
+    );
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "{early}");
+    std::fs::remove_dir_all(work.join(".config")).unwrap();
+    // A config file mise reads that is not TOML: undecided, run.
+    w.put("mise/config.toml", "[tools\n");
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(!skip_all(&early), "{early}");
+    std::fs::remove_dir_all(work.join("mise")).unwrap();
+    let early = w.early(&work, "main", &[], &[]);
+    assert!(skip_all(&early), "restored: {early}");
+}
+
+/// The variables that choose a Ruby for the version managers the job's
+/// setup may use (`MISE_RUBY_VERSION`, `RBENV_VERSION`, `ASDF_RUBY_VERSION`,
+/// chruby's `RUBY_VERSION`), and those that point mise at other config
+/// files, set where the early plan runs: one naming another Ruby, or one
+/// it cannot read as an exact version, runs every unit; one naming the
+/// declared Ruby changes nothing.
+#[test]
+fn rails_early_plan_and_ruby_version_variables() {
+    let Some(w) = World::build(EARLY_TOML, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+    for (k, v) in [
+        ("MISE_RUBY_VERSION", "3.4.7"),
+        ("RBENV_VERSION", "3.4.7"),
+        ("ASDF_RUBY_VERSION", "3.4.7"),
+        ("RUBY_VERSION", "3.4.7"),
+        ("MISE_RUBY_VERSION", "3.4"),
+        ("MISE_CONFIG_FILE", "/elsewhere/mise.toml"),
+        ("MISE_OVERRIDE_CONFIG_FILENAMES", "other.toml"),
+    ] {
+        let early = w.early(&work, "main", &[], &[(k, v)]);
+        assert!(
+            !skip_all(&early) && early_skips(&early).is_empty(),
+            "WRONG SKIP with {k}={v}: {early}"
+        );
+    }
+    let early = w.early(&work, "main", &[], &[("MISE_RUBY_VERSION", "3.4.9")]);
+    assert!(skip_all(&early), "{early}");
+}
+
+/// config/database.yml picks the adapter in ERB from a variable the env
+/// policy passes to the tests without comparing it (`ignore`): the full
+/// plan's probe reports another adapter (toolchain: database) and runs;
+/// the early plan, which does not read the adapter, must run too (it
+/// skipped all). A variable the policy hashes, or strips, decides.
+#[test]
+fn rails_early_plan_database_adapter_from_erb() {
+    let toml = EARLY_TOML.replace(
+        "hash = [\"APP_MODE\", \"TZ\"]\n",
+        "hash = [\"APP_MODE\", \"TZ\"]\nignore = [\"DB_ADAPTER\"]\n",
+    );
+    let Some(w) = World::build(&toml, |dir: &Path| {
+        copy_rails_fixture(dir);
+        let yml = std::fs::read_to_string(dir.join("config/database.yml"))
+            .unwrap()
+            .replace(
+                "adapter: sqlite3",
+                "adapter: <%= ENV.fetch(\"DB_ADAPTER\", \"sqlite3\") %>",
+            );
+        std::fs::write(dir.join("config/database.yml"), yml).unwrap();
+    }) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+    let full = w.plan(&work, "main");
+    assert_eq!(full.skip, set(ALL), "attested: {full:?}");
+    let env = [("DB_ADAPTER", "postgresql")];
+    let full = w.plan_env(&work, "main", &env);
+    let early = w.early(&work, "main", &[], &env);
+    assert_within(&early, &full, "adapter from an ignored variable");
+    assert!(early_skips(&early).is_empty(), "{early}");
+    let reason = early["files"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("cannot decide without the toolchain"),
+        "{reason}"
+    );
+    // The variable hashed instead (the env check compares it): decided.
+    w.base_with(
+        "hashed",
+        &EARLY_TOML.replace(
+            "hash = [\"APP_MODE\", \"TZ\"]\n",
+            "hash = [\"APP_MODE\", \"TZ\", \"DB_ADAPTER\"]\n",
+        ),
+    );
+    let early = w.early(&work, "hashed", &[], &[]);
+    let full = w.plan(&work, "hashed");
+    assert_within(&early, &full, "adapter from a hashed variable");
 }

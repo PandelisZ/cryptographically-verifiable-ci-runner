@@ -16,7 +16,13 @@ inputs:
       request's base commit, or the pushed commit on push events.
     default: ${{ github.event.pull_request.base.sha || github.sha }}
   command:
-    description: "`ci` (plan, then run what is left) or `plan` (decide only)."
+    description: >
+      `ci` (plan, then run what is left), `plan` (decide only), or `early`
+      (since 2.12.0: `vci plan --early`, right after the checkout and before
+      any toolchain is set up: output `skip-all` is `true` only when every
+      unit of the projects (of the partition) is skipped, so later steps can
+      gate the toolchain setup and the tests on `skip-all != 'true'`; see
+      "The early plan" in docs/REFERENCE.md). It never fails the job.
     default: ci
   remote:
     description: >
@@ -41,6 +47,14 @@ inputs:
       its test id. With signing-key or oidc each job attests its own share.
       Empty: the whole suite in this job.
     default: ""
+  early-timeout:
+    description: >
+      `command: early` only (since 2.12.0): seconds the early plan may take,
+      fetch included, before it is stopped and the step answers
+      `skip_all=false` (the job sets up its toolchain and plans in full, as
+      when nothing could be skipped). `0`: no limit. Needs `timeout`
+      (coreutils; on a runner without it there is no limit).
+    default: "90"
   working-directory:
     description: Directory inside the repository to run vci from.
     default: .
@@ -107,13 +121,19 @@ inputs:
 outputs:
   skipped:
     description: Number of test units skipped.
-    value: ${{ steps.ci.outputs.skipped || steps.plan.outputs.skipped }}
+    value: ${{ steps.ci.outputs.skipped || steps.plan.outputs.skipped || steps.early.outputs.skipped }}
   run:
     description: Number of test units that had to run.
-    value: ${{ steps.ci.outputs.run || steps.plan.outputs.run }}
+    value: ${{ steps.ci.outputs.run || steps.plan.outputs.run || steps.early.outputs.run }}
   attested:
     description: Number of test units attested with signing-key or oidc (0 without either).
     value: ${{ steps.ci.outputs.attested }}
+  skip-all:
+    description: >
+      `command: early` only: `true` when the early plan skips every unit (of
+      the partition), `false` when anything may run or the early plan could
+      not decide (empty for the other commands).
+    value: ${{ steps.early.outputs.skip_all }}
 
 runs:
   using: composite
@@ -227,9 +247,42 @@ runs:
     # .git/git-meta.sqlite; read access only) while the projects are probed.
     # If it fails, only attestations already stored locally are used (fail
     # open: in a fresh checkout everything runs).
+    # `command: early`: `vci plan --early` before the toolchain is set up
+    # (fetching as `plan` does). Its github format writes skip_all,
+    # skipped_count and run_count to GITHUB_OUTPUT; it exits 0 whatever
+    # happens, and anything it cannot decide is "run" (skip_all=false).
+    - name: Early plan
+      id: early
+      if: inputs.command == 'early'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PROJECT: ${{ inputs.project }}
+        BASE: ${{ inputs.base-ref }}
+        REMOTE: ${{ inputs.remote }}
+        PARTITION: ${{ inputs.partition }}
+        EARLY_TIMEOUT: ${{ inputs.early-timeout }}
+      run: |
+        args=(--early --fetch "$REMOTE" --base-ref "$BASE" --format github)
+        for p in $PROJECT; do args+=(--project "$p"); done
+        if [ -n "$PARTITION" ]; then args+=(--partition "$PARTITION"); fi
+        # A plan past its time limit (a slow fetch) is stopped: run.
+        limit=()
+        if [ "${EARLY_TIMEOUT:-0}" != "0" ] && command -v timeout > /dev/null; then
+          limit=(timeout -k 10 "$EARLY_TIMEOUT")
+        fi
+        "${limit[@]}" vci plan "${args[@]}" || echo "skip_all=false" >> "$GITHUB_OUTPUT"
+        if ! grep -q '^skip_all=' "$GITHUB_OUTPUT" 2>/dev/null; then
+          echo "skip_all=false" >> "$GITHUB_OUTPUT"
+        fi
+        {
+          echo "skipped=$(sed -n 's/^skipped_count=//p' "$GITHUB_OUTPUT" | tail -1)"
+          echo "run=$(sed -n 's/^run_count=//p' "$GITHUB_OUTPUT" | tail -1)"
+        } >> "$GITHUB_OUTPUT"
+
     - name: Plan
       id: plan
-      if: inputs.command != 'ci'
+      if: inputs.command != 'ci' && inputs.command != 'early'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:

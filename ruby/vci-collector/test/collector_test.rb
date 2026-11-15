@@ -2185,6 +2185,80 @@ class CollectorTest < Minitest::Test
   # asks for fewer workers than vci's slots gets that many; vci's
   # PARALLEL_WORKERS (VCI_RAILS_SLOTS_ASKED=workers) overrides `workers:`,
   # as in Rails.
+  # Zygotes (2.12.0, VCI_RAILS_ZYGOTE): a slot forks a zygote that preloads
+  # what its files loaded on their own (Ruby's library files and gems; the
+  # application's files only with "common", through Rails' loaders) and runs
+  # the slot's remaining files, each forked from it. Here from a hints file
+  # (VCI_RAILS_ZYGOTE_HINTS), at once: every file finds English.rb loaded.
+  # A zygote whose preload raises (a file that is not there) takes no file:
+  # its slot runs them as before, and none finds it loaded. With "off" there
+  # is no zygote.
+  ZYGOTE_TEST = <<~RUBY
+    require "test_helper"
+    class %<name>sTest < Minitest::Test
+      def test_preloaded = assert_equal(%<want>s, $LOADED_FEATURES.any? { |f| f.end_with?("/English.rb") })
+    end
+  RUBY
+
+  def test_batch_slot_zygote_preloads_before_its_files_fork
+    english = File.join(RbConfig::CONFIG["rubylibdir"], "English.rb")
+    skip "no English.rb" unless File.file?(english)
+    put("test/test_helper.rb", "require \"minitest\"\n")
+    ids = %w[a b c d].map { |n| "test/#{n}_test.rb" }
+    slots = { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" }
+    hints = File.join(@tmp, "hints.txt")
+    [[english, "common", true], [english, "off", false], [File.join(File.dirname(english), "no_such_vci_file.rb"), "gems", false]]
+      .each do |path, mode, want|
+        File.write(hints, "#{path}\n")
+        ids.each { |id| put(id, format(ZYGOTE_TEST, name: File.basename(id, "_test.rb").upcase, want: want)) }
+        out = batch(ids, env: slots.merge("VCI_RAILS_ZYGOTE" => mode, "VCI_RAILS_ZYGOTE_HINTS" => hints))
+        z = out[:status].filter_map { |l| l["zygote"] }
+        case mode
+        when "common"
+          assert_equal 2, z.size, out[:said]
+          assert(z.all? { |x| x["gems"] == 1 && x["app"].zero? && x["samples"] == 1 }, z.inspect)
+        when "off" then assert_empty z, out[:said]
+        else assert_equal(2, z.count { |x| x["failed"].to_s.start_with?("LoadError") }, z.inspect)
+        end
+        assert_equal ids, out[:status].filter_map { |l| l["id"] if l["exit"] == 0 }.sort, "#{mode}: #{out[:said]}"
+      end
+  end
+
+  # With no hints, a zygote is planned from the batch's first files
+  # (VCI_RAILS_ZYGOTE_SAMPLES of them, spread over the batch), which run from
+  # their bare slot and each note what it loaded; the zygote preloads what
+  # they loaded (here every file requires English), then runs the rest.
+  # A zygote forms only in a batch that leaves each slot at least 20 files
+  # after the samples (twice the slots, 16 at least): on vex-api, 100 files
+  # over 12 slots (about 6 a slot) used more CPU with zygotes than without.
+  def test_batch_zygote_forms_only_when_each_slot_keeps_enough_files
+    script = "puts \"MIN=\#{[100, 200, 263, 264, 908].map { |n| VciCollector::Batch::Zygote.min_samples(n).inspect }.join(\",\")}\"\n"
+    min = lambda do |slots|
+      out = probe_run(script, env: { "VCI_RAILS_SLOTS" => slots.to_s })
+      line = out.lines.find { |l| l.start_with?("MIN=") }
+      assert line, out
+      line.delete_prefix("MIN=").strip
+    end
+    assert_equal "nil,nil,nil,24,24", min.call(12)
+    assert_equal "nil,16,16,16,16", min.call(8)
+    assert_equal "16,16,16,16,16", min.call(2)
+  end
+
+  def test_batch_slot_zygote_learns_from_the_first_files
+    skip "no English.rb" unless File.file?(File.join(RbConfig::CONFIG["rubylibdir"], "English.rb"))
+    put("test/test_helper.rb", "require \"minitest\"\n")
+    ids = (1..8).map { |n| "test/f#{n}_test.rb" }
+    ids.each_with_index do |id, i|
+      put(id, "require \"test_helper\"\nrequire \"English\"\nclass F#{i}Test < Minitest::Test\n  def test_f = assert(true)\nend\n")
+    end
+    out = batch(ids, env: { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1", "VCI_RAILS_ZYGOTE" => "gems",
+                            "VCI_RAILS_ZYGOTE_SAMPLES" => "2" })
+    z = out[:status].filter_map { |l| l["zygote"] }
+    refute_empty z, out[:said]
+    assert(z.all? { |x| x["samples"] >= 2 && x["gems"] >= 1 }, z.inspect)
+    assert_equal ids, out[:status].filter_map { |l| l["id"] if l["exit"] == 0 }.sort, out[:said]
+  end
+
   def test_batch_slots_follow_the_projects_parallelize_workers
     put("test/fake_rails.rb", RAILS_PARALLEL + <<~RUBY)
       module ActiveSupport
@@ -2650,6 +2724,292 @@ class CollectorTest < Minitest::Test
       out[id] = out[:lines][id].map { |l| JSON.parse(l) }
     end
     out
+  end
+
+  # A batch script whose loader runs inside Minitest.run, as Rails' does
+  # (its Minitest plugin collects the file arguments and loads them when
+  # the options are parsed): a worker runs each of its files with
+  # Minitest.run of that file.
+  RAILS_LIKE_SCRIPT = <<~RUBY
+    require "minitest/autorun"
+    $LOAD_PATH << "test"
+    require_relative "loader/rails/test_unit/runner"
+    module FakeRailsPlugin
+      def self.minitest_plugin_options(opts, options)
+        opts.on(/^[^-]/) { |f| (options[:test_files] ||= []) << f }
+        opts.on { FakeRunner.load_tests(options.fetch(:test_files, [])) }
+      end
+    end
+    Minitest.register_plugin(FakeRailsPlugin)
+  RUBY
+
+  # A helper for worker tests: Rails' parallel hooks, an executor, slots.
+  def worker_helper(extra = "")
+    put("test/test_helper.rb", RAILS_PARALLEL + <<~RUBY + extra)
+      Minitest.parallel_executor = ActiveSupport::Testing::ParallelizeExecutor.new(size: 1, with: :processes)
+    RUBY
+  end
+
+  def worker_test(name, body = "assert true", top: "")
+    put("test/#{name}_test.rb", <<~RUBY)
+      require "test_helper"
+      #{top}
+      class #{name.capitalize}Test < Minitest::Test
+        def test_#{name}
+          #{body}
+        end
+      end
+    RUBY
+  end
+
+  def workers(ids, k, env: {})
+    batch(ids, script: RAILS_LIKE_SCRIPT,
+               env: { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_WORKER_FILES" => k.to_s }.merge(env))
+  end
+
+  # Workers (VCI_RAILS_WORKER_FILES = K): a slot runs up to K files, sorted,
+  # in one process. A later file sees what an earlier one left (its
+  # constant), and records everything the worker observed up to its end:
+  # the earlier files' sources and reads, then its own. Each file's tests
+  # are its own (one test each), its result and exit its own. A file of the
+  # next worker records none of it.
+  def test_batch_worker_files_record_what_earlier_files_observed
+    worker_helper
+    put("test/data/a.txt", "a")
+    put("test/data/b.txt", "b")
+    put("test/data/d.txt", "d")
+    worker_test("a", "assert_equal \"a\", File.read(\"test/data/a.txt\")", top: "QMARK = File.read(\"test/data/a.txt\")")
+    worker_test("b", "assert_equal \"a\", QMARK\n    assert_equal \"b\", File.read(\"test/data/b.txt\")")
+    worker_test("c", "assert defined?(QMARK)")
+    worker_test("d", "refute defined?(QMARK)\n    File.read(\"test/data/d.txt\")")
+    ids = %w[test/c_test.rb test/a_test.rb test/d_test.rb test/b_test.rb]
+    out = workers(ids, 3)
+    lines = out[:status].select { |l| l["id"] }
+    assert_equal({ "done" => true }, out[:status].last, out[:said])
+    assert_equal({ "test/a_test.rb" => 0, "test/b_test.rb" => 0, "test/c_test.rb" => 0, "test/d_test.rb" => 0 },
+                 lines.to_h { |l| [l["id"], l["exit"]] }, out[:said])
+    assert_equal({ "test/a_test.rb" => ["test/a_test.rb", 0], "test/b_test.rb" => ["test/a_test.rb", 1],
+                   "test/c_test.rb" => ["test/a_test.rb", 2] },
+                 lines.select { |l| l["worker"] }.to_h { |l| [l["id"], l["worker"]] }, out[:said])
+    a, b, c, d = out.values_at(*%w[test/a_test.rb test/b_test.rb test/c_test.rb test/d_test.rb])
+    assert_equal %w[test/data/a.txt], paths(a, "read").sort
+    assert_equal %w[test/data/a.txt test/data/b.txt], paths(b, "read").sort
+    assert_equal %w[test/data/a.txt test/data/b.txt], paths(c, "read").sort
+    assert_equal %w[test/data/d.txt], paths(d, "read").sort
+    assert_includes paths(b, "module"), "test/a_test.rb"
+    assert_includes paths(c, "module"), "test/a_test.rb"
+    assert_includes paths(c, "module"), "test/b_test.rb"
+    refute_includes paths(a, "module"), "test/b_test.rb"
+    refute_includes paths(d, "module"), "test/a_test.rb"
+    [a, b, c, d].each do |r|
+      assert_equal({ "state" => "passed", "tests" => 1, "failed" => 0 }, r.last.slice("state", "tests", "failed"))
+      assert_empty taints(r)
+    end
+  end
+
+  # A worker's first file writes what its own process writes with K = 1
+  # (line for line, but the meta and result lines' timings), and K = 1 is
+  # the engine without workers: the same lines for every file, and no
+  # `worker` in files.jsonl.
+  def test_batch_worker_first_file_and_k1_are_the_one_process_per_file_output
+    worker_helper
+    put("test/data/a.txt", "a")
+    worker_test("a", "File.read(\"test/data/a.txt\")")
+    worker_test("b", "assert true")
+    worker_test("c", "assert true")
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb]
+    norm = ->(recs) { recs.reject { |r| %w[meta result].include?(r["kind"]) }.map(&:to_s).sort }
+    base = batch(ids, script: RAILS_LIKE_SCRIPT, env: { "VCI_RAILS_SLOTS" => "2" })
+    one = workers(ids, 1)
+    assert(one[:status].none? { |l| l.key?("worker") }, one[:said])
+    ids.each { |id| assert_equal norm.call(base[id]), norm.call(one[id]), id }
+    w = workers(ids, 2)
+    assert_equal ["test/a_test.rb", 0], w[:status].find { |l| l["id"] == "test/a_test.rb" }["worker"], w[:said]
+    assert_equal norm.call(base["test/a_test.rb"]), norm.call(w["test/a_test.rb"])
+    # b ran after a in its worker: a's records are b's too.
+    assert_includes paths(w["test/b_test.rb"], "read"), "test/data/a.txt"
+    refute_includes paths(base["test/b_test.rb"], "read"), "test/data/a.txt"
+  end
+
+  # A taint in a file of a worker (a child process) is in the output of
+  # every later file of that worker: what the child did is unseen, and it
+  # may have left what they depend on.
+  # Zygotes and workers together (2.12.0): a slot's zygote preloads first
+  # (here from hints, at once: English.rb), then forks the slot's workers;
+  # each worker's files find what the zygote loaded, a later file records
+  # what an earlier one of its worker read, and each file's line says its
+  # worker and its CPU. Learnt instead of hinted, the zygote is planned from
+  # the loads the first workers' files noted (each file's own, from its
+  # output process), and every file still passes.
+  def test_batch_zygote_forks_workers
+    english = File.join(RbConfig::CONFIG["rubylibdir"], "English.rb")
+    skip "no English.rb" unless File.file?(english)
+    worker_helper
+    put("test/data/a.txt", "a")
+    worker_test("a", "assert $LOADED_FEATURES.any? { |f| f.end_with?(\"/English.rb\") }\n    File.read(\"test/data/a.txt\")")
+    %w[b c d e f].each { |n| worker_test(n, "assert $LOADED_FEATURES.any? { |f| f.end_with?(\"/English.rb\") }") }
+    ids = %w[a b c d e f].map { |n| "test/#{n}_test.rb" }
+    hints = File.join(@tmp, "hints.txt")
+    File.write(hints, "#{english}\n")
+    out = workers(ids, 3, env: { "VCI_RAILS_SLOTS_ASKED" => "1", "VCI_RAILS_ZYGOTE" => "gems",
+                                 "VCI_RAILS_ZYGOTE_HINTS" => hints })
+    z = out[:status].filter_map { |l| l["zygote"] }
+    assert_equal 2, z.size, out[:said]
+    assert(z.all? { |x| x["gems"] == 1 && !x.key?("failed") }, z.inspect)
+    lines = out[:status].select { |l| l["id"] }
+    assert_equal ids, lines.filter_map { |l| l["id"] if l["exit"] == 0 }.sort, out[:said]
+    assert(lines.all? { |l| l["worker"].is_a?(Array) && l["cpu"].is_a?(Array) }, lines.inspect)
+    assert_equal %w[test/data/a.txt], paths(out["test/b_test.rb"], "read").sort
+    assert_empty paths(out["test/d_test.rb"], "read")
+
+    # Learnt: every file requires English itself; two files' loads plan it.
+    ids = (1..8).map { |n| "test/f#{n}_test.rb" }
+    ids.each_with_index do |id, i|
+      put(id, "require \"test_helper\"\nrequire \"English\"\nclass F#{i}Test < Minitest::Test\n  def test_f = assert(true)\nend\n")
+    end
+    out = workers(ids, 2, env: { "VCI_RAILS_SLOTS_ASKED" => "1", "VCI_RAILS_ZYGOTE" => "gems",
+                                 "VCI_RAILS_ZYGOTE_SAMPLES" => "2" })
+    z = out[:status].filter_map { |l| l["zygote"] }
+    refute_empty z, out[:said]
+    assert(z.all? { |x| x["samples"].to_i >= 2 && x["gems"].to_i >= 1 }, z.inspect)
+    assert_equal ids, out[:status].filter_map { |l| l["id"] if l["exit"] == 0 }.sort, out[:said]
+    # Only a worker's first file notes its loads (a later one's understate
+    # what a file loads on its own).
+    firsts = out[:status].filter_map { |l| l["id"] if l["worker"] && l["worker"][1].zero? }
+    noted = Dir[File.join(@out, "batch", "loads-*.txt")].sum { |f| File.read(f).count("\n") }
+    assert_operator noted, :>=, 2
+    assert_operator noted, :<=, firsts.size, out[:status].inspect
+    # Without a zygote (more samples asked than the batch has), every
+    # worker's first file notes, and no other file.
+    out = workers(ids, 2, env: { "VCI_RAILS_SLOTS_ASKED" => "1", "VCI_RAILS_ZYGOTE" => "gems",
+                                 "VCI_RAILS_ZYGOTE_SAMPLES" => "100" })
+    assert_empty out[:status].filter_map { |l| l["zygote"] }, out[:said]
+    noted = Dir[File.join(@out, "batch", "loads-*.txt")].sum { |f| File.read(f).count("\n") }
+    assert_equal 4, noted, out[:status].inspect
+  end
+
+  def test_batch_worker_taint_reaches_later_files
+    worker_helper
+    worker_test("a")
+    worker_test("b", "assert system(\"true\")")
+    worker_test("c")
+    worker_test("d")
+    out = workers(%w[test/a_test.rb test/b_test.rb test/c_test.rb test/d_test.rb], 3)
+    a, b, c, d = out.values_at(*%w[test/a_test.rb test/b_test.rb test/c_test.rb test/d_test.rb])
+    assert_empty taints(a), out[:said]
+    assert_includes taints(b), "process:system"
+    assert_includes taints(c), "process:system"
+    assert_empty taints(d)
+  end
+
+  # A file that fails ends its worker: the files after it run in a fresh
+  # worker (they record nothing of the failed file); the failed file's line
+  # says its place, and vci runs it again on its own. A file whose worker
+  # dies while it runs has no result (it runs on its own); the files after
+  # it run in a fresh worker too.
+  def test_batch_worker_stops_after_a_failed_or_crashed_file
+    worker_helper
+    put("test/data/b.txt", "b")
+    worker_test("a")
+    worker_test("b", "File.read(\"test/data/b.txt\")\n    assert false, \"b fails\"")
+    worker_test("c")
+    worker_test("d")
+    worker_test("e")
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb test/d_test.rb test/e_test.rb]
+    out = workers(ids, 4)
+    lines = out[:status].select { |l| l["id"] }
+    assert_equal({ "done" => true }, out[:status].last, out[:said])
+    assert_equal({ "test/a_test.rb" => 0, "test/b_test.rb" => 1, "test/c_test.rb" => 0, "test/d_test.rb" => 0,
+                   "test/e_test.rb" => 0 }, lines.to_h { |l| [l["id"], l["exit"]] }, out[:said])
+    assert_equal ["test/a_test.rb", 1], lines.find { |l| l["id"] == "test/b_test.rb" }["worker"]
+    # c and d: a fresh worker from c's place.
+    assert_equal ["test/c_test.rb", 2], lines.find { |l| l["id"] == "test/c_test.rb" }["worker"], out[:said]
+    assert_equal ["test/c_test.rb", 3], lines.find { |l| l["id"] == "test/d_test.rb" }["worker"]
+    %w[test/c_test.rb test/d_test.rb].each do |id|
+      refute_includes paths(out[id], "read"), "test/data/b.txt", id
+      refute_includes paths(out[id], "module"), "test/b_test.rb", id
+    end
+    assert_equal "failed", out["test/b_test.rb"].last["state"]
+
+    worker_test("b", "Process.kill(:KILL, Process.pid)")
+    out = workers(ids, 4)
+    lines = out[:status].select { |l| l["id"] }
+    assert_equal({ "done" => true }, out[:status].last, out[:said])
+    b = lines.select { |l| l["id"] == "test/b_test.rb" }
+    assert_equal 1, b.size, out[:said]
+    assert_match(/worker process of slot \d that ran it ended \(signal 9\).*runs on its own/, b[0]["why"])
+    assert_nil out["test/b_test.rb"]
+    assert_equal ["test/c_test.rb", 2], lines.find { |l| l["id"] == "test/c_test.rb" }["worker"], out[:said]
+    assert_equal 0, lines.find { |l| l["id"] == "test/d_test.rb" }["exit"]
+    refute_includes paths(out["test/d_test.rb"], "module"), "test/b_test.rb"
+  end
+
+  # A worker runs a file only as a one-file run would run its tests: a file
+  # that reopens a test class an earlier file of the worker defined (its
+  # one-file run runs only its own methods of it), a file an earlier file
+  # already loaded, and a file that requires a file of the batch an earlier
+  # one loaded each go to a fresh worker, where they come first.
+  def test_batch_worker_gives_back_what_it_cannot_run_as_a_one_file_run
+    worker_helper
+    worker_test("a")
+    put("test/b_test.rb", <<~RUBY)
+      require "test_helper"
+      class ATest < Minitest::Test
+        def test_b = assert(true)
+      end
+    RUBY
+    worker_test("c")
+    worker_test("d")
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb test/d_test.rb]
+    out = workers(ids, 3)
+    lines = out[:status].select { |l| l["id"] }
+    assert_equal ["test/b_test.rb", 1], lines.find { |l| l["id"] == "test/b_test.rb" }["worker"], out[:said]
+    assert_equal ["test/b_test.rb", 2], lines.find { |l| l["id"] == "test/c_test.rb" }["worker"], out[:said]
+    assert_equal 1, out["test/b_test.rb"].last["tests"]
+    refute_includes paths(out["test/b_test.rb"], "module"), "test/a_test.rb"
+    ids.each { |id| assert_equal "passed", out[id].last["state"], id }
+
+    # a requires c (a file of the batch): c's tests ran with a, c comes
+    # first in a fresh worker. b requires a, which a loaded: b too.
+    worker_test("a", "assert true", top: "require_relative \"c_test\"")
+    worker_test("b", "assert true", top: "require_relative \"a_test\"")
+    out = workers(ids, 3)
+    lines = out[:status].select { |l| l["id"] }
+    assert_equal({ "done" => true }, out[:status].last, out[:said])
+    assert_equal 2, out["test/a_test.rb"].last["tests"], out[:said]
+    assert_equal ["test/b_test.rb", 1], lines.find { |l| l["id"] == "test/b_test.rb" }["worker"], out[:said]
+    assert_equal ["test/c_test.rb", 2], lines.find { |l| l["id"] == "test/c_test.rb" }["worker"], out[:said]
+    assert_equal 1, out["test/c_test.rb"].last["tests"]
+    assert_equal 3, out["test/b_test.rb"].last["tests"]
+    ids.each { |id| assert_equal "passed", out[id].last["state"], id }
+  end
+
+  # VCI_RAILS_FILE_TIMEOUT holds for each file of a worker, from when the
+  # file before it ended: three files of 2.5 s each run in a worker under a
+  # 6 s limit; a file that sleeps past it stops its worker, has no result
+  # (timed out), and the file after it runs in a fresh worker.
+  def test_batch_worker_file_timeout_is_each_files
+    worker_helper
+    %w[a b c].each { |n| worker_test(n, "sleep 2.5") }
+    worker_test("d", "sleep 60")
+    worker_test("e")
+    worker_test("f")
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb test/d_test.rb test/e_test.rb test/f_test.rb]
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    out = workers(ids, 5, env: { "VCI_RAILS_FILE_TIMEOUT" => "6" })
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 55
+    lines = out[:status].select { |l| l["id"] }
+    assert_equal({ "done" => true }, out[:status].last, out[:said])
+    %w[test/a_test.rb test/b_test.rb test/c_test.rb].each do |id|
+      line = lines.find { |l| l["id"] == id }
+      assert_equal "test/a_test.rb", line&.dig("worker", 0), out[:status].inspect
+      assert_equal 0, line["exit"], out[:said]
+    end
+    d = lines.find { |l| l["id"] == "test/d_test.rb" }
+    assert_equal 6, d["timed_out"], out[:status].inspect + out[:said].to_s
+    assert_nil out["test/d_test.rb"]
+    assert_equal ["test/e_test.rb", 4], lines.find { |l| l["id"] == "test/e_test.rb" }["worker"], out[:said]
+    assert_equal 0, lines.find { |l| l["id"] == "test/e_test.rb" }["exit"], out[:said]
   end
 
   # A batch file's output lines as vci reads them (rails.rs, read_batch):

@@ -142,6 +142,16 @@ module VciCollector
     {}.freeze
   end
   SLOTS_ASKED = ENV["VCI_RAILS_SLOTS_ASKED"] == "1"
+  # Batch mode, Minitest, slots (2.12.0): how many test files one process
+  # of a slot runs one after the other, a worker (VCI_RAILS_WORKER_FILES,
+  # set by vci from the project's `rails_worker_files`; 1, the default: one
+  # process per file, as before). Each file's output holds everything its
+  # worker observed from its fork to the end of that file, the earlier
+  # files of the worker included (Batch.run_worker).
+  WORKER_FILES = [Integer(ENV.fetch("VCI_RAILS_WORKER_FILES", "1"), exception: false) || 1, 1].max
+  # The process's arguments as it started (`bin/rails test <files> --seed
+  # 0`): a worker runs each of its files with the same seed.
+  ARGV_AT_START = ARGV.dup.freeze
   # policy.rails_autoload_lookups (2.6.0, set by vci): a directory Zeitwerk
   # lists to define autoloads is recorded as an autoload directory (its
   # listing is not an input), and the constant names looked up without
@@ -156,7 +166,8 @@ module VciCollector
   # slots fork (every file then records them as inputs: a measurement, not
   # a mode to attest with); "routes" draws the routes only; "warmup" calls
   # Process.warmup in each slot once it is set up, before its first file's
-  # process forks.
+  # process forks; "nomajor" (2.12.0) turns off the garbage collector's full
+  # marks in each file's process (GC.config).
   # Batch mode: what a group's process loads after its boot, before its
   # files' processes fork, so that each of them does not load it on its own
   # (VCI_RAILS_PRELOAD, set by vci, a comma-separated list; 2.11.0):
@@ -207,7 +218,17 @@ module VciCollector
         if defined?(::Rails::Application::RoutesReloader) && !::Rails::Application::RoutesReloader.ancestors.include?(Routes)
           ::Rails::Application::RoutesReloader.prepend(Routes)
         end
+        n0 = VciCollector.records.size
         ::Kernel.at_exit do
+          # A worker's process (Batch.run_worker) started a profile per
+          # file: each file's own process prints its own.
+          next unless VciCollector.test_id == id
+          if (dir = ENV["VCI_RAILS_PROFILE_LOADS"]) && !dir.empty?
+            VciCollector.quiet do
+              mods = VciCollector.records.keys.drop(n0).filter_map { |(k, p)| p if k == :module && p.is_a?(String) }
+              File.write(File.join(dir, "#{id.tr("/", "_")}.txt"), mods.join("\n"))
+            end
+          end
           ms = ->(ns) { (ns / 1_000_000.0).round(1) }
           now = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
           $stdout.puts "vci-profile id=#{id} proc_ms=#{ms.call(now - started)} req_ms=#{ms.call(req_ns)} nreq=#{nreq} " \
@@ -338,6 +359,12 @@ module VciCollector
   # the fork (Output.lines_of's `base`), instead of all of its lines, split
   # afterwards (VCI_RAILS_OWN_OUTPUT=0: as before).
   OWN_OUTPUT = ENV["VCI_RAILS_OWN_OUTPUT"] != "0"
+  # Batch mode (2.12.0): what a slot's zygote preloads (Batch::Zygote;
+  # VCI_RAILS_ZYGOTE, set by vci from the project's `rails_zygote`): "gems"
+  # the gem files many of the batch's files loaded, "common" those and the
+  # application files almost every one of them loaded, "off" none (each
+  # file's process forks from its slot, as before).
+  ZYGOTE = %w[gems common].include?(ENV["VCI_RAILS_ZYGOTE"].to_s) ? ENV["VCI_RAILS_ZYGOTE"].to_s.dup.freeze : nil
   # The fresh temp dir vci gave this process (TMPDIR), read once here: a test
   # that later sets ENV["TMPDIR"] (to "/tmp", HOME, "/") changes where its
   # own temp files go, never which reads the collector treats as vci's
@@ -1149,11 +1176,201 @@ module VciCollector
       end
     end
 
+    # A slot's zygote (2.12.0, ZYGOTE): a process the slot forks once its
+    # files have shown what they load, which loads first what many of them
+    # loaded on their own and then runs the slot's remaining files, each
+    # forked from it instead of from the slot. Everything it loads is
+    # recorded in it before any file's process forks from it, as the boot's
+    # own loads are, so it is an input of each of those files: a superset of
+    # what each file would have recorded (the files learnt from are hints;
+    # whatever is preloaded is recorded, whoever suggested it). What it
+    # preloads:
+    # - gem files (of the bundle, under a gem root) and Ruby's own library
+    #   files that at least GEM_SHARE of the files sampled loaded. They cost
+    #   no precision: a gem is recorded by name and version, and the
+    #   toolchain already records the whole bundle and Ruby's version, so a
+    #   change to any of them already runs every file again;
+    # - with "common", also the application's files (autoloaded by Rails'
+    #   Zeitwerk loaders, outside the test directory) that at least
+    #   APP_SHARE of the files sampled loaded: each becomes an input of every
+    #   later file of the slot, a file that did not load it runs again when
+    #   it changes.
+    # The samples are the module loads of the batch's first files, each run
+    # from its bare slot (loads-<group>-<slot>.txt in $VCI_OUT/batch, by
+    # the pid of the group's process: groups running at once boot
+    # differently and learn apart): a zygote
+    # forms once there are at least min_samples of them, or at once from
+    # VCI_RAILS_ZYGOTE_HINTS (a file of paths, one a line: a diagnostic
+    # switch). A preload that raises, or takes longer than a minute, ends
+    # the zygote before it takes any file, and the slot runs its files as
+    # before.
+    module Zygote
+      GEM_SHARE = 0.1
+      APP_SHARE = 0.9
+      # Seconds a zygote's preload may take.
+      WAIT = 60
+      HINTS = ENV["VCI_RAILS_ZYGOTE_HINTS"].to_s.dup.freeze
+      SAMPLES = ENV["VCI_RAILS_ZYGOTE_SAMPLES"].to_s.dup.freeze
+
+      module_function
+
+      def on?
+        !ZYGOTE.nil? && !OUT.nil? && Batch.on?
+      end
+
+      # Files each slot must still have to run after the samples for a
+      # zygote to form: its preload and its own garbage collection cost 0.7
+      # to 1.7 s a slot on vex-api, which about 6 files a slot did not repay
+      # (100 files over 12 slots used 4% more CPU than no zygote) and 13 to
+      # 16 repaid with nothing to spare (200 files: the same CPU).
+      FILES_PER_SLOT = 20
+
+      # How many files' loads a zygote is planned from: twice the slots, at
+      # least 16 (VCI_RAILS_ZYGOTE_SAMPLES: that many, a diagnostic switch),
+      # in a batch that leaves each slot FILES_PER_SLOT files after them (a
+      # smaller batch gets no zygote; with the switch, fewer than the work).
+      def min_samples(work)
+        asked = SAMPLES.to_i
+        return (asked < work ? asked : nil) if asked.positive?
+        n = [2 * SLOTS, 16].max
+        work - n >= FILES_PER_SLOT * SLOTS ? n : nil
+      end
+
+      # The first `need` pieces of `work` spread over it (each the next of
+      # `need` equal stretches), then the rest in order: the files sampled
+      # are not all of one directory.
+      def spread(work, need)
+        return work if need.nil? || need >= work.size
+        picks = (0...need).map { |j| (j * work.size) / need }.uniq
+        taken = picks.to_h { |j| [j, true] }
+        picks.map { |j| work[j] } + work.each_index.reject { |j| taken[j] }.map { |j| work[j] }
+      end
+
+      def dir
+        File.join(OUT.to_s, "batch")
+      end
+
+      # In a file's process run from its bare slot, at exit: the Ruby files
+      # it loaded itself (after the fork), in the order it loaded them.
+      #
+      # In a worker (rails_worker_files), only its first file notes: a later
+      # file of the worker does not load again what an earlier one loaded,
+      # so its loads would understate what a file loads on its own (and
+      # with it the share of files that load an application file).
+      def note!(from)
+        return unless on? && Batch.target && !Batch.zygote? && !Batch.slot.nil? && from
+        return if Batch.worker_later_file?
+        VciCollector.quiet do
+          mods = []
+          VciCollector.records.each_key.with_index do |(k, p), j|
+            next unless j >= from && k == :module && p.is_a?(String) && p.end_with?(".rb")
+            mods << p unless p.include?("\t") || p.include?("\n")
+          end
+          File.open(File.join(dir, "loads-#{Batch.group_pid}-#{Batch.slot}.txt"), "a") do |f|
+            f.write("#{mods.join("\t")}\n")
+          end
+        end
+      rescue StandardError
+        nil
+      end
+
+      # The samples so far ([[path, ...], ...]), or nil when there are not
+      # enough yet.
+      def samples(need)
+        VciCollector.quiet do
+          mine = "loads-#{Batch.group_pid}-"
+          files = Dir.children(dir).select { |n| n.start_with?(mine) && n.end_with?(".txt") }
+          texts = files.sort.map { |n| File.read(File.join(dir, n)) }
+          return nil if texts.sum { |t| t.count("\n") } < need
+          texts.flat_map { |t| t.split("\n").map { |l| l.split("\t") } }
+        end
+      rescue StandardError
+        nil
+      end
+
+      # The hints of VCI_RAILS_ZYGOTE_HINTS as one sample, or nil.
+      def hinted
+        return nil if HINTS.empty?
+        [VciCollector.quiet { File.read(HINTS).split("\n").map(&:strip).reject(&:empty?) }]
+      rescue StandardError
+        nil
+      end
+
+      # What to preload from `samples`: [[path, cpath or nil, :gem | :app]],
+      # in the order the files first loaded them (a file loaded by a file
+      # loaded before it comes after it).
+      def plan(samples)
+        n = samples.size
+        count = Hash.new(0)
+        samples.each { |s| s.uniq.each { |p| count[p] += 1 } }
+        loaders = autoloaders
+        test_dirs = %w[test spec].map { |d| File.join(VciCollector.root.to_s, d) }
+        out = []
+        count.each do |p, c|
+          next unless p.is_a?(String) && p.end_with?(".rb") && p.start_with?("/")
+          next if test_dirs.any? { |d| VciCollector.inside?(p, d) } || Batch.id_of(p)
+          kind = VciCollector.quiet { free?(p) } ? :gem : :app
+          share = kind == :gem ? GEM_SHARE : APP_SHARE
+          next if kind == :app && ZYGOTE != "common"
+          next unless c >= 2 || n == 1
+          next unless c >= share * n
+          cpath = VciCollector.quiet { cpath_of(p, loaders) }
+          next if kind == :app && (cpath.nil? || !VciCollector.inside?(p, VciCollector.repo))
+          out << [p, cpath, kind]
+        end
+        out
+      end
+
+      # A gem's file (of the bundle, under a gem root) or Ruby's own.
+      def free?(p)
+        return true if Gems.under_root?(p) && Gems.spec_for(p)
+        lib = RbConfig::CONFIG["rubylibdir"].to_s
+        !lib.empty? && VciCollector.inside?(p, lib)
+      rescue StandardError
+        false
+      end
+
+      def autoloaders
+        return [] unless defined?(::Rails) && ::Rails.respond_to?(:autoloaders)
+        ::Rails.autoloaders.to_a.select { |l| l.respond_to?(:cpath_expected_at) }
+      rescue StandardError
+        []
+      end
+
+      # The constant path Rails' loaders expect `p` to define, or nil (not
+      # theirs).
+      def cpath_of(p, loaders)
+        loaders.each do |l|
+          c = begin
+            l.cpath_expected_at(p)
+          rescue StandardError
+            nil
+          end
+          return c if c.is_a?(String) && !c.empty?
+        end
+        nil
+      end
+
+      # Load each planned file as the files loaded it: a constant Rails'
+      # loaders define by autoloading it, any other file by requiring it.
+      # Raises what a load raises.
+      def preload!(plan)
+        plan.each do |p, cpath, _|
+          if cpath
+            Object.const_get(cpath)
+          else
+            require p
+          end
+        end
+      end
+    end
+
     @target = nil
     @own_fork = false
     @slot = nil
     @slot_tmp = nil
     @shard = nil
+    @zygote = false
 
     class << self
       # The test id this process runs (a file's process), or nil.
@@ -1169,6 +1386,16 @@ module VciCollector
       def slot_setup?
         @slot_setup == true
       end
+
+      # Whether this process is a slot's zygote, or a file's process forked
+      # from one.
+      def zygote?
+        @zygote == true
+      end
+
+      # How many records this file's process had when it forked; the pid of
+      # the group's process its slots forked from (run_slots).
+      attr_reader :forked_at, :group_pid
 
       def on?
         !BATCH_IDS.nil?
@@ -1230,7 +1457,11 @@ module VciCollector
         p = VciCollector.pathify(path)
         return :load unless p.is_a?(String) && names.key?(VciCollector.quiet { Real.basename(p, ".rb") })
         id = id_of(p)
-        return :load if @preloading || !(id && loader_call?)
+        return :load if @preloading
+        unless id && loader_call?
+          worker_required(id) if id && @worker
+          return :load
+        end
         drive! if @target.nil?
         id == @target ? :load : :skip
       end
@@ -1398,6 +1629,10 @@ module VciCollector
       # 3 to 5 shards each, ran its 20 pieces on 8 slots).
       def slots_for(files, boot)
         work = files.sum { |f| RUNNER == "rspec" ? 1 : [SHARDS[f].to_i, 1].max }
+        if worker_files?
+          singles = files.count { |f| SHARDS[f].to_i < 2 }
+          work = work - singles + singles.fdiv(WORKER_FILES).ceil
+        end
         w = [SLOTS, work].min
         return 1 if w < 2 || boot.nil?
         return w if SLOTS_ASKED
@@ -1484,8 +1719,11 @@ module VciCollector
           k = RUNNER == "rspec" ? 0 : SHARDS[f].to_i
           k > 1 ? (0...k).map { |sh| [f, sh, k] } : [[f, nil, nil]]
         end
+        work = worker_work(work)
+        work = Zygote.spread(work, Zygote.min_samples(work.size)) if Zygote.on?
         # Every slot's lines say when they were written, from here (ms).
         @batch_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        @group_pid = Process.pid
         status(boot_ms: ((@batch_started - VciCollector::LOADED_AT) * 1000).round)
         spawned = VciCollector.quiet { ENV["VCI_BATCH_SPAWNED_MS"] }.to_s
         if spawned.match?(/\A\d+\z/)
@@ -1598,29 +1836,59 @@ module VciCollector
         share!(write: true)
         collect_garbage!(slot: i)
         first = 0
-        nxt = i
-        while nxt && nxt < files.size
-          f, sh, k = files[nxt]
+        nxt = [i, 0]
+        need = Zygote.on? ? Zygote.min_samples(files.size) : nil
+        while nxt && nxt[0] < files.size
+          if Zygote.on? && !@zygote && !@zygote_tried && (plan = zygote_plan(need))
+            @zygote_tried = true
+            z = zygote!(i, plan)
+            if z.is_a?(Process::Status)
+              # The zygote ran the slot's remaining files and its cleanup.
+              if z.signaled?
+                status(slot: i, why: "slot #{i}'s zygote ended (signal #{z.termsig})")
+              end
+              flush
+              Process.exit!(first.nonzero? || z.exitstatus || 1)
+            end
+          end
+          idx, off = nxt
+          f, sh, k = files[idx]
           before = tmp_entries(@slot_tmp)
           disconnect
           started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          pid = fork_own
-          if pid.nil?
-            if k
-              @shard = [sh, k]
-              shard_methods!
+          if f.is_a?(Array)
+            # A worker: several files in one process (run_worker).
+            chunk = f[off..] || []
+            progress = File.join(OUT.to_s, "batch", "worker-#{i}-#{idx}-#{off}")
+            pid = fork_own
+            run_worker(chunk, progress, idx, off) if pid.nil?
+            watch = watch_worker(pid, chunk, progress, off)
+            _, st = Process.wait2(pid)
+            watch&.dig(:thread)&.kill
+            first = 1 if first.zero? && !st.success?
+            worker_ended(st, chunk, progress, idx, off, queue, files.size, watch&.dig(:fired))
+          else
+            pid = fork_own
+            if pid.nil?
+              if k
+                @shard = [sh, k]
+                shard_methods!
+              end
+              return f
             end
-            return f
+            watch = watch_file(pid, f)
+            c0 = Process.times
+            _, st = Process.wait2(pid)
+            c1 = Process.times
+            watch&.dig(:thread)&.kill
+            line = { id: f, exit: st.exitstatus, slot: i,
+                     ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round, at: batch_at,
+                     cpu: [((c1.cutime - c0.cutime) * 1000).round, ((c1.cstime - c0.cstime) * 1000).round] }
+            line[:timed_out] = FILE_TIMEOUT if watch&.dig(:fired)
+            line[:shard] = [sh, k] if k
+            status(line)
+            first = st.exitstatus || 1 if first.zero? && !st.success?
           end
-          watch = watch_file(pid, f)
-          _, st = Process.wait2(pid)
-          watch&.dig(:thread)&.kill
-          line = { id: f, exit: st.exitstatus, slot: i,
-                   ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round, at: batch_at }
-          line[:timed_out] = FILE_TIMEOUT if watch&.dig(:fired)
-          line[:shard] = [sh, k] if k
-          status(line)
-          first = st.exitstatus || 1 if first.zero? && !st.success?
           changed = @slot_tmp ? tmp_cleanup(before, @slot_tmp) : []
           unless changed.empty?
             status(slot: i, why: "the process of #{f} changed #{changed.first(3).join(", ")} in slot #{i}'s temp " \
@@ -1674,6 +1942,332 @@ module VciCollector
         state
       end
 
+      # watch_file for a worker running `chunk` (from place `off`): the limit
+      # is each file's, from when the file before it said its result in the
+      # worker's progress file (worker_progress), so that a worker of K files
+      # is stopped as soon as one of them runs past FILE_TIMEOUT, as that
+      # file's own process would be. Nil without a limit.
+      def watch_worker(pid, chunk, progress, off)
+        return nil unless FILE_TIMEOUT.positive?
+
+        state = { fired: false }
+        slot = @slot
+        state[:thread] = Thread.new do
+          seen = -1
+          since = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          warned = false
+          loop do
+            sleep 1
+            size = VciCollector.quiet { Real.exist?(progress) ? Real.stat(progress).size : 0 }
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            if size != seen
+              seen = size
+              since = now
+              warned = false
+              next
+            end
+            done = VciCollector.quiet do
+              Real.exist?(progress) ? File.read(progress).scan(/^done (\d+)$/).map { |(d)| d.to_i }.max : nil
+            end
+            f = chunk[(done.nil? ? off : done + 1) - off] || chunk.last
+            if !warned && now - since >= [120, FILE_TIMEOUT].min && FILE_TIMEOUT > 120
+              warned = true
+              $stderr.puts "vci_collector: #{f} still running after 120s (slot #{slot}, in a worker)"
+            end
+            next if now - since < FILE_TIMEOUT
+
+            state[:fired] = true
+            $stderr.puts "vci_collector: #{f} ran past #{FILE_TIMEOUT}s (VCI_RAILS_FILE_TIMEOUT) in slot #{slot}; " \
+                         "stopping its worker"
+            begin
+              Process.kill("TERM", pid)
+              sleep 10
+              Process.kill("KILL", pid)
+            rescue Errno::ESRCH
+              nil
+            end
+            break
+          end
+        end
+        state
+      end
+
+      # --- workers (2.12.0) ---------------------------------------------------
+      #
+      # With WORKER_FILES = K > 1 (`rails_worker_files`, Minitest, slots), a
+      # slot runs up to K files in one process, a worker, one after the
+      # other, as a Rails parallel worker runs many: what one file loaded
+      # (the application's classes Zeitwerk autoloads, gems required lazily)
+      # is loaded once for the worker, not once per file.
+      #
+      # What makes it sound: a file's output is written by a process forked
+      # from the worker at the end of that file's tests (finish_worker_file!),
+      # so it holds everything the worker recorded from its fork to that
+      # point: the boot's and slot's records, each earlier file of the worker
+      # (its source: it was required) and everything those files loaded,
+      # read, listed, looked up or were tainted by, then the file's own. A
+      # later file's result can depend on what an earlier one left behind
+      # (loaded constants, patches, memoized reads, global state); all of
+      # that came from what the earlier files observed, which are the later
+      # file's inputs too. The price is precision: a file runs again when
+      # anything an earlier file of its worker read changes.
+      #
+      # Each file runs as a one-file run's Minitest.run does: Minitest.run
+      # with the batch's seed and that file alone (srand again, fresh
+      # reporters, Rails' plugin loads the file through its loader), its
+      # tests being the boot's test classes and the classes its own load
+      # defined (WorkerSuites), in Minitest's order for that list. The
+      # worker stops, and gives the rest of its files back to the slots'
+      # queue for a fresh worker, when that would not hold: a file whose
+      # source an earlier file of the worker already loaded (its classes
+      # ran with that file), a file that requires a file of the batch an
+      # earlier file loaded, or that adds test methods to a test class an
+      # earlier file defined. It also stops after a file that failed (whose
+      # process exited non-zero): the files after it run in a fresh worker,
+      # never in a process a failure went through, and vci runs the failed
+      # file again on its own. A worker that ends any other way (a crash, a
+      # signal) gives no result for the file it was running (it runs on its
+      # own) and gives the rest back.
+      #
+      # Which files share a worker: the group's unsharded files, sorted by
+      # test id, cut into runs of K (sharded files run as before). The files
+      # before a file in its worker, in order, are in its line of
+      # files.jsonl (`worker`: [its worker's first file, its place]); what
+      # the plan compares is their content and everything they observed, as
+      # inputs of the file.
+
+      # Whether this process runs, or ends, a file of a worker that is not
+      # the worker's first (Zygote.note!).
+      def worker_later_file?
+        !@worker.nil? && @worker[:place].to_i.positive?
+      end
+
+      # Whether this batch runs workers.
+      def worker_files?
+        WORKER_FILES > 1 && RUNNER == "minitest"
+      end
+
+      # The slots' work with workers: sharded files' shards as before, then
+      # the other files, sorted, cut into runs of WORKER_FILES ([files, nil,
+      # nil]; a run of one file is that file).
+      def worker_work(work)
+        return work unless worker_files?
+        singles = work.select { |w| w[1].nil? }.map(&:first)
+        return work if singles.size < 2
+        work.reject { |w| w[1].nil? } +
+          singles.sort.each_slice(WORKER_FILES).map { |c| c.size == 1 ? [c[0], nil, nil] : [c, nil, nil] }
+      end
+
+      # Extends Minitest's singleton in a worker: run_all_suites runs the
+      # suites a one-file run of the current file runs (worker_suites).
+      module WorkerSuites
+        def run_all_suites(reporter, options)
+          keep = VciCollector::Batch.worker_suites
+          return super if keep.nil?
+          all = ::Minitest::Runnable.runnables
+          saved = all.dup
+          all.replace(keep)
+          begin
+            super
+          ensure
+            added = all - keep
+            all.replace(saved + added)
+          end
+        end
+      end
+
+      # In a worker, from a slot: runs `chunk` (files from place `off` of the
+      # slots' work item `idx`), writes each file's line, notes progress in
+      # the file `progress` for the slot (worker_ended), and exits. Never
+      # returns: each file's output is written by a process forked at its
+      # end (finish_worker_file!), which leaves through the at_exit handlers.
+      def run_worker(chunk, progress, idx, off)
+        @worker = { boot: {}, own: {}, mismatch: nil, args: worker_args,
+                    boot_features: $LOADED_FEATURES.size, file_features: $LOADED_FEATURES.size }
+        ::Minitest::Runnable.runnables.each { |r| @worker[:boot][r] = true }
+        ::Minitest.singleton_class.prepend(WorkerSuites) unless ::Minitest.singleton_class.include?(WorkerSuites)
+        failed = false
+        chunk.each_with_index do |f, j|
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          c0 = Process.times
+          @worker[:file_features] = $LOADED_FEATURES.size
+          if j.positive? && (loaded_by_worker?(f) || requires_worker_file?(f))
+            worker_progress(progress, "back #{off + j}")
+            break
+          end
+          @worker[:pre] = ::Minitest::Runnable.runnables.to_h { |r| [r, true] }
+          @worker[:mismatch] = nil
+          @worker[:place] = j
+          become(f)
+          arg = f.start_with?("-") ? "./#{f}" : f
+          res = catch(:vci_worker) { [:ran, ::Minitest.run(@worker[:args] + [arg])] }
+          if res == :mismatch
+            worker_progress(progress, "back #{off + j}")
+            break
+          end
+          code = res[1]
+          pid = fork_own
+          finish_worker_file!(code) if pid.nil?
+          _, st = Process.wait2(pid)
+          # The file's CPU: the worker's own while it ran the file, and its
+          # output process's (cpu, as a file's own process has it).
+          c1 = Process.times
+          cpu = [((c1.utime - c0.utime + c1.cutime - c0.cutime) * 1000).round,
+                 ((c1.stime - c0.stime + c1.cstime - c0.cstime) * 1000).round]
+          status(id: f, exit: st.exitstatus, slot: @slot,
+                 ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round, at: batch_at,
+                 worker: [chunk.first, off + j], cpu: cpu)
+          worker_progress(progress, "done #{off + j}")
+          unless st.success?
+            failed = true
+            worker_progress(progress, "back #{off + j + 1}") if j + 1 < chunk.size
+            break
+          end
+          ::Minitest::Runnable.runnables.each do |r|
+            @worker[:own][r] = own_tests(r) unless @worker[:boot].key?(r) || @worker[:pre].key?(r)
+          end
+        end
+        flush
+        Process.exit!(failed ? 1 : 0)
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        raise if @finisher
+        $stderr.puts "vci_collector: batch worker: #{e.class}: #{e.message}"
+        flush
+        Process.exit!(1)
+      end
+
+      # The arguments of a worker's Minitest.run besides the file: the seed
+      # the batch was started with (`--seed 0`).
+      def worker_args
+        a = ARGV_AT_START
+        i = a.index("--seed")
+        return ["--seed", a[i + 1].to_s] if i && a[i + 1]
+        s = a.find { |x| x.start_with?("--seed=") }
+        s ? [s] : []
+      end
+
+      # A test class's own test methods (what a file that reopens it adds).
+      def own_tests(r)
+        r.public_instance_methods(false).grep(/\Atest/).sort
+      rescue StandardError
+        []
+      end
+
+      # Whether test file `id`, or a feature of the same path, was loaded by
+      # an earlier file of this worker (not by the boot or the slot).
+      def loaded_by_worker?(id)
+        abs = VciCollector.quiet { Real.expand_path(id, VciCollector.root) }
+        real = VciCollector.real_of(abs)
+        lf = $LOADED_FEATURES
+        (@worker[:boot_features]...[@worker[:file_features], lf.size].min).any? do |i|
+          lf[i] == abs || lf[i] == real
+        end
+      rescue StandardError
+        true
+      end
+
+      # Whether test file `id`'s source names, in a `require` or
+      # `require_relative` of a string, a file of the batch (by its base
+      # name) that an earlier file of this worker loaded. A require_relative
+      # is not seen by the require hook (worker_required); this reads the
+      # source instead, and takes any file of the batch of that name.
+      def requires_worker_file?(id)
+        abs = VciCollector.quiet { Real.expand_path(id, VciCollector.root) }
+        src = VciCollector.quiet { Real.binread(abs) }.dup.force_encoding(Encoding::UTF_8).scrub
+        src.scan(/\brequire(?:_relative)?[\s(]*["']([^"'#]+)["']/).any? do |(name)|
+          base = VciCollector.quiet { Real.basename(name, ".rb") }
+          next false unless names.key?(base)
+          BATCH_IDS.any? do |other|
+            other != id && VciCollector.quiet { Real.basename(other, ".rb") } == base && loaded_by_worker?(other)
+          end
+        end
+      rescue StandardError
+        true
+      end
+
+      # In a worker: the current file requires `id`, a file of the batch,
+      # itself (not through the runner's loader). Loaded by an earlier file
+      # of the worker, its tests ran there, where a one-file run of the
+      # current file runs them: the worker stops (worker_suites).
+      def worker_required(id)
+        return if @worker.nil? || @finisher || id == @target
+        @worker[:mismatch] ||= id if loaded_by_worker?(id)
+      end
+
+      # In a worker's Minitest.run: the test classes to run, as a one-file
+      # run of the current file has them (the boot's, then those its load
+      # defined, in the order they were defined), or nil (not a worker).
+      # Throws :vci_worker, :mismatch when the worker cannot run the file as
+      # a one-file run does (run_worker).
+      def worker_suites
+        w = @worker
+        return nil if w.nil? || @finisher
+        throw :vci_worker, :mismatch if w[:mismatch]
+        w[:own].each { |r, tests| throw :vci_worker, :mismatch if own_tests(r) != tests }
+        pre = w[:pre]
+        boot = w[:boot]
+        ::Minitest::Runnable.runnables.select { |r| boot.key?(r) || !pre.key?(r) }
+      end
+
+      # Append `line` to a worker's progress file (worker_ended reads it).
+      def worker_progress(path, line)
+        VciCollector.quiet { File.open(path, "a") { |f| f.write("#{line}\n") } }
+      rescue StandardError
+        nil
+      end
+
+      # In the process forked from a worker at the end of a file's tests:
+      # end as that file's one-file run ends (Minitest's after_run hooks,
+      # then exit with Minitest's result, through the at_exit handlers,
+      # the collector's last: it writes the file's output). The worker's
+      # database connections are left to it (discarded here, not closed).
+      def finish_worker_file!(code)
+        @finisher = true
+        VciCollector.instance_variable_set(:@pid, Process.pid)
+        if defined?(::ActiveRecord::Base) && ::ActiveRecord::Base.respond_to?(:connection_handler)
+          h = ::ActiveRecord::Base.connection_handler
+          if h.respond_to?(:connection_pool_list)
+            VciCollector.quiet { h.connection_pool_list.each { |pool| pool.discard! if pool.respond_to?(:discard!) } }
+          end
+        end
+        # Minitest's own at_exit (from the batch's first process) would run
+        # them again and exit with its own (unset) result.
+        ::Minitest.allow_fork = false if ::Minitest.respond_to?(:allow_fork=)
+        hooks = ::Minitest.class_variable_defined?(:@@after_run) ? ::Minitest.class_variable_get(:@@after_run) : []
+        hooks.reverse_each(&:call)
+        exit(code || false)
+      end
+
+      # In a slot after its worker ended (`st`): what it said in its
+      # progress file decides what the slots' queue gets back. A worker
+      # that stopped gave back where to go on from; one that ended
+      # otherwise (a crash, a signal, past its time) leaves the file it was
+      # running without a result (timed out: as a one-file process; else it
+      # runs on its own) and the rest goes back.
+      def worker_ended(st, chunk, progress, idx, off, queue, n, fired)
+        lines = VciCollector.quiet { Real.exist?(progress) ? File.read(progress).split("\n") : [] }
+        done = lines.filter_map { |l| l[/\Adone (\d+)\z/, 1]&.to_i }.max
+        back = lines.filter_map { |l| l[/\Aback (\d+)\z/, 1]&.to_i }.max
+        full = off + chunk.size
+        if back
+          take(queue, n, back: [idx, back]) if back < full
+          return
+        end
+        nxt = done.nil? ? off : done + 1
+        return if nxt >= full
+        f = chunk[nxt - off]
+        how = st.signaled? ? "signal #{st.termsig}" : "exit #{st.exitstatus}"
+        if fired
+          status(id: f, exit: nil, slot: @slot, timed_out: FILE_TIMEOUT, at: batch_at)
+        else
+          status(id: f, why: "the worker process of slot #{@slot} that ran it ended (#{how}) before it said its " \
+                             "result: it runs on its own")
+        end
+        take(queue, n, back: [idx, nxt + 1]) if nxt + 1 < full
+      rescue StandardError => e
+        $stderr.puts "vci_collector: batch slot #{@slot}: a worker's end: #{e.class}: #{e.message}"
+      end
+
       # Milliseconds since the slots were started (`run_slots`).
       def batch_at
         ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - (@batch_started || 0)) * 1000).round
@@ -1694,26 +2288,30 @@ module VciCollector
       # those given back): the next file's index, or nil. With `back`:
       # gives that index back instead (a slot that cannot run its first
       # file), for the next slot that asks.
+      #
+      # An entry is [index, offset]: a worker's files from `offset` on
+      # (2.12.0: the rest of a worker that stopped, run_worker), else
+      # offset 0. Given back as "index.offset".
       def take(queue, n, back: nil)
         VciCollector.quiet do
           File.open(queue, File::RDWR) do |q|
             q.flock(File::LOCK_EX)
-            nxt, *given = q.read.split(",").map(&:to_i)
-            nxt ||= n
+            nxt, *given = q.read.split(",")
+            nxt = nxt.nil? ? n : nxt.to_i
             i = nil
             if back
-              given << back
+              given << (back.is_a?(Array) ? "#{back[0]}.#{back[1]}" : back.to_s)
             elsif !given.empty?
               i = given.shift
             elsif nxt < n
-              i = nxt
+              i = nxt.to_s
               nxt += 1
             end
             q.rewind
             q.truncate(0)
             q.write([nxt, *given].join(","))
             q.flush
-            i
+            i && i.split(".", 2).then { |a, b| [a.to_i, b.to_i] }
           end
         end
       rescue StandardError
@@ -1871,11 +2469,15 @@ module VciCollector
       def become(id)
         @target = id
         (@loader_checks || {}).each_key { |k| VciCollector.records.delete(k) unless ids[k[1]] == id }
+        @forked_at = VciCollector.records.size
         VciCollector.instance_variable_set(:@pid, Process.pid)
         VciCollector.instance_variable_set(:@test_id, id)
         # Minitest's at_exit (registered by the driver) sets the exit status
         # only in the process that registered it, unless forks may.
         ::Minitest.allow_fork = true if defined?(::Minitest) && ::Minitest.respond_to?(:allow_fork=)
+        if EXPERIMENT.include?("nomajor") && ::GC.respond_to?(:config)
+          VciCollector.quiet { ::GC.config(rgengc_allow_full_mark: false) }
+        end
         Profile.start!(id)
         id
       end
@@ -1912,6 +2514,109 @@ module VciCollector
         status(**line, gc_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round)
       rescue StandardError
         nil
+      end
+
+      # What a slot's zygote would preload, once there is something to plan
+      # from (Zygote): from VCI_RAILS_ZYGOTE_HINTS, else from `need` files'
+      # samples; nil when there is not, or nothing to preload.
+      def zygote_plan(need)
+        s = Zygote.hinted || (need && Zygote.samples(need))
+        return nil if s.nil? || s.empty?
+        p = Zygote.plan(s)
+        @zygote_samples = s.size
+        p.empty? ? nil : p
+      rescue StandardError
+        nil
+      end
+
+      # In slot `i`: fork its zygote, which preloads `plan` (Zygote). In the
+      # zygote: :zygote, once the preload is done and recorded (it then runs
+      # the slot's remaining files). In the slot: the zygote's
+      # Process::Status once it ended (it ran them), or nil when the preload
+      # failed before it took any file (the slot runs them, as before).
+      #
+      # The zygote says its preload is done (`r`), then waits for the slot's
+      # go (`go_r`) before it takes a file: a slot that gave up on it (past
+      # Zygote::WAIT) kills it before it can have forked any file's process,
+      # and runs the files itself.
+      def zygote!(i, plan)
+        begin
+          r, w = VciCollector.quiet { IO.pipe }
+          go_r, go_w = VciCollector.quiet { IO.pipe }
+          disconnect
+          pid = fork_own
+        rescue StandardError => e
+          $stderr.puts "vci_collector: batch slot #{i}'s zygote: #{e.class}: #{e.message}"
+          return nil
+        end
+        if pid.nil?
+          begin
+            r.close
+            go_w.close
+            @zygote = true
+            started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            before = VciCollector.records.size
+            begin
+              @preloading = true
+              Zygote.preload!(plan)
+            ensure
+              @preloading = false
+            end
+            added = VciCollector.records.keys.drop(before)
+            repo = VciCollector.repo
+            in_repo = added.select do |(_, abs)|
+              abs.is_a?(String) && VciCollector.inside?(abs, repo) && !VciCollector.quiet { Zygote.free?(abs) }
+            end
+            in_repo = in_repo.size
+            load_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round
+            disconnect
+            share!(write: true)
+            collect_garbage!
+            status(slot: i, zygote: { samples: @zygote_samples, gems: plan.count { |x| x[2] == :gem },
+                                      app: plan.count { |x| x[2] == :app }, records: added.size,
+                                      repo: in_repo, load_ms: load_ms,
+                                      ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round })
+            w.write("1")
+            w.close
+            go = go_r.read(1)
+            go_r.close
+            Process.exit!(0) unless go == "1"
+            return :zygote
+          rescue Exception => e # rubocop:disable Lint/RescueException
+            status(slot: i, zygote: { failed: "#{e.class}: #{e.message.to_s.lines.first.to_s.strip}"[0, 300] })
+            flush
+            Process.exit!(0)
+          end
+        end
+        w.close
+        go_r.close
+        ok = VciCollector.quiet { IO.select([r], nil, nil, Zygote::WAIT) && r.read(1) == "1" }
+        r.close
+        if ok
+          begin
+            go_w.write("1")
+          rescue StandardError
+            ok = false
+          end
+        end
+        go_w.close
+        unless ok
+          begin
+            Process.kill("KILL", pid)
+          rescue Errno::ESRCH
+            nil
+          end
+          Process.wait2(pid)
+          status(slot: i, zygote: { failed: "it did not finish its preload in #{Zygote::WAIT} s" }) if ok.nil?
+          return nil
+        end
+        # From here the zygote runs the slot's files: the slot only waits.
+        loop do
+          _, st = Process.wait2(pid)
+          return st
+        rescue Errno::EINTR
+          next
+        end
       end
 
       # Close the boot's database connections before a file's process forks,
@@ -5395,6 +6100,7 @@ at_exit do
       # runner's own loader (Batch.gate): nothing here is attributable.
       next VciCollector::Batch.undriven! if VciCollector::Batch.on? && !VciCollector::Batch.target
       VciCollector::Output.write!(status)
+      VciCollector::Batch::Zygote.note!(VciCollector::Batch.forked_at)
     when "probe" then VciCollector::Probe.print!
     end
   rescue Exception => e # rubocop:disable Lint/RescueException

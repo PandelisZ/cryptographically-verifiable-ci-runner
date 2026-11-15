@@ -759,6 +759,218 @@ git-meta store. What remains between vci and plain is the cost of a process per 
 tests use on its own (about 66 files, 0.1 s), collects its garbage and copies the pages it writes (0.08 s of system
 time), where a Rails worker pays that once for all of its files.
 
+**Slot zygotes (vci 2.12, `rails_zygote`).** Most of what a file's process loads on its own after the fork, other
+files' processes load too: on vex-api's shard of 908 files, half of their 56,711 loads were of 130 files (123 gem
+files, from Action Pack, Action View, Action Mailer, Active Record's associations, and 7 application files: two
+token models, a concern and four authentication services that the tests' common setup loads, loaded by 896 of the
+908 files). With `rails_zygote` set to `"gems"` or `"common"` (it is off by default), a slot loads those once, in a
+process between it and its files:
+
+- each slot runs the batch's first files from its boot, as before, and each of those processes notes the Ruby files
+  it loaded after the fork (`loads-<group>-<slot>.txt` in the run's output directory). The first files are spread over the
+  batch (every n-th file), not its first directory. There are twice as many as the slots, 16 at least, and only in a
+  batch that leaves each slot at least 20 files after them (264 files at 12 slots, 176 at 8): a smaller batch gets
+  no zygote. A zygote's preload and garbage collection cost 0.7 to 1.7 s a slot on vex-api; with the earlier
+  threshold (four times the samples) 100 files over 12 slots formed 11 zygotes of about 6 files each and used 4 to
+  15% more CPU than without them in 8 of 8 interleaved sessions (median 70.2 against 67.1 CPU-seconds), and 200
+  files used the same CPU (132 against 130). The break-even lies between those, and was not measured more finely;
+- once that many have ended, each slot forks a *zygote*, which loads, in the order the files loaded them: the files
+  of the bundle's gems (and Ruby's own library files) that at least a tenth of those files loaded; and with
+  `rails_zygote = "common"` also the application's files that Rails' loaders autoload (outside `test/` and `spec/`)
+  that at least 90% of them loaded, each by its constant, as a test autoloads it. It then writes the lines its files
+  share (as the slot did) and collects its garbage, and runs the slot's remaining files, each forked from it;
+- what the zygote loads is recorded in it before any file's process forks from it, as what the boot loads is: it is
+  an input of every file forked from it, whether or not the file would have loaded it (a superset of what the file's
+  own process recorded before). The files sampled only decide what is loaded, never what is recorded. A gem's files
+  cost no precision: a gem is recorded by name and version, and the toolchain records the whole bundle, so a change
+  to a gem already runs every file. Neither do the absent load-path candidates in `lib/` and `vendor/` that a gem
+  file's own requires look for (`lib/active_record/associations/preloader.rb`), which a file that requires it records
+  anyway. An application file under `"common"` does: a file that never loaded it runs again when it changes;
+- a preload that raises, or takes longer than a minute, ends the zygote before it takes a file, and its slot runs its
+  files as before (`vci: N slot zygote(s) failed, their slots ran their files as before: ...`). With `VCI_TIMING=1`
+  vci says what the zygotes preloaded (`vci: 12 slot zygote(s) preloaded what 35 files of the batch loaded: up to 127
+  gem or Ruby files and 7 application files (643 records, 511 in the repository outside gems), ...`: the 7 files and
+  the absent load-path candidates above), and each file's CPU time (`vci: a file's process used 0.45
+  CPU-s on average ...`).
+
+`rails_zygote` is set in the project's table of `vci.toml` (or at the top in the single-project form): `"off"`, the
+default, forks every file from its slot, as 2.11 did, and every file records exactly the inputs it recorded under
+2.11; `"gems"` preloads gem and Ruby files only; `"common"` also the application files.
+
+**What a zygote costs, and why it is off by default.** Under `"gems"` a file records as externals the gems its
+zygote loaded that it never used itself: on 101 of vex-api's files, 75 gained `et-orbi 1.4.2`, `fugit 1.14.0` and
+`raabro 1.5.0` and nothing else changed (on vex's full shard 806 of 907 input roots differed from 2.11.1's, against 60
+between two 2.11.1 runs). That costs no precision (the bundle is part of the toolchain and `Gemfile.lock` an input
+of every file, so a gem change already runs every file), but it is a change to what is attested. Each zygote is a
+process of its own: on vex-api it dirtied about 150 MB, and the batch's peak resident memory (all processes, summed,
+medians of six rounds) went from 4.74 GB with 2.11.1 to 6.55 GB with `"gems"` and 6.49 GB with `"common"` at 12
+slots, 3.36 to 4.55 GB at 8 (28 processes became 40; the largest one stayed at about 650 to 680 MB). On a runner
+short of memory, leave it off. And the saving was measured at 12 slots only: there `"gems"` used 0.93 of 2.11.1's
+CPU time (paired over six interleaved rounds; 0.96 with a history of earlier runs), `"common"` 0.92, and the Ruby
+batch took 0.90 of 2.11.1's time with `"common"` (medians 56.9 s against 67.4 s; 0.92 with a history, the pairs
+ranging from 0.57 to 1.22). At 8 slots, as on vex's 8-core runners, `"gems"` was within noise of 2.11.1 (paired CPU
+1.01, wall 1.08; medians 467 CPU-seconds and 81.1 s against 483 and 80.0 s) and `"common"` used 0.93 of its CPU and
+0.94 of its wall time. Those 8-slot runs had the laptop's 14 cores, not an 8-core Linux runner. In the review's model
+of vex's CI jobs (the Ruby batch is 23% of a vci job, and a zygote forms only in a third of them) neither setting
+changes vex's runner time measurably (14.3 runner-hours a day either way): a zygote is a choice for suites whose
+runs are mostly full.
+
+Measured again after the review's fixes (14 November 2026, 22:49 to 23:02, vex-api's shard 2 of 2, 908
+files, 12 slots, a local SQLite store, release builds, three lock sessions with the builds in a different order in
+each, load average 9 to 67 on the 14-core laptop shared with other agents, so only comparisons within a session
+hold). CPU is the user and system time of every process of the run. 2.11.1: 79.4, 76.0 and 99.9 s, 560, 544 and 575
+CPU-seconds (its Ruby batch 66.3, 64.9 and 87.7 s). The new default (`"off"`): 70.1, 83.2 and 89.0 s, 551, 560 and
+584 CPU-seconds (batch 59.4, 72.0 and 77.2 s): the same as 2.11.1 within the noise, as it should be. `"gems"`: 64.6,
+70.3 and 79.9 s, 510, 516 and 556 CPU-seconds (batch 53.8, 59.1 and 67.2 s), 0.91 to 0.97 of 2.11.1's CPU in the
+same session. Plain `bin/rails test`: 50.7 s and 336 CPU-seconds (one run). The input roots of the 907 attested files:
+the default's differed from 2.11.1's in 60, exactly as many as between two 2.11.1 runs (random ids in absent
+`public/` paths); `"gems"`' differed in 808. `VCI_RAILS_ZYGOTE` (`off`, `gems`, `common`) in vci's environment overrides it. It is not part of
+`vci:config`: an attestation made with any setting is accepted with any other, as each records a superset of what
+the file loaded. Diagnostic switches: `VCI_RAILS_ZYGOTE_HINTS` (a file of absolute paths, one a line: each zygote
+forms at once and preloads those, classified as above) and `VCI_RAILS_ZYGOTE_SAMPLES` (how many files to wait for).
+
+Measured and left out: leaving a file's process with `exit!` once its output is written, instead of Ruby's own exit
+(finalizers; Ruby 3.4 does not free the heap at exit unless `RUBY_FREE_AT_EXIT` is set): over three interleaved
+pairs on 303 of the shard's files a file's process used 0.62 CPU-seconds either way. Turning off the garbage
+collector's full marks in a file's process (`VCI_RAILS_EXPERIMENT=nomajor`): with zygotes a file's process ran 0.1
+of them on average, and its CPU time did not change (0.46 and 0.45 against 0.45 and 0.48).
+
+Measured on 14 November 2026 on the same shard (908 files, 12 slots, a local SQLite store, release builds, runs of
+each build interleaved) on the 14-core laptop while other agents' jobs kept its load average between 35 and 180, so
+every figure is inflated against an idle machine and only the comparisons within a round hold. A file's process used
+0.48 CPU-seconds on average with `"common"` (0.52, 0.45, 0.48, 0.48 and 0.48 in five rounds), 0.52 with `"gems"`
+(0.61, 0.48, 0.47) and 0.57 with `"off"` (0.63, 0.53, 0.54); its top-level requires took 68 ms instead of 123 ms (20
+of them instead of 29). The zygotes formed after 35 files and each preloaded 127 to 162 gem or Ruby files and, with
+`"common"`, the 7 application files above, in 0.2 to 1.3 s (0.6 to 5.2 s with their shared output). The whole `vci
+run`, against vci 2.11.1, from the review's six interleaved rounds per setting (each paired with 2.11.1 in the same
+lock session, medians): `"common"` cut the Ruby batch by about 7 to 10% (56.9 s against 67.4 s; pairs 0.57 to 1.22,
+median 0.90; 0.92 with a history of earlier runs, 0.93 at 8 slots) and the CPU by about 8% (paired 0.92); `"gems"` used
+0.93 of 2.11.1's CPU. (The builder's last two rounds, 52 s against 66 and 67 s, were the best of a noisy series.)
+Wall-time gains on vex's own runners are not measured. Precision, from each file's own loads with the zygote's 7 application files added, replayed
+over the 30 most recent commits that touched vex-api: 1,207 file runs either way, none more; 84 more inputs in all
+(0.09 a file). Not measured: vex's 8-core CI runners, a plan, a push or the git-meta store. What still separates a
+file's process from a Rails worker's share of the work: the application files each loads on its own (about 30, most
+of them used by few other files), the collector's hooks on every file operation of its tests, its own output (0.05 s,
+where 2.11.1's took 0.10 s: what the zygote loaded is in the lines it shares, and its gem files are checked against
+their archives once, in the zygote; of the rest, a third is folding absent paths into listings, with a `git
+check-ignore` of its own), and the memory pages it copies from its slot (0.09 s of system time).
+
+**Several files per process: `rails_worker_files` (since 2.12, opt-in, Minitest).** A trade of precision for speed,
+off by default. With `rails_worker_files = K` above 1 (in the project's table, or `VCI_RAILS_WORKER_FILES=K` in
+vci's environment, which overrides it; `1` is one process per file, as before), each slot of a Minitest batch forks
+a *worker* that runs up to K test files one after the other, as a Rails parallel worker runs many, so what one file
+autoloads is loaded once for the worker's files instead of once per file. An RSpec project ignores it.
+
+```toml
+[[projects]]
+name = "api"
+path = "api"
+adapter = "rails"
+rails_worker_files = 5   # default 1: one process per test file
+```
+
+*What a file records.* Each file's inputs are everything its worker observed from its fork to the end of that file:
+the boot's and the slot's records, then every earlier file of the worker (its source, which the worker loaded, and
+everything it loaded, read, listed, looked up in the environment or was tainted by: a child process or a socket in
+one file taints every later file of its worker), then the file's own. A later file's result can depend on what an
+earlier one left behind (a constant it autoloaded, a patch, a memoized read, a global): all of that came from what
+the earlier file observed, which is recorded for the later file too, so its inputs remain a superset of what its
+result depends on. The price is precision: a file runs again when anything an earlier file of its worker read
+changes, or when one of those earlier files is changed, renamed or deleted. A file's output is written by a process
+forked from the worker at the end of the file's tests, which ends as that file's own process would (Minitest's
+`after_run` hooks, the `at_exit` handlers, its exit status); the worker goes on with the next file.
+
+*Which files share a worker, and in what order.* The batch's files that do not run as shards, sorted by test id
+(path), cut into runs of K; a worker runs its files in that order. The order is not recorded beside the inputs: it
+follows from the earlier files' paths, which are inputs. A file attested after files A and B is skipped only while
+A and B (and what they observed) are unchanged; a new file sorting between them does not make it run (its
+attestation did not depend on the new file), and its next run records whatever then runs before it. Since vci runs
+only the files a plan did not skip, workers are made of the files that run, so a file's inputs are those of the
+last worker it ran in.
+
+*Each file runs as its one-file run does.* Each file runs through `Minitest.run` with the batch's seed and that
+file alone: fresh reporters, Minitest's own seeding, and only the test classes of the boot and of that file. A worker
+gives the rest of its files back to the slots, to a fresh worker where they come first, when that would not hold: a
+file an earlier file of the worker already loaded (its tests ran there), a file that requires a file of the batch an
+earlier file loaded, a file that adds tests to a test class an earlier file defined. The database, fixtures and the
+slot's temp directory are shared by a worker's files as by a slot's files with one process each (and by a Rails
+worker's): what the database holds is not an input either way. On vex-api's shard, the 907 files had the same
+results (state, tests, failures, skips) with K = 5 as with one process per file.
+
+*Failures fail open.* A file that fails (its process exits non-zero) ends its worker: the files after it run in a
+fresh worker, never in a process a failure went through, and the failed file runs again on its own, which gives its
+result (`its process failed in slot 2, file 3 of its worker process (exit 1): it runs again on its own`). A worker
+that crashes or is killed gives no result for the file it was running (it runs on its own) and gives the rest
+back. `VCI_RAILS_FILE_TIMEOUT` holds for each file, counted from the end of the file before it in its worker. A test
+that passes only after another file has run (it uses a constant that file autoloaded without requiring it) is
+attested with that file among its inputs, as a Rails worker would pass it; run on its own, or in another worker, it
+fails and runs again on its own.
+
+*What it buys, and what it costs, on vex-api* (shard 2 of 2: 908 files, 12 slots, a local SQLite store; a 14-core
+laptop that other agents' jobs loaded to a load average of 37 to 140 during these runs, so the figures are noisy;
+user plus system CPU of all processes beside wall time, 2 to 4 runs each, interleaved):
+
+| Run | wall (median) | Ruby batch | CPU-seconds | runs |
+|---|---|---|---|---|
+| plain `bin/rails test` (12 workers) | 111 s | | 397 | 3 |
+| `vci run`, K = 1 (one process per file) | 129 s | 107 s | 587 | 4 |
+| K = 5 | 101 s | 86 s | 478 | 4 |
+| K = 20 | 167 s | 147 s | 538 | 3 |
+| K = 75 | 134 s | 116 s | 541 | 3 |
+
+In the four rounds where K = 1 and K = 5 ran one after the other, K = 5 took 0.68 to 1.03 of K = 1's CPU time
+(median 0.82) and 0.61 to 0.95 of its wall time (median 0.72). On the same laptop with little else running, plain
+took 30 s and 275 CPU-seconds and K = 1 58 s and 480 (2.11.0's measurements above); K = 5 was not measured there.
+
+Precision, from those runs' attestations: for each of the last 30 commits that touched `vex-api` before vex
+`739417357`, the paths that commit changed were changed in the working tree (a modified file modified, an added or
+deleted file deleted or created) and `vci plan --project vex-api` counted the shard's files that would run. 9 of the
+30 commits changed `db/schema.rb` or another input of every file: about 896 of 908 run at any K. For the other 21:
+
+| K | files that run, all 21 commits | median per commit | most | against K = 1 |
+|---|---|---|---|---|
+| 1 | 663 | 18 | 114 | 1.0x |
+| 5 | 1,355 | 44 | 232 | 2.0x |
+| 20 | 2,813 | 101 | 474 | 4.2x |
+| 75 | 6,389 | 315 | 701 | 9.6x |
+
+A file's manifest grew from 539 inputs on average (K = 1) to 574 (K = 5), 670 (K = 20) and 927 (K = 75). Above
+K = 5 vci got slower again on vex-api (more CPU than K = 5, more wall time than K = 1): a file's output holds everything its worker observed, so it takes
+longer to write the later a file comes in its worker (0.10 s at K = 5, 0.20 s at K = 20 and 75), and a worker of 20
+or 75 consecutive files holds the slow ones of one directory together, so its slot ends last.
+
+For vex, K = 5 is a fair trade and nothing above it is. A commit that runs everything (9 in 30) costs about a fifth
+less CPU and finishes its batch about a quarter sooner; a typical commit runs about twice as many files again (44
+instead of 18, a few seconds across 12 slots); over the 30 commits, files run times CPU per file comes to about 12%
+less than with K = 1 (a rough estimate: the CPU per file is a full run's divided by its files). Whether that is worth
+a plan that names twice as many files to run is the project's choice. The mode suits a suite where many changes run
+most files anyway and a file's own process is a large share of its cost (short files that autoload much of the
+application); it does not suit one whose pull requests mostly run a few files and whose files are slow, where
+vci's per-file precision is what saves the time. Not measured: vex's 8-core CI runners, K between 5 and 20, and
+precision on a store built up by partial runs (each figure here starts from one full run's attestations; a partial
+run's workers group the files that run, which may come from unrelated directories, so a file's inputs after it can
+be wider than here).
+
+**Zygotes and workers together.** The two settings combine: a slot's zygote forms as above and then forks the slot's
+workers instead of its files' processes, so a worker's files find what the zygote preloaded and record it as inputs,
+as a file's own process does. The zygote is planned from what the first file of each of the first workers loaded
+after the fork: a later file of a worker loads nothing an earlier one already loaded, so its loads would understate
+what a file loads on its own (with every worker file noting, `"common"` preloaded none of vex-api's 7 application
+files on a sample of 100 of its files at K = 3; with only the first, all 7). The figures above for K = 5 were measured
+against one process per file *without* zygotes. With zygotes, over six interleaved rounds on 14 November (vex-api's
+shard 2 of 2, 908 files, 12 slots, a local SQLite store, release builds, each round paired with 2.11.1 in the same
+lock session): K = 5 with `"gems"` used 444 CPU-seconds and with `"common"` 447, against 496 for `"gems"` with one
+process per file and 538 for 2.11.1; paired with 2.11.1, 0.84 and 0.82 of its CPU against 0.93 for `"gems"` alone
+(0.43 CPU-seconds a file against 0.49). So a worker still saves about a tenth of the CPU on top of the zygote. Its
+batch ends later, by about 10 s (67.2 s against 56.9 s for `"gems"` alone, medians of different sessions; 0.97 of
+2.11.1's in the same session), because its runs of five sorted files leave some slots 14 to 17 s behind the others.
+(A first measurement of two runs each said K = 5 saved no CPU with zygotes and ended 20 to 60 s later; six rounds did
+not reproduce that.) `rails_worker_files` stays 1 by default for its precision, which is the reason: about twice as
+many files run again on a typical commit. In the review's model of vex's CI jobs, K = 5 raises runner time on a suite
+shaped like vex's (15.8 runner-hours a day with `"gems"`, 15.1 with `"common"`, against 14.3 without workers; 14.1
+with workers and no zygote, a figure that rests on a heavily loaded laptop's CPU ratio of 0.72), because most of
+vex's jobs run few files and those then run about twice as many.
+
 The collector (`ruby/vci-collector/vci_collector.rb`, plain Ruby, nothing is installed into your project) is loaded
 through `RUBYOPT` before `bin/rails`, Bundler and Rails. It sets these run conditions:
 
@@ -1220,6 +1432,137 @@ match = ["test/images/**"]
 libraries = "exact"
 ```
 
+### The early plan: skip the toolchain setup (`vci plan --early`, since 2.12.0)
+
+A Rails job spends most of its fixed cost before vci runs at all: on vex's runners a plain job of one shard took
+116 s, of which 48 s went to the toolchain (system packages, mise's Ruby, the gems, the database setup) and 39 s to
+the tests. A job whose plan then says "N to skip, 0 to run" paid the 48 s for nothing. `vci plan --early` is a plan
+made right after the checkout, with only the vci binary, that answers one question: is every unit of these projects
+skipped? A workflow then runs the toolchain setup and the tests only when the answer is no:
+
+```yaml
+- uses: actions/checkout@v4
+- id: early
+  uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
+  with:
+    command: early
+    project: vex-api
+    partition: ${{ matrix.partition }}   # optional: the same I/N the job's `vci ci` uses
+# every step below, the toolchain setup included:
+- if: steps.early.outputs.skip-all != 'true'
+  run: bash scripts/ci/rails-system-dependencies.sh
+# ... mise, bundle install, database setup ...
+- if: steps.early.outputs.skip-all != 'true'
+  uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
+  with:
+    project: vex-api
+    partition: ${{ matrix.partition }}
+```
+
+Without the action: `vci plan --early --fetch --base-ref "$BASE" --project vex-api --format github` writes
+`skip_all=true|false`, `skipped_count=N` and `run_count=N` to `$GITHUB_OUTPUT` (besides the outputs `--format github`
+always writes); `--format text` ends with `early: skip all: N unit(s) skipped, ...` or `early: run:
+<why>`; `--format json` carries `"early": {"skipAll": ..., "skipped": N, "run": N, "why": ...}`. `--partition I/N`
+answers for partition I of `vci ci --partition I/N` (a unit's partition does not depend on what the plan skips, so a
+partition the early plan finds empty is empty for the full plan too). `--json-file FILE` also writes the JSON plan
+to a file. The command writes nothing to the store, never starts Ruby, and exits 0 whatever happens: a plan that
+fails, a base it cannot read, a fetch that fails (then only what is stored locally counts) all answer "run".
+
+**What it decides, and how.** The early plan runs the full plan's check chain (trust, policy and `no_skip_refs` from
+the base commit, expiry, every input file, the hashed environment, the externals) with one difference: where the full
+plan probes the installed toolchain (one Ruby process that sets up the bundle and reports versions), the early plan
+takes the toolchain from what the checkout declares, and only for a Rails project whose **base** `vci.toml` opts in:
+
+```toml
+[[projects]]
+name = "vex-api"
+adapter = "rails"
+[projects.policy]
+libraries = "any"
+toolchain = "declared"   # since 2.12.0; default "probed"; read only by `vci plan --early`
+```
+
+Every other project, a Rails project without the key, and a Rails project under `libraries = "exact"` (whose library
+versions only Ruby can read) runs everything in the early plan, unlisted. So does a multi-project repository unless
+`--project` names the Rails projects only. Under the opt-in, a unit's attested toolchain must match these facts of the
+checkout, or the unit runs:
+
+| Attested fact (full plan: compared with the probe) | Early plan: compared with |
+|---|---|
+| Ruby `X.Y.Zp<n>` and `ruby X.Y.Z` | the exact `X.Y.Z` every version file names, from the project dir up to the repository root: `.ruby-version`, `.tool-versions`, every mise config file there (`mise.toml`, `mise.local.toml`, `mise.<env>.toml`, `mise.<env>.local.toml`, each with or without a leading dot, the same names in `.config/`, and every `*.toml` at any depth under `mise/`, `.mise/` and `.config/mise/`, which holds `config.toml`, `config.<env>.toml`, `config.local.toml` and `conf.d/*.toml`; files of every `MISE_ENV`, not only the job's: one more can only make it run), and since the 2.12.0 review the variables that pick a Ruby where the early plan runs (`MISE_RUBY_VERSION`, `RBENV_VERSION`, `ASDF_RUBY_VERSION`, `RUBY_VERSION`); none, an inexact one (`3.4`, `latest`), two that disagree, a config file that is not TOML, or a variable that points mise at other config files (`MISE_CONFIG_FILE`, `MISE_DEFAULT_CONFIG_FILENAME`, `MISE_OVERRIDE_CONFIG_FILENAMES`, ...): run. The patchlevel is not compared (MRI has one per release). The lockfile's `RUBY VERSION`, when present, must agree too |
+| Bundler | the lockfile's `BUNDLED WITH` (Bundler switches to it) |
+| Rails, the test frameworks | the lockfile's `railties`, `minitest`, `rspec-*` |
+| the bundle (every gem, `name==version`) | every attested gem pinned in that version by the lockfile (`Gemfile.lock`, or `gems.locked`; `BUNDLE_GEMFILE` set: run). Both files are inputs of every Rails unit as well, so any change to them runs everything anyway |
+| OS and architecture | this runner's, whatever `platform` accepts (the bundle, the gems' native builds and Ruby's own build are per platform) |
+| root or not | this runner's, unless `allow_superuser_mismatch` |
+| the collector version | this vci's collector (`VCI_RUBY_COLLECTOR`, or the one beside the binary) |
+| encodings | `UTF-8/UTF-8` (what a Rails application's probe reports; `config/environment.rb` missing: run) |
+| SQLite, libyaml, time zone data loaded or not (versions not compared under `"any"`) | SQLite loaded exactly when the lockfile has `sqlite3` (attested not loaded with it there: run), TZInfo loaded exactly when it has `tzinfo`, libyaml recorded as loaded (not loaded: run) |
+| a native library (`native:libvips.so.42`; by name under `"any"`) | not compared: taken as installed by the job's setup (recorded by `vci explain` as accepted) |
+| any other item of the attested libraries | run |
+| a variable mise exports from those files' `[env]` that the project's env policy hashes, or an `[env]` directive (`_.file`, `_.source`, `_.path`) | run (the early plan's environment does not have it yet) |
+| the database adapters (`database`: what the probe reads from `config/database.yml` with its ERB, and `DATABASE_URL`) | not compared, when each variable the file's ERB reads by literal name (`ENV["X"]`, `ENV.fetch("X", ...)`) is one the tests get fixed (`set`), compared (`hash`, built-in hash such as `DATABASE_URL` and `*_DATABASE_URL`) or not at all (unlisted, strict mode): then the adapters follow from the file, an input of every unit, and the compared environment. A variable passed to the tests uncompared (`ignore`, built-in ignore, or any under `mode = "loose"`), or ERB that does anything else (`ENV` by a computed name, `Rails`, `File`, the application's code, a shell command, an interpolated string, a global): run. vex's file (17 tags, 9 variables, none passed uncompared) is decided |
+
+**The guarantee.** The early plan skips a unit only when every check of the full chain passes with the facts above,
+and answers `skip_all=true` only when every unit of the listed projects (of the partition) is skipped. Given that the
+job's setup installs what the checkout declares, it never skips a unit the full plan would run. What it cannot see,
+and the full plan would (each one makes the full plan run units that the early plan skips):
+
+- a toolchain the setup installs other than the declared one: another build of the same Ruby `X.Y.Z` (its
+  patchlevel aside), a Bundler that does not switch to `BUNDLED WITH`;
+- Bundler settings the setup writes outside the checkout (`bundle config set without ...` in `~/.bundle`, or a
+  `BUNDLE_*` variable a later step exports), which change which of the lockfile's gems the bundle holds;
+- a system library the setup fails to install, or installs other than when the attestation was made, where the full
+  plan compares whether it is loaded: a native library opened through FFI (libvips), libyaml; under `libraries =
+  "any"` their versions are not compared by the full plan either;
+- an environment variable a later step exports through `$GITHUB_ENV` (mise's `[env]` in the version files is read),
+  and mise config outside the checkout (`~/.config/mise/`, `/etc/mise/`, `MISE_GLOBAL_CONFIG_FILE`).
+
+Until the review of 14 November 2026 (before 2.12.0 was released) the early plan read only nine fixed version file
+names and did not look at the database adapters: a `mise/config.toml`, `.config/mise/conf.d/*.toml`,
+`.config/mise/config.local.toml` or `.config/mise/config.<env>.toml` naming another Ruby or exporting a hashed
+variable, `MISE_RUBY_VERSION` set to another Ruby, or a `config/database.yml` taking its adapter from an `ignore`d
+variable (a CI matrix over databases) all made it skip every unit that the full plan ran. These are tested
+(`rails_early_plan_reads_every_mise_config_file`, `rails_early_plan_and_ruby_version_variables`,
+`rails_early_plan_database_adapter_from_erb`). The extra mise locations are read by the early plan only; they are not
+global inputs of the full plan, which probes the Ruby the setup installed and compares the environment it exported
+(adding them would change every Rails unit's global input set and run every Rails file once after an upgrade).
+
+**A time limit (the action).** The early plan fetches the store first, and on vex the plan step's fetch has a long
+tail (p90 30 s, about 500 s on one job of 40 sampled). The action's `early-timeout` input (seconds, default 90, `0`:
+none) stops the early plan when it runs past it and answers `skip_all=false`: the job then sets up and plans in full
+as it would have anyway. It needs `timeout` (coreutils) on the runner; without it there is no limit. The fetch's own
+time is the `fetch attestations (--fetch, in the background)` line under `VCI_TIMING=1`.
+
+**What it saves, and what it does not.** A job the early plan answers "skip all" for leaves out its toolchain setup
+and tests, nothing else: on 40 sampled vex jobs that had nothing to run (vci 2.10), setup, checkout, the
+attestation-store cache and the plan took 37 to 549 s, median 57.5 s and mean 75.8 s (the store cache restore 9.7 s
+and the plan step 23.6 s on average, median 11 s), not the 40 s estimated before; such a job's mean fell from 2.18 to
+1.26 runner-minutes in the model of those jobs. That applies to 18% of vex's Rails jobs. With the rest of vci's fixed
+cost per job as it is (store cache, a separate plan step, a second plan, publishing: about 46 s against plain's 43 s
+test step), the early plan alone pays for itself only when about 43% of a repository's jobs have nothing to run. The
+steps it gates are every step that needs the toolchain, including ones that are not tests: on vex `bundler-audit`
+(both shards) and `rails zeitwerk:check` (shard 1, 5 s) run in the same job, and gating the setup removes them from
+skip-all jobs. Either accept that (they still run on every job that runs tests, and on the default branch), or keep
+the toolchain for the job that runs them (in the economics model, keeping shard 1's: 13.8 runner-hours a day against
+13.5 dropping both; moving the checks to a job of their own per run: 17.0, worse than not gating at all, 14.3).
+Figures from the 2.12.0 review's model of vex's Rails job history (7 to 14 November 2026), checked against observed jobs to within 3%.
+
+On vex (`platform = "any"`, `libraries = "any"`, Ruby from `mise.toml` and `vex-api/.ruby-version`, the gems from
+`vex-api/Gemfile.lock` installed with `BUNDLE_FROZEN`), what remains unchecked is whether the setup installs the same
+system packages, Ruby build and Bundler configuration as the job that attested, which is the same workflow. The full
+plan in the same job, whenever the early plan says "run", compares everything as before; nothing about the full plan
+changes with `toolchain = "declared"`.
+
+**Other adapters.** node:test, Vitest, pytest, Go and Cargo always answer "run" in the early plan: their attested
+toolchains hold facts no checkout file pins exactly. Node: the major (or exact) version and the resolved packages
+of `node_modules` (including prebuilt addons) are read from the installed tree; Go: `go env` settings
+(`CGO_ENABLED`, `GOFLAGS`, `GOEXPERIMENT`, ...) and the architecture level come from the installed Go and the
+environment, and a `go.mod` `toolchain` line names a release, not the build; Cargo: `rustc -vV` (commit hash and
+LLVM version) and `rustc --print cfg` cannot be derived from `rust-toolchain.toml`'s channel without a table of
+releases. A declared form of these would be possible (e.g. a pinned `rust-toolchain.toml` channel mapped to its
+commit), but it is not implemented.
+
 ## Quick start (RSpec)
 
 RSpec runs under the Rails adapter (`adapter = "rails"`), with the same collector, run conditions and checks as
@@ -1444,7 +1787,7 @@ checkout, clock, policy and environment.
 |---|---|
 | `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails\|node-test] [--no-install] [--meta-url URL] [--oidc]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest; node-test prints the test command it read instead), print a CI snippet. `--oidc` (since 2.0) also writes `.vci/identities.toml`, trusting pushes to origin's default branch by the repository's workflow (its only file under `.github/workflows`, else `*`, to narrow) as principal `github-actions` (an existing file is left alone), and `.vci/sigstore-trusted-root.json` from `gh attestation trusted-root` (refreshed each time; without `gh`, a note says to write it): see [Keyless signing (OIDC)](#keyless-signing-oidc) |
 | `vci run [FILES…] [--key PATH \| --oidc[=github\|public-good]] [--ttl 14d] [--summary FILE]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed). Prints one line per unit not attested and a count of files per reason (see below); `--summary FILE` writes every unit with its reasons as JSON. Since 1.9.0 each distinct input manifest is stored once, as its own value (`vci:manifest:<input root>`), and the attestation references it; storing an attestation deletes the same signer's attestations of that unit it supersedes (an earlier commit of this line of history, other files: see [git-meta](#git-meta); every store does the same), printing `vci: removed N superseded attestation(s) ...` and how many manifests nothing references any more (since 2.0 it first fetches, in one batch, the stored attestations of those units that were not fetched yet; one that cannot be fetched is kept). `--oidc` (since 2.0; GitHub Actions with `permissions: id-token: write`) signs keylessly with the job's OIDC token instead of a key, through GitHub's Sigstore instance or, with `--oidc=public-good`, sigstore.dev's; the instance needs the `=` (`vci run --oidc a_test.go` runs `a_test.go`). See [Keyless signing (OIDC)](#keyless-signing-oidc). Since 2.1, once a project's tests have finished, its units are checked and signed in parallel (`$VCI_JOBS` at a time, default one per CPU; `ssh-keygen` processes, or keyless signatures, several at once), and each path of the checkout is read once for the whole run (its contents hash, a directory's children, git's answer to whether it is ignored), since the tree no longer changes (each unit still compares its inputs with the snapshot taken before the tests ran); the lines, `--summary` and the exit code are as before, in the units' order, and the store is written one unit at a time in that order. Since 2.1.3 the units are handed to the runner longest first, by the duration their newest stored attestation records (units without one first, in the listing's order), so that a runner that takes several at once does not end on its longest file; the lines, summary and store keep the listing's order. The attestations a new one supersedes are found in parallel too, and removed as it is stored. `VCI_TIMING=1` prints `read the last duration of N unit(s)`, `check, sign and store N unit(s) of P (J at a time)` and the thread-seconds of each part. Since 2.9.0, on a store that keeps objects (SQLite, PostgreSQL, libSQL, git-meta) and unless `[store] record_format = 1` keeps the 1.9.0 manifest behaviour above, a run stores no manifest: it puts its four objects (hdr, tables, shape, state: [docs/STORE-BACKENDS.md](STORE-BACKENDS.md), "Format-3 records") in the batch before its records, and when they cannot be put prints `vci: warning: storing the run's N object(s) in the <kind> store: <error>` and refuses every format-3 unit after it (`signing or storing failed`), so that no record names an object the store does not hold; after supersession it removes the superseded records' objects nothing references any more (`vci: removed N object(s) no attestation references any more`) and, on a store with listing columns (not git-meta, which leaves them to `vci prune`), the state objects older than `[store] explain_hashes_days` (`vci: removed N state object(s) older than D day(s) ([store] explain_hashes_days)`), each writer applying its own working tree's setting |
-| `vci plan [--base-ref R] [--format text\|json\|github] [--fetch [R]] [--project NAME]...` | Print which test files can be skipped and why the others run. `--fetch` first fetches attestations as `vci fetch [--remote R]` does, while the projects are probed; a failed fetch is a warning (stderr; a `::warning title=vci::` line unless the format is `json`) and the plan uses what is stored locally. `--project NAME` (repeatable) plans only those `[[projects]]` entries (by `name`, as the base commit's vci.toml names them): the other projects are not listed, probed or verified (their toolchains need not be installed) and are absent from the output. An unknown name is an error (exit 2) naming the configured projects; the single-project form has no names, so `--project` is an error there. Since 2.1 files are verified in parallel (`$VCI_JOBS` threads, default one per CPU), each file's candidates newest first, and each path of the checkout is read once per plan (see [Verification](#verification-vci-plan), "Cost"). Since 2.10 a unit that runs because a format-3 record's inputs changed names the input as a format-1 record did, `no valid attestation (3 candidates; best failed inputs: entry:app/models/organization.rb (+2 more))`, from its run's state object, which the plan loads after the verdicts for the units that run (at most `[store] plan_states` = 8 objects asked for and fetched, of which it reads at most `plan_states_mib` = 16 MiB; with either at 0 none is asked for, fetched or read; none is asked for or read when every unit skips, though on a git-meta clone round 2 may already have downloaded up to `plan_states` of them beside its candidates, see "Round 2 in one round trip" under [Verification](#verification-vci-plan)); where it cannot, the text says why: `entry: changed (attested hash not loaded: state expired)`, `... over the plan's budget)` or `... no state object for the run)` (see [Verification](#verification-vci-plan), "Naming the input that changed"). The text format then lists, before its last line, the inputs that made the most units run: `changed inputs, by the units each made run (top 5 of 12):`, then one `  <units>  <path>` line each, and `  <N>  unit(s) ran on changed inputs not named (attested hash not loaded)` for the rest. Since 2.10 the text format and the github format's notices print every path, key and reason with its control characters escaped (`\n`, `\u{1b}`), so a file name cannot add a line, while the github format's file lists give names as they are, a file to run whose name holds a line break making `run_all=true` (see [Verification](#verification-vci-plan), "What the text output escapes"); `--format json` gives the exact names |
+| `vci plan [--base-ref R] [--format text\|json\|github] [--fetch [R]] [--project NAME]... [--early [--partition I/N]] [--json-file FILE]` | Print which test files can be skipped and why the others run. `--fetch` first fetches attestations as `vci fetch [--remote R]` does, while the projects are probed; a failed fetch is a warning (stderr; a `::warning title=vci::` line unless the format is `json`) and the plan uses what is stored locally. `--project NAME` (repeatable) plans only those `[[projects]]` entries (by `name`, as the base commit's vci.toml names them): the other projects are not listed, probed or verified (their toolchains need not be installed) and are absent from the output. An unknown name is an error (exit 2) naming the configured projects; the single-project form has no names, so `--project` is an error there. Since 2.1 files are verified in parallel (`$VCI_JOBS` threads, default one per CPU), each file's candidates newest first, and each path of the checkout is read once per plan (see [Verification](#verification-vci-plan), "Cost"). Since 2.10 a unit that runs because a format-3 record's inputs changed names the input as a format-1 record did, `no valid attestation (3 candidates; best failed inputs: entry:app/models/organization.rb (+2 more))`, from its run's state object, which the plan loads after the verdicts for the units that run (at most `[store] plan_states` = 8 objects asked for and fetched, of which it reads at most `plan_states_mib` = 16 MiB; with either at 0 none is asked for, fetched or read; none is asked for or read when every unit skips, though on a git-meta clone round 2 may already have downloaded up to `plan_states` of them beside its candidates, see "Round 2 in one round trip" under [Verification](#verification-vci-plan)); where it cannot, the text says why: `entry: changed (attested hash not loaded: state expired)`, `... over the plan's budget)` or `... no state object for the run)` (see [Verification](#verification-vci-plan), "Naming the input that changed"). The text format then lists, before its last line, the inputs that made the most units run: `changed inputs, by the units each made run (top 5 of 12):`, then one `  <units>  <path>` line each, and `  <N>  unit(s) ran on changed inputs not named (attested hash not loaded)` for the rest. Since 2.10 the text format and the github format's notices print every path, key and reason with its control characters escaped (`\n`, `\u{1b}`), so a file name cannot add a line, while the github format's file lists give names as they are, a file to run whose name holds a line break making `run_all=true` (see [Verification](#verification-vci-plan), "What the text output escapes"); `--format json` gives the exact names `--early` (since 2.12.0): plan before the toolchain is installed and answer whether every unit is skipped (`skip_all`); exits 0 whatever happens; see [The early plan](#the-early-plan-skip-the-toolchain-setup-vci-plan---early-since-2120). `--json-file FILE` (since 2.12.0) also writes the JSON plan to FILE |
 | `vci ci [--base-ref R] [--audit-log PATH] [--fetch [R]] [--project NAME]... [--partition I/N] [--key PATH \| --oidc[=INSTANCE] [--ttl 14d] [--push [--remote R]]]` | `--fetch` as for `vci plan` (a failed fetch is also in the audit log's `warnings`). `--project` as for `vci plan`: only those projects are planned, run (and with `--key` attested), and only they appear in the printed plan and in the audit log's `projects`, `skipped` and `ran`; one CI job per suite (`vci ci --fetch origin --base-ref "$BASE" --project web`). `--partition I/N` (since 2.0; `1 <= I <= N`, anything else is a usage error, exit 2) splits a suite over N jobs: of the units the plan runs (for a project that runs everything, every unit it lists), this job runs only those in partition I. Since 2.4, a project whose units are all files is split by size: every unit it lists, skipped or not, largest file first, goes to the partition with the fewest bytes so far (ties: the lowest partition, then the smaller test id), so the jobs get about the same amount of tests (a file's size stands for how long it takes; vex's two Rails jobs had 2,762 and 3,231 s of tests split by test id, 3,047 and 2,946 s by size). Any other project (a unit that is not a file, such as a cargo unit), and every project with `VCI_PARTITION_BY=hash`, is split by test id: the first 8 bytes of the unit's storage key, BLAKE3 of the test id, big-endian, modulo N, plus one. Either way the split depends only on the checkout, never on what the plan skips or on the order or the other jobs, so every unit runs in exactly one partition, and a job run again after the others pushed agrees with them. What the plan skips is skipped in every partition. A project that runs everything and whose units cannot be listed runs whole in every partition that cannot list it, with a `::warning` (each job lists on its own and cannot know whether another listed it, so such a project may run in more than one job, never in none); without any readable project every partition runs the default project. After the plan it prints `partition 2/3: 41 of 120 units to run`; the exit code is this partition's tests'; the audit log's `ran` holds this partition's units and `partition` is `{index, count, units, total, unlisted}` (`units`: this partition's, `total`: all partitions', `unlisted`: projects this partition runs whole because it could not list them), `null` without the flag. With `--key --push` each job attests and publishes its own share (concurrent pushes merge and retry), so the next plan skips every partition's units: `vci ci --fetch origin --base-ref "$BASE" --project rust --partition ${{ matrix.part }}/3 --key ci-key --push --remote origin`. `--partition 1/1` runs what `vci ci` without it runs. Plan, run the remainder, write a JSON audit log of every skip. With `--key`, the remainder runs as `vci run --key` runs it (collectors on, inputs recorded, an attestation signed and stored for every unit that passed and is attestable; a unit that refuses still runs, and only test failures make the exit code non-zero); when the plan runs everything (`policy.no_skip_refs`, an unreadable base policy), every unit is attested: the run the next commit's plan reuses. `--push` then publishes as `vci push --remote R` does, whatever the tests did; a failed push prints a `::warning title=vci::` line and does not change the exit code. When a project cannot be listed or run with the collectors, the others are still run and attested and that project alone runs without attesting (a `::warning`); nothing that ran is run again, and the exit code is every test's. When nothing can be attested (the key cannot be read, the run cannot be prepared) everything runs without attesting. `--key` attests nothing (a `::warning`; the tests still run, nothing is pushed) when its principal is in `policy.no_skip_refs_except` and the current ref does not match `policy.no_skip_refs` (or the base `allowed_signers` cannot be read there): such a run, e.g. a pull request's, would let main skip code only it ran; give other refs a key outside that list, or name the principal in `policy.attest_on_any_ref` (since 1.9.2) to let pull requests attest with it on purpose. `--oidc[=INSTANCE]` (since 2.0) attests as `--key` does, keylessly as `vci run --oidc` signs, and refuses on the same terms with the principals of the base `.vci/identities.toml` entries the job's identity matches (or when that file cannot be read there); a job without a token (no `permissions: id-token: write`) fails before anything runs, and an identity that matches no entry attests with a `::warning` that nothing will trust it. `--key` and `--oidc` exclude each other; `--ttl` and `--push` need one of them. The audit log lists `attested` units, `attestErrors` (units or projects that could not be attested or run with the collectors), `notAttested` (why nothing was attested, or `null`) and `pushed` (`true`, `false`, or `null` without `--push` or when nothing was attested on purpose). On a shared store (PostgreSQL, since 2.8.0) `--push` is what stores: without it `vci ci` signs but stores nothing, its `attested` entries carry `"stored": false` and `pushed` is `false` (the publication gate, see [PostgreSQL](#postgresql)); on SQLite `--push` has nothing to do |
 | `vci verify <envelope\|-> [--allowed-signers F] [--identities F --trusted-root F] [--base-ref R] [--manifest FILE] [--envelope]` | Verify one DSSE envelope against `.vci/allowed_signers` (SSH-signed) or `.vci/identities.toml` and `.vci/sigstore-trusted-root.json` (keyless) at `--base-ref` or HEAD, or against the files given: once any trust file is given, an envelope whose kind needs one that was not is INVALID (the repository's files are then not used). It prints its claims, including the input manifest: inline (before 1.9.0) or the one it references, read from `--manifest FILE` (its compact encoding, as `git meta get project vci:manifest:<root>` prints it) or else from the attestation store of the repository it runs in, whichever it is (since 2.8.0; on git-meta, since 2.0 fetched from the metadata remote when it was not fetched yet), which runs `[store] token_command` as any command reading the store does (a compact `--manifest FILE` on a base manifest reads the base from there too); its root must be the signed input root (exit 1 otherwise, or when it is not available). A keyless envelope prints the identity, the principal it matched, the timestamp authority and the run URL. Since 2.9.0 the file may be a format-3 record (the `vci3` text frame a store holds): it is verified as the DSSE envelope rebuilt from it, the statement bytes unchanged and the signature re-armored; its input set is resolved from the run's objects in the repository's store (every object is taken by the id asked for, recomputed over the bytes the store returned: a missing or mismatched hdr or tables object, or a descriptor that does not resolve, is INVALID with `repo id: (in the hdr object <id>: <why>)`, and a shape object whose bytes are not its id with `manifest: INVALID: the shape object <id> is corrupt (its BLAKE3 is <found>)`, exit 1), and its root is recomputed only against `--manifest FILE` (the compact JSON of the resolved manifest, `InputManifest::to_compact`, or its JSON; no base support), since the attested hashes are in no signed object: without the file it prints the set's size and `root not recomputed: the attested hashes are in no signed object, pass --manifest FILE` and exits 0, and it never observes HEAD (that is the plan's check). `--envelope` prints the envelope JSON of the record and verifies nothing (exit 0): for a frame the rebuilt envelope, which in-toto tooling verifies as it does a stored one; for an envelope its bytes as read; a file that is neither exits 2 |
 | `vci push [--rewrite-history]` / `vci fetch` `[--remote R]` | On SQLite, PostgreSQL and libSQL (since 2.8.0) there is nothing to exchange: each says so, `vci fetch` with the number of attestations stored, and exits 0 (a libSQL replica that cannot sync exits 2), and `--remote` and `--rewrite-history` exit 2 (see [Where attestations live](#where-attestations-live)). On git-meta, the default: git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. `--rewrite-history` (since 1.8.2) publishes the metadata as one commit without parents (with a lease on the tip just fetched): what a fetch downloads is then the attestations the tree holds, not every version ever published; other clones merge onto it at their next fetch. Use it after `vci prune`, whose deletions otherwise leave the deleted values in the history (since 2.10 `vci prune` does it itself in CI once the fetched history passes `[store] history_max_commits`, and since 2.10 a clone that last fetched before the rewrite merges it three-way on the newest tip it had, so what was deleted since is not published again, and without such a tip the new tip's deletion record of an attestation, or of a manifest or object the clone put before the record, wins over the value a clone still holds; the local metadata commit moves to the rewrite only once it is published, and the rewrite's commit names the local commit it publishes (`Rewrite-of: <id>`), so a clone killed in between merges what follows on it: [Keeping the store small](#keeping-the-store-small)). Since 1.9.0 a fetched tip that the local metadata commit is an ancestor of is merged by applying only the tree entries that changed; since 2.0 a fetch downloads keys, not values (blobless; values are fetched when a plan, verify, run or prune reads them), and every merge is done from the trees' paths (`VCI_TIMING=1` prints `materialize (from paths, N changed entries, M not fetched)` or `materialize (full)`); and every merge puts back the input manifests an attestation in the store still references that a prune or supersession elsewhere deleted (`put back N input manifest(s) ...`; the next push publishes them). See "What `vci fetch` and `vci push` guard against": since 2.10 the local metadata commit only ever moves to a checked serialization, even when a command is killed, and a push or fetch puts back the values of the remote tip the local commit lost without this store deleting them (`note: restored N value(s) of <remote>'s refs/meta/main that this store had lost without deleting them (first: ...)`) instead of refusing to push. Since 2.1.3 `VCI_TIMING=1` prints a push's parts: fetch and materialize the remote's metadata, check what the push would delete and what it sends, put the local metadata on top of the remote's, `git push`. Since 2.1.11 the values a plan or run reads are fetched by several `git fetch` processes at once, `VCI_FETCH_JOBS` of them (default 4; `1` fetches one batch after the other): a plan's 16,000 values came in 20 s instead of 37 on one laptop. Since 2.7.34 (2.7.35 on git 2.43, which merges commits only) a merge whose only paths changed on both sides are deletion records (a run's two jobs deleting the same superseded attestations) writes ours into the tip's tree before `git merge-tree` merges, with `-X no-renames`, so a blobless clone merges trees alone instead of failing on a missing blob and falling back to git-meta's merge of three listed trees (20 to 120 s on vex). Since 2.10.3 `vci push` first removes each unit's attestations beyond the 4 newest, and since 2.11 the ones issued longer ago than the longest `max_ttl`, the format-3 objects no remaining attestation names and the run links of runs with none left (all from keys), and in CI publishes a history past `[store] history_max_commits` as one commit: see [Keeping the store small](#keeping-the-store-small) |
@@ -1484,7 +1827,7 @@ binary), `VCI_JOBS` (parallel pytest or `go test` processes in `vci run`, and th
 in full in every round, each observing its inputs on its own, as 2.10.0 did: the same verdicts and text, slower; for
 comparing, see [Verification](#verification-vci-plan)), `VCI_RAILS_JOBS` (the slots of a Rails batch: files at once, each slot with a database of its own as Rails' parallel workers have; `1`: one at a time; default: `PARALLEL_WORKERS` above 1, `VCI_JOBS`, or the number of CPUs, capped by `parallelize(workers:)`, for projects that call Rails' `parallelize`; `PARALLEL_WORKERS=1` or `workers: 1` turns them off), `VCI_METRICS` (since 2.5: every vci command appends one JSON line to `<git common dir>/vci-metrics.jsonl` with its version, command, flag names (never their values), exit code, duration, machine (OS, architecture, CPUs, CI or not) and every step it timed, the lines `VCI_TIMING` prints; `vci metrics [--last N] [--command C] [--format json]` gives each step's median, 95th percentile and maximum over recent commands; `VCI_METRICS=<file>` writes elsewhere, `VCI_METRICS=0` writes nothing; in GitHub Actions `vci ci` also adds its slowest steps to the job's step summary; the log keeps about its last 4 MB), `VCI_RAILS_SHARD_SECONDS` (a Minitest file whose last run took at least twice this many seconds runs as shards of about this long, one process each, in a batch's slots; default 30, `0`: off; since 2.3), `VCI_RAILS_FILE_TIMEOUT` (seconds a Rails test file's process may run, in a batch's slot or on its own, before it is stopped; default 600, `0`: no limit; a stopped file fails, is not attested and is not run again, and a file still running after two minutes is named on stderr; since 2.7.2), `VCI_NODE_TEST_FILE_TIMEOUT` (seconds a node:test file's processes may run in `vci run` and `vci ci --key` before
 they are stopped with their process group; default 600, `0`: no limit; a stopped file fails and is not attested;
-since 2.11.1), `VCI_RAILS_PER_FILE` (`1`: `vci run` starts one Ruby process per Rails file instead of booting once per runner and forking one process per file), `VCI_RAILS_SHARED_OUTPUT` (`0`: in a Rails batch, each file's process writes all of its output instead of only what it does not share with the other files of its boot), `VCI_RAILS_OWN_OUTPUT` (`0`, since 2.11: in a Rails batch, each file's process makes all of its lines and splits off the shared ones, instead of making only the lines of what it recorded after the fork; the same lines either way), `VCI_RAILS_PRELOAD_ROUTES` (`0`, since 2.11: a Rails batch does not draw the application's routes in its boot; see "What a batch file's process costs"), `VCI_RAILS_PROFILE` (`1`, since 2.7.34: each Rails file's process prints one `vci-profile` line with its top-level requires' time and count, the routes' first draw, the garbage collector's time and count (since 2.11 also its major and minor collections), its own time from the fork, and since 2.11 its user and system CPU time; the batch's output carries them), `VCI_RAILS_EXPERIMENT` (since 2.7.34, measurement switches of a Rails batch, comma separated, each measured on vex's runners and found not to change a file's process beyond noise: `eager` eager-loads the application and draws its routes in the batch's process before the slots fork, so every file records them as inputs; `routes` draws the routes only (since 2.11 a batch does it by default with `rails_inputs = "loose"`); `warmup` calls `Process.warmup` in each slot once it is set up; `iseq` keeps each source file's compiled instruction sequence under this run's output directory, keyed by path, size and mtime, so a batch compiles a file once instead of once per process), `VCI_GO`
+since 2.11.1), `VCI_RAILS_PER_FILE` (`1`: `vci run` starts one Ruby process per Rails file instead of booting once per runner and forking one process per file), `VCI_RAILS_SHARED_OUTPUT` (`0`: in a Rails batch, each file's process writes all of its output instead of only what it does not share with the other files of its boot), `VCI_RAILS_OWN_OUTPUT` (`0`, since 2.11: in a Rails batch, each file's process makes all of its lines and splits off the shared ones, instead of making only the lines of what it recorded after the fork; the same lines either way), `VCI_RAILS_WORKER_FILES` (since 2.12: a number overrides the project's `rails_worker_files`, the test files one process of a Minitest batch's slot runs one after the other; `1`: one process per file; see "Several files per process"), `VCI_RAILS_PRELOAD_ROUTES` (`0`, since 2.11: a Rails batch does not draw the application's routes in its boot; see "What a batch file's process costs"), `VCI_RAILS_ZYGOTE` (`off`, `gems` or `common`, since 2.12: overrides the project's `rails_zygote`; see "Slot zygotes"), `VCI_RAILS_ZYGOTE_HINTS` and `VCI_RAILS_ZYGOTE_SAMPLES` (since 2.12, diagnostic: a file of absolute paths every slot's zygote preloads at once; how many files' loads a zygote waits for), `VCI_RAILS_PROFILE` (`1`, since 2.7.34: each Rails file's process prints one `vci-profile` line with its top-level requires' time and count, the routes' first draw, the garbage collector's time and count (since 2.11 also its major and minor collections), its own time from the fork, and since 2.11 its user and system CPU time; the batch's output carries them; with `VCI_RAILS_PROFILE_LOADS` naming a directory, since 2.12, each also writes there the Ruby files it loaded after the fork), `VCI_RAILS_EXPERIMENT` (since 2.7.34, measurement switches of a Rails batch, comma separated, each measured on vex's runners and found not to change a file's process beyond noise: `eager` eager-loads the application and draws its routes in the batch's process before the slots fork, so every file records them as inputs; `routes` draws the routes only (since 2.11 a batch does it by default with `rails_inputs = "loose"`); `warmup` calls `Process.warmup` in each slot once it is set up; `iseq` keeps each source file's compiled instruction sequence under this run's output directory, keyed by path, size and mtime, so a batch compiles a file once instead of once per process; `nomajor`, since 2.12, turns off the garbage collector's full marks in each file's process (`GC.config(rgengc_allow_full_mark: false)`): with slot zygotes a file's process ran 0.1 full marks on average and its CPU time did not change), `VCI_GO`
 (go binary), `VCI_CARGO` (cargo binary; rustc is `$RUSTC` when declared, else `rustc` on PATH), `VCI_CARGO_JOBS` (Cargo test
 executables run at once in `vci run` and `vci ci`; default: the number of CPUs; cargo itself runs one build at a
 time), `VCI_RUBY` (ruby binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory
@@ -2867,7 +3210,12 @@ adapter = "vitest"     # or "pytest", "go", "cargo", "rails", "node-test"
 # runner = "rspec"     # rails only: "minitest" or "rspec" (unset: detected, see Quick start (RSpec)); in [[projects]] per project
 # rails_inputs = "strict"  # rails only: "loose" (default since 2.7.36: routes, initializers, boot files, migrations, locales,
                            # autoload records are not inputs) or "strict"; in [[projects]] per project
+# rails_zygote = "common"  # rails only (2.12): what a batch's slot zygote preloads, "off" (default, no zygote), "gems" or "common";
+                           # see "Slot zygotes" under Quick start (Rails); in [[projects]] per project
 # ignore_inputs = ["config/credentials/**"]  # rails only: more globs (relative to the project dir) that are never inputs
+# rails_worker_files = 5  # rails (Minitest) only, since 2.12: test files one process of a batch's slot runs one after
+                          # the other (default 1: one process per file); each file's inputs are everything its process
+                          # observed up to its end, so more files run again (see "Several files per process")
 # test_script = "test" # node-test only: the package.json script that runs `node --test` (default "test"); or instead:
 # test_globs = ["src/**/*.test.ts"]                  # node-test only: test file globs (node:test's glob syntax)
 # node_args = ["--import", "./test/hooks.mjs"]       # node-test only, with test_globs: node options
@@ -2890,6 +3238,8 @@ go_allow_net = false   # Go: attest packages whose test links package net (see "
 ignore_taints = []     # taints that do not refuse a unit (globs over reason keys, "*" = all; see "Waiving taints: policy.ignore_taints")
 node_exact = false     # Vitest and node-test: require the exact Node version (default: the same major)
 allow_superuser_mismatch = false # accept attestations made as root where CI is not, or the other way round (risky: see below)
+toolchain = "probed"   # since 2.12.0, Rails: "declared" lets `vci plan --early` take the toolchain from the checkout
+                       # (version files, Gemfile.lock) instead of probing it; see "The early plan"
 
 [[policy.platform_overrides]]
 match = ["src/native/**"]   # project-relative globs

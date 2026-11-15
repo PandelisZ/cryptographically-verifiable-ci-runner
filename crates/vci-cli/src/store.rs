@@ -369,6 +369,8 @@ pub mod mem {
         /// server would answer with a request each.
         columns_calls: AtomicUsize,
         object_reads: AtomicUsize,
+        /// How many values `read_values` was asked for.
+        values_read: AtomicUsize,
         /// How many records `columns` was asked about, how many times
         /// `object_sizes` was called, and how many bytes `get_objects`
         /// answered.
@@ -496,6 +498,11 @@ pub mod mem {
 
         /// How many times [`AttestationStore::columns`] was called (a
         /// request each on a server).
+        /// How many values `read_values` was asked for, in all.
+        pub fn values_read(&self) -> usize {
+            self.state.values_read.load(Ordering::SeqCst)
+        }
+
         pub fn columns_calls(&self) -> usize {
             self.state.columns_calls.load(Ordering::SeqCst)
         }
@@ -652,6 +659,9 @@ pub mod mem {
         }
 
         fn read_values(&self, envs: &mut [&mut StoredEnvelope]) -> Result<(), StoreError> {
+            self.state
+                .values_read
+                .fetch_add(envs.len(), Ordering::SeqCst);
             let d = self.state.data.lock().unwrap();
             for e in envs.iter_mut() {
                 match d.attestations.get(&e.key) {

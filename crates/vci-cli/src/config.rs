@@ -57,6 +57,16 @@ pub struct Config {
     /// project dir) whose files are never inputs; see [`RailsInputs`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_inputs: Option<Vec<String>>,
+    /// Rails adapter (single-project form, 2.12.0): what a batch's slot
+    /// zygote preloads, `"gems"` (default), `"common"` or `"off"`; see
+    /// [`vci_adapter::RailsZygote`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rails_zygote: Option<vci_adapter::RailsZygote>,
+    /// Rails adapter (single-project form, 2.12.0): how many test files one
+    /// process of a batch's slot runs one after the other (default 1: one
+    /// process per file); see [`check_rails_worker_files`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rails_worker_files: Option<u32>,
     #[serde(default)]
     pub policy: Policy,
     #[serde(default)]
@@ -143,6 +153,13 @@ pub struct ProjectConfig {
     /// are never inputs.
     #[serde(default)]
     pub ignore_inputs: Option<Vec<String>>,
+    /// Rails adapter (2.12.0): what a batch's slot zygote preloads; see
+    /// [`vci_adapter::RailsZygote`].
+    #[serde(default)]
+    pub rails_zygote: Option<vci_adapter::RailsZygote>,
+    /// Rails adapter (2.12.0): test files per process of a batch's slot.
+    #[serde(default)]
+    pub rails_worker_files: Option<u32>,
     #[serde(default)]
     pub policy: Option<PolicyOverride>,
     #[serde(default)]
@@ -174,6 +191,7 @@ pub struct PolicyOverride {
     pub node_exact: Option<bool>,
     pub allow_superuser_mismatch: Option<bool>,
     pub rails_autoload_lookups: Option<bool>,
+    pub toolchain: Option<ToolchainTrust>,
 }
 
 /// Per-project env keys; each one given replaces the top-level key.
@@ -210,6 +228,10 @@ pub struct ProjectSpec {
     pub rails_inputs: Option<RailsInputs>,
     /// Rails: the `ignore_inputs` setting.
     pub ignore_inputs: Vec<String>,
+    /// Rails: the `rails_zygote` setting (the default when unset).
+    pub rails_zygote: vci_adapter::RailsZygote,
+    /// Rails: the `rails_worker_files` setting (`None`: 1).
+    pub rails_worker_files: Option<u32>,
     pub policy: Policy,
     pub env: EnvConfig,
     pub inputs: Vec<InputsConfig>,
@@ -368,6 +390,37 @@ fn check_runner(what: &str, adapter: &str, runner: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `rails_zygote` is a setting of the rails adapter.
+fn check_rails_zygote(
+    what: &str,
+    adapter: &str,
+    set: Option<vci_adapter::RailsZygote>,
+) -> Result<()> {
+    if set.is_some() && adapter != "rails" {
+        bail!("{what}: `rails_zygote` is a setting of the rails adapter, not {adapter:?}");
+    }
+    Ok(())
+}
+
+/// `rails_worker_files` (2.12.0) is a setting of the rails adapter, at
+/// least one. With K above 1, a slot of a Minitest batch runs up to K test
+/// files in one process, one after the other, and each file's inputs are
+/// everything that process observed up to the end of that file (the earlier
+/// files of the process included): faster, less precise. 1 is one process
+/// per file.
+fn check_rails_worker_files(what: &str, adapter: &str, k: Option<u32>) -> Result<()> {
+    let Some(k) = k else {
+        return Ok(());
+    };
+    if adapter != "rails" {
+        bail!("{what}: `rails_worker_files` is a setting of the rails adapter, not {adapter:?}");
+    }
+    if k == 0 {
+        bail!("{what}: rails_worker_files must be at least 1 (1: one process per test file)");
+    }
+    Ok(())
+}
+
 /// `rails_inputs` and `ignore_inputs` are settings of the rails adapter;
 /// each glob is relative to the project dir, without `..`.
 fn check_rails_inputs(
@@ -461,6 +514,26 @@ pub enum Platform {
     Any,
     SameOs,
     Exact,
+}
+
+/// Whether `vci plan --early` may take a project's toolchain from what the
+/// checkout declares (`policy.toolchain`, since 2.12.0). The full plan
+/// (`vci plan`, `vci ci`) always probes the toolchain and is not changed by
+/// this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolchainTrust {
+    /// The default: the early plan cannot decide the project (it answers
+    /// "run"), because only a probe of the installed toolchain says what the
+    /// full plan compares.
+    #[default]
+    Probed,
+    /// Rails: the early plan, which runs before the toolchain is installed,
+    /// compares an attestation's toolchain with what the checkout declares
+    /// (the exact Ruby version of the version files, Bundler, Rails and the
+    /// gems of `Gemfile.lock`, the collector of this vci) instead of probing
+    /// it; see docs/REFERENCE.md, "The early plan".
+    Declared,
 }
 
 /// How native libraries and the interpreter's library versions are compared
@@ -597,6 +670,14 @@ pub struct Policy {
     /// `vci run` reads allows it.
     #[serde(default)]
     pub rails_autoload_lookups: bool,
+    /// `vci plan --early` (2.12.0): "declared" lets the early plan, which
+    /// runs before the toolchain is installed, take a Rails project's
+    /// toolchain from what the checkout declares; "probed" (the default)
+    /// makes the early plan answer "run" for the project. See
+    /// [`ToolchainTrust`]. Read from the base commit. Never changes what
+    /// the full plan decides.
+    #[serde(default)]
+    pub toolchain: ToolchainTrust,
 }
 
 fn default_max_ttl() -> String {
@@ -624,6 +705,7 @@ impl Default for Policy {
             node_exact: false,
             allow_superuser_mismatch: false,
             rails_autoload_lookups: false,
+            toolchain: ToolchainTrust::Probed,
         }
     }
 }
@@ -987,6 +1069,8 @@ impl Config {
                 self.rails_inputs,
                 self.ignore_inputs.as_deref(),
             )?;
+            check_rails_zygote("vci.toml", adapter, self.rails_zygote)?;
+            check_rails_worker_files("vci.toml", adapter, self.rails_worker_files)?;
             check_rel("project", self.project.as_deref().unwrap_or("."))?;
             return Ok(());
         }
@@ -996,9 +1080,11 @@ impl Config {
             || self.node_test_options() != vci_adapter::NodeTestOptions::default()
             || self.rails_inputs.is_some()
             || self.ignore_inputs.is_some()
+            || self.rails_zygote.is_some()
+            || self.rails_worker_files.is_some()
         {
             bail!(
-                "top-level `project`/`adapter`/`runner`/`test_script`/`test_globs`/`node_args`/`rails_inputs`/`ignore_inputs` cannot be combined with [[projects]]; give each project its own"
+                "top-level `project`/`adapter`/`runner`/`test_script`/`test_globs`/`node_args`/`rails_inputs`/`ignore_inputs`/`rails_zygote`/`rails_worker_files` cannot be combined with [[projects]]; give each project its own"
             );
         }
         let mut names = std::collections::BTreeSet::new();
@@ -1039,6 +1125,12 @@ impl Config {
                 &p.adapter,
                 p.rails_inputs,
                 p.ignore_inputs.as_deref(),
+            )?;
+            check_rails_zygote(&format!("project {:?}", p.name), &p.adapter, p.rails_zygote)?;
+            check_rails_worker_files(
+                &format!("project {:?}", p.name),
+                &p.adapter,
+                p.rails_worker_files,
             )?;
             if !dirs.insert((normalise_rel(&p.path), p.adapter.clone())) {
                 bail!(
@@ -1147,6 +1239,8 @@ impl Config {
                     self.rails_inputs,
                 ),
                 ignore_inputs: self.ignore_inputs.clone().unwrap_or_default(),
+                rails_zygote: self.rails_zygote.unwrap_or_default(),
+                rails_worker_files: self.rails_worker_files,
                 policy: Policy {
                     removed_rails_allow_db: None,
                     ..self.policy.clone()
@@ -1205,6 +1299,9 @@ impl Config {
                     if let Some(v) = o.rails_autoload_lookups {
                         policy.rails_autoload_lookups = v;
                     }
+                    if let Some(v) = o.toolchain {
+                        policy.toolchain = v;
+                    }
                 }
                 let mut env = self.env.clone();
                 if let Some(o) = &p.env {
@@ -1236,6 +1333,8 @@ impl Config {
                     },
                     rails_inputs: rails_mode(&p.adapter, p.rails_inputs),
                     ignore_inputs: p.ignore_inputs.clone().unwrap_or_default(),
+                    rails_zygote: p.rails_zygote.unwrap_or_default(),
+                    rails_worker_files: p.rails_worker_files,
                     policy,
                     env,
                     inputs: p.inputs.clone().unwrap_or_else(|| self.inputs.clone()),
@@ -2215,6 +2314,38 @@ mod tests {
         }
     }
 
+    /// `rails_zygote` (2.12.0): "off" by default, "gems" or "common" when
+    /// set, in the single-project form or a project's table; only the rails
+    /// adapter takes it.
+    #[test]
+    fn rails_zygote_setting() {
+        use vci_adapter::RailsZygote;
+        let c = Config::parse(RAILS_TEMPLATE).unwrap();
+        assert_eq!(c.project_specs()[0].rails_zygote, RailsZygote::Off);
+        let c = Config::parse("adapter = \"rails\"\nrails_zygote = \"gems\"\n").unwrap();
+        assert_eq!(c.project_specs()[0].rails_zygote, RailsZygote::Gems);
+        let c = Config::parse("adapter = \"rails\"\nrails_zygote = \"common\"\n").unwrap();
+        assert_eq!(c.project_specs()[0].rails_zygote, RailsZygote::Common);
+        let c = Config::parse(
+            "[[projects]]\nname = \"api\"\npath = \"api\"\nadapter = \"rails\"\nrails_zygote = \"gems\"\n\n[[projects]]\nname = \"web\"\npath = \"web\"\nadapter = \"vitest\"\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert_eq!(s[0].rails_zygote, RailsZygote::Gems);
+        assert_eq!(s[1].rails_zygote, RailsZygote::Off);
+        for bad in [
+            "adapter = \"rails\"\nrails_zygote = \"all\"\n",
+            "adapter = \"pytest\"\nrails_zygote = \"gems\"\n",
+            "rails_zygote = \"gems\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n",
+            "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"go\"\nrails_zygote = \"common\"\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(RailsZygote::parse(" common "), Some(RailsZygote::Common));
+        assert_eq!(RailsZygote::parse("0"), Some(RailsZygote::Off));
+        assert_eq!(RailsZygote::parse("eager"), None);
+    }
+
     /// `rails_inputs` (2.7.36): loose by default for Rails projects, none
     /// for the others; `ignore_inputs` adds to the loose list, and is the
     /// whole list in strict mode. Only the rails adapter takes them.
@@ -2262,6 +2393,33 @@ mod tests {
             "adapter = \"rails\"\nignore_inputs = [\"\"]\n",
             "rails_inputs = \"strict\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n",
             "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"go\"\nignore_inputs = [\"x\"]\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// `rails_worker_files` (2.12.0): unset by default (one process per
+    /// file), at least 1, a setting of the rails adapter only, per project
+    /// in `[[projects]]`.
+    #[test]
+    fn rails_worker_files_setting() {
+        let c = Config::parse(RAILS_TEMPLATE).unwrap();
+        assert_eq!(c.project_specs()[0].rails_worker_files, None);
+        let c = Config::parse("adapter = \"rails\"\nrails_worker_files = 5\n").unwrap();
+        assert_eq!(c.project_specs()[0].rails_worker_files, Some(5));
+        let c = Config::parse(
+            "[[projects]]\nname = \"api\"\npath = \"api\"\nadapter = \"rails\"\nrails_worker_files = 3\n\n[[projects]]\nname = \"web\"\npath = \"web\"\nadapter = \"vitest\"\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert_eq!(s[0].rails_worker_files, Some(3));
+        assert_eq!(s[1].rails_worker_files, None);
+        for bad in [
+            "adapter = \"rails\"\nrails_worker_files = 0\n",
+            "adapter = \"rails\"\nrails_worker_files = -1\n",
+            "adapter = \"pytest\"\nrails_worker_files = 2\n",
+            "rails_worker_files = 2\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n",
+            "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"go\"\nrails_worker_files = 2\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
