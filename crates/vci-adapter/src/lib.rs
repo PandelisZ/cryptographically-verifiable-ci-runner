@@ -167,6 +167,10 @@ pub struct RunHints {
     /// project's `rails_zygote`; `VCI_RAILS_ZYGOTE` in vci's environment
     /// overrides it).
     pub rails_zygote: RailsZygote,
+    /// Rails (2.12.0): the project's `rails_worker_files`, test files per
+    /// process of a batch's slot (0 or 1: one process per file;
+    /// `VCI_RAILS_WORKER_FILES` in vci's environment overrides it).
+    pub rails_worker_files: u32,
 }
 
 /// `rails_zygote` (2.12.0): what a Rails batch's slot loads, in a zygote

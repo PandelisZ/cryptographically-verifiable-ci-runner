@@ -2997,6 +2997,7 @@ pub fn run_units(
                         == Some(crate::config::RailsInputs::Loose)
                         && vci_adapter::preload_routes_wanted(),
                     rails_zygote: project.rails_zygote,
+                    rails_worker_files: project.rails_worker_files.unwrap_or(1),
                 },
             )?;
             Ok((go_tree, out))
