@@ -214,7 +214,8 @@ fn run_script_of(step: &Step) -> String {
 /// `command: ci` plans once: one `vci ci --fetch` fetches the attestations
 /// while it probes the projects, plans, prints the plan and runs what is
 /// left. No separate fetch or plan step runs; `command: plan` runs the one
-/// `vci plan --fetch`.
+/// `vci plan --fetch`, and `command: early` (2.12.0) the one `vci plan
+/// --early --fetch`, which exits 0 and outputs `skip_all`.
 #[test]
 fn the_action_plans_once_and_fetches_while_planning() {
     let action = read("action.yml");
@@ -230,9 +231,20 @@ fn the_action_plans_once_and_fetches_while_planning() {
         .iter()
         .filter(|s| s.body.contains("vci plan ") || s.body.contains("vci ci "))
         .collect();
-    assert_eq!(planning.len(), 2, "one step per command");
+    assert_eq!(planning.len(), 3, "one step per command");
     let plan = planning.iter().find(|s| s.id == "plan").unwrap();
-    assert_eq!(plan.cond, "inputs.command != 'ci'");
+    assert_eq!(
+        plan.cond,
+        "inputs.command != 'ci' && inputs.command != 'early'"
+    );
+    let early = planning.iter().find(|s| s.id == "early").unwrap();
+    assert_eq!(early.cond, "inputs.command == 'early'");
+    let script = run_script_of(early);
+    assert!(
+        script.contains("args=(--early --fetch \"$REMOTE\" --base-ref \"$BASE\" --format github)"),
+        "{script}"
+    );
+    assert!(script.contains("skip_all=false"), "fails open: {script}");
     assert!(
         run_script_of(plan).contains("vci plan --fetch \"$REMOTE\" --base-ref \"$BASE\""),
         "{}",
@@ -254,13 +266,14 @@ fn the_action_plans_once_and_fetches_while_planning() {
     for (name, want) in [
         (
             "skipped",
-            "${{ steps.ci.outputs.skipped || steps.plan.outputs.skipped }}",
+            "${{ steps.ci.outputs.skipped || steps.plan.outputs.skipped || steps.early.outputs.skipped }}",
         ),
         (
             "run",
-            "${{ steps.ci.outputs.run || steps.plan.outputs.run }}",
+            "${{ steps.ci.outputs.run || steps.plan.outputs.run || steps.early.outputs.run }}",
         ),
         ("attested", "${{ steps.ci.outputs.attested }}"),
+        ("skip-all", "${{ steps.early.outputs.skip_all }}"),
     ] {
         let (_, body) = outputs.iter().find(|(n, _)| n == name).unwrap();
         assert!(body.contains(&format!("value: {want}")), "{name}: {body}");

@@ -227,6 +227,21 @@ pub struct PlanResult {
     /// from, for `explain`.
     #[serde(skip)]
     pub store_kind: &'static str,
+    /// `vci plan --early`: the answer (set by the command once the plan is
+    /// made, for its `--partition`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub early: Option<crate::early::EarlyAnswer>,
+}
+
+impl ProjectPlan {
+    /// Name for messages: the project name, else its directory.
+    pub fn label(&self) -> String {
+        if self.name.is_empty() {
+            self.path.clone()
+        } else {
+            self.name.clone()
+        }
+    }
 }
 
 impl PlanResult {
@@ -248,6 +263,11 @@ pub struct PlanOptions {
     /// `--project`: only these `[[projects]]` (empty: every project). The
     /// others are not listed, probed or verified.
     pub projects: Vec<String>,
+    /// `--early` (2.12.0): plan before the toolchain is installed. A Rails
+    /// project whose base policy says `toolchain = "declared"` is verified
+    /// against what the checkout declares ([`crate::early`]); every other
+    /// project runs everything. Nothing is written to the store.
+    pub early: bool,
 }
 
 /// Resolve the base ref: explicit, `$VCI_BASE_REF`, `$GITHUB_BASE_REF`
@@ -402,6 +422,9 @@ struct Verifier<'a> {
     cargo_lock: Option<Result<vci_adapter::InstalledExternals, String>>,
     /// Rails: the gems of the bundle Bundler resolves in this checkout.
     rails_gems: Option<Result<vci_adapter::InstalledExternals, String>>,
+    /// `vci plan --early`: the toolchain the checkout declares, compared
+    /// instead of the probed one ([`crate::early::toolchain_diff`]).
+    declared: Option<Arc<crate::early::Declared>>,
     /// Rails: the native libraries the application opens through FFI when it
     /// boots, resolved only when a candidate records one (the plan's only
     /// boot of the application: once per project, and none when no candidate
@@ -2165,6 +2188,7 @@ fn plan_timed(opts: &PlanOptions) -> Result<PlanResult> {
         allowed: None,
         fetch_failed: None,
         store_kind: store.kind(),
+        early: None,
     };
     // The store selection's warnings (printed when it was opened).
     res.warnings.extend(crate::store::warnings_of(&repo));
@@ -2277,6 +2301,8 @@ struct Resolved {
     go_modules: Option<Result<vci_adapter::InstalledExternals, String>>,
     cargo_lock: Option<Result<vci_adapter::InstalledExternals, String>>,
     rails_gems: Option<Result<vci_adapter::InstalledExternals, String>>,
+    /// `--early`: what the checkout declares, compared instead of a probe.
+    declared: Option<Arc<crate::early::Declared>>,
 }
 
 /// `VCI_TIMING=1`: print how long a phase of the plan took, on stderr.
@@ -2326,6 +2352,7 @@ fn unused_hint_flag(project: &str) -> String {
 /// List a project's test files and, with `resolve`, resolve its toolchain
 /// and externals at the same time (both may shell out: uv, go, cargo, ruby;
 /// pytest and Minitest files are listed without a process).
+#[allow(clippy::too_many_arguments)]
 fn probe_project(
     ctx: &Ctx,
     store: &dyn AttestationStore,
@@ -2334,13 +2361,18 @@ fn probe_project(
     child: &ChildEnvMap,
     resolve: bool,
     repo_id: &Result<String, String>,
+    early: bool,
 ) -> Probed {
     let env = child.to_child_env();
     std::thread::scope(|s| {
         let resolving = resolve.then(|| {
             s.spawn(|| {
                 let t = std::time::Instant::now();
-                let r = resolve_project(ctx, project, &env, repo_id);
+                let r = if early {
+                    resolve_declared(ctx, project, child, repo_id)
+                } else {
+                    resolve_project(ctx, project, &env, repo_id)
+                };
                 timing(
                     &format!("{}: resolve toolchain and externals", project.name),
                     t,
@@ -2359,7 +2391,7 @@ fn probe_project(
         // ([`start_native_boots`]), unless a plan before it started one that
         // way for nothing ([`unused_hint_flag`], asked on the same thread
         // only when the first flag is not set).
-        let natives = (resolve && project.adapter.name() == "rails").then(|| {
+        let natives = (resolve && !early && project.adapter.name() == "rails").then(|| {
             s.spawn(|| {
                 if store.flag(&natives_flag(&project.name)) {
                     project.adapter.start_native_externals(&env);
@@ -2434,9 +2466,46 @@ fn resolve_project(
             go_modules: listed("go"),
             cargo_lock: listed("cargo"),
             rails_gems: listed("rails"),
+            declared: None,
         })
     })()
     .map_err(|e| format!("{e:#}"))
+}
+
+/// `--early`: what the checkout declares about a Rails project's toolchain
+/// ([`crate::early::declare`]) instead of a probe; no process is started.
+/// The gems the externals check reads are the lockfile's.
+fn resolve_declared(
+    ctx: &Ctx,
+    project: &Project,
+    child: &ChildEnvMap,
+    repo_id: &Result<String, String>,
+) -> Result<Resolved, String> {
+    let repo_id = repo_id.clone()?;
+    let max_ttl = project
+        .policy
+        .max_ttl_secs()
+        .map_err(|e| format!("{e:#}"))?;
+    // BUNDLE_GEMFILE where vci runs, or set for the tests.
+    let gemfile = child
+        .get("BUNDLE_GEMFILE")
+        .map(|v| v.to_string_lossy().into_owned())
+        .or_else(|| std::env::var("BUNDLE_GEMFILE").ok());
+    let declared = Arc::new(crate::early::declare(
+        &ctx.root,
+        &project.dir,
+        gemfile.as_deref(),
+    ));
+    Ok(Resolved {
+        repo_id,
+        versions: vci_adapter::ToolVersions::default(),
+        max_ttl,
+        python_externals: None,
+        go_modules: None,
+        cargo_lock: None,
+        rails_gems: Some(crate::early::lock_gems(&declared)),
+        declared: Some(declared),
+    })
 }
 
 /// Start the boot of each Rails project whose read format-3 candidates name
@@ -2623,6 +2692,18 @@ fn plan_with(
             start
         })
         .collect();
+    // `--early`: a project the early plan cannot decide runs everything,
+    // and is not listed or probed (its toolchain is not installed yet).
+    let mut starts = starts;
+    let mut not_early: Vec<bool> = vec![false; ctx.projects.len()];
+    if opts.early {
+        for (i, (p, start)) in ctx.projects.iter().zip(starts.iter_mut()).enumerate() {
+            if let Some(why) = crate::early::undecidable(p.adapter.name(), p.policy.toolchain) {
+                start.run_all.get_or_insert(why);
+                not_early[i] = true;
+            }
+        }
+    }
     let repo_id = ctx.repo.repo_id().map_err(|e| format!("{e:#}"));
     let probed: Vec<Probed> = std::thread::scope(|s| {
         let handles: Vec<_> = ctx
@@ -2633,7 +2714,18 @@ fn plan_with(
             .map(|(i, (p, start))| {
                 let resolve = start.run_all.is_none() && trusted;
                 let (ctx, repo_id) = (&ctx, &repo_id);
-                s.spawn(move || probe_project(ctx, store, i, p, &start.child, resolve, repo_id))
+                let (early, skip) = (opts.early, not_early[i]);
+                s.spawn(move || {
+                    if skip {
+                        return Probed {
+                            files: Ok(Vec::new()),
+                            warnings: Vec::new(),
+                            resolved: None,
+                            boot_hint: false,
+                        };
+                    }
+                    probe_project(ctx, store, i, p, &start.child, resolve, repo_id, early)
+                })
             })
             .collect();
         handles
@@ -2832,6 +2924,7 @@ fn plan_with(
                     go_modules: r.go_modules,
                     cargo_lock: r.cargo_lock,
                     rails_gems: r.rails_gems,
+                    declared: r.declared,
                     natives: std::sync::OnceLock::new(),
                     manifests: ManifestLoader::default(),
                     objects: &objects,
@@ -2962,7 +3055,9 @@ fn plan_with(
     }
     // What passed on this tree, for the plans whose base commit it is
     // (2.7.29; see `passing_memos`).
-    if let Some(head) = head_tree.as_deref() {
+    // Not after an early plan: its skips trust the declared toolchain, and
+    // a memo is read by full plans, which choose their candidates by it.
+    if let Some(head) = head_tree.as_deref().filter(|_| !opts.early) {
         let t = std::time::Instant::now();
         let passed: Vec<(String, String)> = verdicts
             .iter()
@@ -5402,11 +5497,48 @@ impl Verifier<'_> {
 
         // Toolchain (adapter-specific tools; see Toolchain::diff).
         let tc = p.toolchain();
-        let now_tc = crate::run::toolchain_for(adapter.name(), &self.versions);
         let libraries = self.project.policy.libraries_for(&f.project_rel);
-        let mut tdiff = toolchain_diff(&self.project.policy, libraries, tc, &now_tc);
-        info.accepted_by_policy
-            .extend(libraries_accepted(libraries, tc, &now_tc));
+        // `vci plan --early`: the declared toolchain instead of the probed
+        // one, and the same platform whatever the policy accepts.
+        if let Some(d) = &self.declared {
+            let env = self.project.file_env(&f.project_rel);
+            let compared = |k: &str| {
+                crate::envpolicy::list_matches(&env.hash, k)
+                    || crate::envpolicy::list_matches(&env.builtin_hash, k)
+                    || crate::envpolicy::list_matches(&env.loose_hash, k)
+            };
+            let tdiff = crate::early::toolchain_diff(
+                self.project.policy.allow_superuser_mismatch,
+                libraries,
+                tc,
+                d,
+                &compared,
+            );
+            if !tdiff.is_empty() {
+                return Err(Failure {
+                    check: "toolchain",
+                    rank: 10,
+                    details: tdiff
+                        .into_iter()
+                        .map(|(w, e, a)| Detail {
+                            what: w.into(),
+                            expected: e,
+                            actual: a,
+                        })
+                        .collect(),
+                });
+            }
+        }
+        let now_tc = crate::run::toolchain_for(adapter.name(), &self.versions);
+        let mut tdiff = if self.declared.is_some() {
+            Vec::new()
+        } else {
+            toolchain_diff(&self.project.policy, libraries, tc, &now_tc)
+        };
+        if self.declared.is_none() {
+            info.accepted_by_policy
+                .extend(libraries_accepted(libraries, tc, &now_tc));
+        }
         let platform = self.project.policy.platform_for(&f.project_rel);
         tdiff.extend(platform_diff(
             platform,
@@ -5648,6 +5780,17 @@ impl Verifier<'_> {
                 }
                 (None, None, Some(lock), _) => {
                     crate::externals::cargo_locked(lock, &e.name, &e.version)
+                }
+                (None, None, None, Some(_))
+                    if e.name.starts_with(crate::externals::NATIVE_PREFIX)
+                        && self.declared.is_some() =>
+                {
+                    crate::early::native(&e.name, libraries).map(|note| {
+                        if let Some(n) = note {
+                            info.accepted_by_policy
+                                .push(format!("external:{}: {n}", e.name));
+                        }
+                    })
                 }
                 (None, None, None, Some(_))
                     if e.name.starts_with(crate::externals::NATIVE_PREFIX) =>
@@ -5893,6 +6036,158 @@ fn no_skip_ref_failure(r: &str, principal: &str, except: &[String]) -> Failure {
 }
 
 /// Load the plan and print it in `format`.
+/// Write the plan as JSON (what `--format json` prints) to `path`.
+pub fn write_json(res: &PlanResult, path: &camino::Utf8Path) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_str().is_empty()) {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {parent}"))?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(res)?;
+    bytes.push(b'\n');
+    std::fs::write(path, bytes).with_context(|| format!("writing {path}"))
+}
+
+/// The early plan's answer for this plan (and partition): every unit of
+/// the listed projects skipped (in the partition) and none running
+/// everything.
+pub fn early_answer(
+    res: &PlanResult,
+    split: Option<&crate::partition::Split>,
+) -> crate::early::EarlyAnswer {
+    let skipped = res.skipped().count();
+    let mut why: Option<String> = res
+        .run_all
+        .as_ref()
+        .map(|r| format!("running everything: {r}"));
+    let run = match split {
+        Some(s) => {
+            let whole = res
+                .projects
+                .iter()
+                .zip(&s.shares)
+                .find(|(_, sh)| **sh == crate::partition::Share::Whole);
+            if let Some((p, _)) = whole {
+                why.get_or_insert_with(|| {
+                    format!(
+                        "{} runs everything: {}",
+                        p.label(),
+                        p.run_all
+                            .as_deref()
+                            .unwrap_or("its test files could not be listed")
+                    )
+                });
+            }
+            s.units() + usize::from(whole.is_some())
+        }
+        None => {
+            if let Some(p) = res.projects.iter().find(|p| p.run_all.is_some()) {
+                why.get_or_insert_with(|| {
+                    format!(
+                        "{} runs everything: {}",
+                        p.label(),
+                        p.run_all.as_deref().unwrap_or_default()
+                    )
+                });
+            }
+            res.to_run().count()
+        }
+    };
+    if why.is_none() && run > 0 {
+        why = Some(format!("{run} unit(s) to run"));
+    }
+    if why.is_none() && res.projects.is_empty() {
+        why = Some("no project was planned".into());
+    }
+    crate::early::EarlyAnswer {
+        skip_all: why.is_none() && run == 0,
+        skipped,
+        run,
+        partition: split.map(|s| s.part.to_string()),
+        why,
+    }
+}
+
+/// `vci plan --early`: plan, answer, print. Never fails: a plan that cannot
+/// be made answers "run" (exit 0).
+pub fn early(
+    opts: &PlanOptions,
+    partition: Option<crate::partition::Partition>,
+    format: &str,
+    json_file: Option<&camino::Utf8Path>,
+) -> i32 {
+    let made = plan(opts).and_then(|mut res| {
+        let root = open_repo()?.1;
+        let split = partition.map(|p| crate::partition::Split::new(&res, p, root.as_std_path()));
+        res.early = Some(early_answer(&res, split.as_ref()));
+        Ok(res)
+    });
+    let res = match made {
+        Ok(res) => res,
+        Err(e) => {
+            let why = format!("the plan failed: {e:#}");
+            eprintln!("vci: warning: early plan: {why}");
+            PlanResult {
+                base_ref: None,
+                base_commit: None,
+                run_all: Some(why.clone()),
+                warnings: vec![],
+                projects: vec![],
+                files: vec![],
+                multi: false,
+                config: None,
+                allowed: None,
+                fetch_failed: None,
+                store_kind: "",
+                early: Some(crate::early::EarlyAnswer {
+                    skip_all: false,
+                    skipped: 0,
+                    run: 0,
+                    partition: partition.map(|p| p.to_string()),
+                    why: Some(why),
+                }),
+            }
+        }
+    };
+    if let Some(f) = json_file
+        && let Err(e) = write_json(&res, f)
+    {
+        eprintln!("vci: warning: early plan: {e:#}");
+    }
+    if let Some(w) = &res.fetch_failed
+        && format != "json"
+    {
+        println!("::warning title=vci::{}", w.replace(['\r', '\n'], " "));
+    }
+    if let Err(e) = print(&res, format) {
+        eprintln!("vci: warning: early plan: {e:#}");
+    }
+    0
+}
+
+/// The early answer's line of the text plan, and its outputs for GitHub.
+fn early_lines(a: &crate::early::EarlyAnswer) -> (String, String) {
+    let part = a
+        .partition
+        .as_deref()
+        .map(|p| format!(" in partition {p}"))
+        .unwrap_or_default();
+    let text = if a.skip_all {
+        format!(
+            "early: skip all{part}: {} unit(s) skipped, nothing to run: the toolchain need not be set up",
+            a.skipped
+        )
+    } else {
+        format!(
+            "early: run{part}: {}: set the toolchain up and run `vci ci`",
+            printable(a.why.as_deref().unwrap_or("something may run"))
+        )
+    };
+    let outputs = format!(
+        "skip_all={}\nskipped_count={}\nrun_count={}\n",
+        a.skip_all, a.skipped, a.run
+    );
+    (text, outputs)
+}
+
 pub fn print(res: &PlanResult, format: &str) -> Result<()> {
     match format {
         "json" => {
@@ -5958,6 +6253,11 @@ pub fn print(res: &PlanResult, format: &str) -> Result<()> {
                 run.join(" "),
                 skip.join(" ")
             );
+            if let Some(a) = &res.early {
+                let (text, outputs) = early_lines(a);
+                println!("::notice title=vci early::{}", github_data(&text));
+                lines.push_str(&outputs);
+            }
             if res.multi {
                 for (i, p) in res.projects.iter().enumerate() {
                     let files: Vec<&str> = res
@@ -6025,6 +6325,9 @@ pub fn print(res: &PlanResult, format: &str) -> Result<()> {
                 println!("{line}");
             }
             println!("{}", summary_line(res));
+            if let Some(a) = &res.early {
+                println!("{}", early_lines(a).0);
+            }
         }
     }
     Ok(())
@@ -6892,6 +7195,7 @@ mod tests {
             allowed: None,
             fetch_failed: None,
             store_kind: "git-meta",
+            early: None,
         };
         let line = summary_line(&res);
         assert!(line.contains("running everything"), "{line}");
@@ -6984,6 +7288,7 @@ mod tests {
             only: None,
             fetch: None,
             projects: projects.iter().map(|p| p.to_string()).collect(),
+            early: false,
         };
         let mut res = PlanResult {
             base_ref: None,
@@ -6997,6 +7302,7 @@ mod tests {
             allowed: None,
             fetch_failed: None,
             store_kind: "git-meta",
+            early: None,
         };
         let repo = Repo::discover(root).unwrap();
         let store = crate::store::for_repo(&repo);
@@ -8091,6 +8397,7 @@ adapter = "pytest"
             allowed: None,
             fetch_failed: None,
             store_kind: "git-meta",
+            early: None,
         };
         let not_loaded = Failure::one(
             "inputs",
