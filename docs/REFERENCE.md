@@ -763,12 +763,17 @@ time), where a Rails worker pays that once for all of its files.
 files' processes load too: on vex-api's shard of 908 files, half of their 56,711 loads were of 130 files (123 gem
 files, from Action Pack, Action View, Action Mailer, Active Record's associations, and 7 application files: two
 token models, a concern and four authentication services that the tests' common setup loads, loaded by 896 of the
-908 files). A slot now loads those once, in a process between it and its files:
+908 files). With `rails_zygote` set to `"gems"` or `"common"` (it is off by default), a slot loads those once, in a
+process between it and its files:
 
 - each slot runs the batch's first files from its boot, as before, and each of those processes notes the Ruby files
   it loaded after the fork (`loads-<group>-<slot>.txt` in the run's output directory). The first files are spread over the
   batch (every n-th file), not its first directory. There are twice as many as the slots, 16 at least, and only in a
-  batch of at least four times that many files: a smaller batch gets no zygote;
+  batch that leaves each slot at least 20 files after them (264 files at 12 slots, 176 at 8): a smaller batch gets
+  no zygote. A zygote's preload and garbage collection cost 0.7 to 1.7 s a slot on vex-api; with the earlier
+  threshold (four times the samples) 100 files over 12 slots formed 11 zygotes of about 6 files each and used 4 to
+  15% more CPU than without them in 8 of 8 interleaved sessions (median 70.2 against 67.1 CPU-seconds), and 200
+  files used the same CPU (132 against 130). The break-even lies between those, and was not measured more finely;
 - once that many have ended, each slot forks a *zygote*, which loads, in the order the files loaded them: the files
   of the bundle's gems (and Ruby's own library files) that at least a tenth of those files loaded; and with
   `rails_zygote = "common"` also the application's files that Rails' loaders autoload (outside `test/` and `spec/`)
@@ -788,9 +793,27 @@ token models, a concern and four authentication services that the tests' common 
   the absent load-path candidates above), and each file's CPU time (`vci: a file's process used 0.45
   CPU-s on average ...`).
 
-`rails_zygote` is set in the project's table of `vci.toml` (or at the top in the single-project form): `"gems"`, the
-default, preloads gem and Ruby files only; `"common"` also the application files; `"off"` forks every file from its
-slot, as before. `VCI_RAILS_ZYGOTE` (`off`, `gems`, `common`) in vci's environment overrides it. It is not part of
+`rails_zygote` is set in the project's table of `vci.toml` (or at the top in the single-project form): `"off"`, the
+default, forks every file from its slot, as 2.11 did, and every file records exactly the inputs it recorded under
+2.11; `"gems"` preloads gem and Ruby files only; `"common"` also the application files.
+
+**What a zygote costs, and why it is off by default.** Under `"gems"` a file records as externals the gems its
+zygote loaded that it never used itself: on 101 of vex-api's files, 75 gained `et-orbi 1.4.2`, `fugit 1.14.0` and
+`raabro 1.5.0` and nothing else changed (on vex's full shard 806 of 907 input roots differed from 2.11.1's, against 60
+between two 2.11.1 runs). That costs no precision (the bundle is part of the toolchain and `Gemfile.lock` an input
+of every file, so a gem change already runs every file), but it is a change to what is attested. Each zygote is a
+process of its own: on vex-api it dirtied about 150 MB, and the batch's peak resident memory (all processes, summed,
+medians of six rounds) went from 4.74 GB with 2.11.1 to 6.55 GB with `"gems"` and 6.49 GB with `"common"` at 12
+slots, 3.36 to 4.55 GB at 8 (28 processes became 40; the largest one stayed at about 650 to 680 MB). On a runner
+short of memory, leave it off. And the saving was measured at 12 slots only: there `"gems"` used 0.93 of 2.11.1's
+CPU time (paired over six interleaved rounds; 0.96 with a history of earlier runs), `"common"` 0.92, and the Ruby
+batch took 0.90 of 2.11.1's time with `"common"` (medians 56.9 s against 67.4 s; 0.92 with a history, the pairs
+ranging from 0.57 to 1.22). At 8 slots, as on vex's 8-core runners, `"gems"` was within noise of 2.11.1 (paired CPU
+1.01, wall 1.08; medians 467 CPU-seconds and 81.1 s against 483 and 80.0 s) and `"common"` used 0.93 of its CPU and
+0.94 of its wall time. Those 8-slot runs had the laptop's 14 cores, not an 8-core Linux runner. In the review's model
+of vex's CI jobs (the Ruby batch is 23% of a vci job, and a zygote forms only in a third of them) neither setting
+changes vex's runner time measurably (14.3 runner-hours a day either way): a zygote is a choice for suites whose
+runs are mostly full. `VCI_RAILS_ZYGOTE` (`off`, `gems`, `common`) in vci's environment overrides it. It is not part of
 `vci:config`: an attestation made with any setting is accepted with any other, as each records a superset of what
 the file loaded. Diagnostic switches: `VCI_RAILS_ZYGOTE_HINTS` (a file of absolute paths, one a line: each zygote
 forms at once and preloads those, classified as above) and `VCI_RAILS_ZYGOTE_SAMPLES` (how many files to wait for).
@@ -808,10 +831,11 @@ every figure is inflated against an idle machine and only the comparisons within
 (0.61, 0.48, 0.47) and 0.57 with `"off"` (0.63, 0.53, 0.54); its top-level requires took 68 ms instead of 123 ms (20
 of them instead of 29). The zygotes formed after 35 files and each preloaded 127 to 162 gem or Ruby files and, with
 `"common"`, the 7 application files above, in 0.2 to 1.3 s (0.6 to 5.2 s with their shared output). The whole `vci
-run` in the last two rounds, against vci 2.11.1 and plain `bin/rails test` run the same way: 2.11.1 83 s and 78 s (the
-batch 67 s and 66 s), 540 and 501 CPU-seconds; `"common"` 65 s and 64 s (the batch 52 s both times), 480 and 482
-CPU-seconds; `"gems"` 481 CPU-seconds (its wall time, 142 s, fell in a load spike); plain 163 s (a load spike) and 59 s,
-460 and 303 CPU-seconds. Precision, from each file's own loads with the zygote's 7 application files added, replayed
+run`, against vci 2.11.1, from the review's six interleaved rounds per setting (each paired with 2.11.1 in the same
+lock session, medians): `"common"` cut the Ruby batch by about 7 to 10% (56.9 s against 67.4 s; pairs 0.57 to 1.22,
+median 0.90; 0.92 with a history of earlier runs, 0.93 at 8 slots) and the CPU by about 8% (paired 0.92); `"gems"` used
+0.93 of 2.11.1's CPU. (The builder's last two rounds, 52 s against 66 and 67 s, were the best of a noisy series.)
+Wall-time gains on vex's own runners are not measured. Precision, from each file's own loads with the zygote's 7 application files added, replayed
 over the 30 most recent commits that touched vex-api: 1,207 file runs either way, none more; 84 more inputs in all
 (0.09 a file). Not measured: vex's 8-core CI runners, a plan, a push or the git-meta store. What still separates a
 file's process from a Rails worker's share of the work: the application files each loads on its own (about 30, most
@@ -922,15 +946,19 @@ as a file's own process does. The zygote is planned from what the first file of 
 after the fork: a later file of a worker loads nothing an earlier one already loaded, so its loads would understate
 what a file loads on its own (with every worker file noting, `"common"` preloaded none of vex-api's 7 application
 files on a sample of 100 of its files at K = 3; with only the first, all 7). The figures above for K = 5 were measured
-against one process per file *without* zygotes. Measured again on 14 November against the merged 2.12 engine (vex-api's
-shard 2 of 2, 908 files, 12 slots, a local SQLite store, release builds, interleaved, load average 8 to 44 on the
-14-core laptop): with the default `rails_zygote = "gems"`, five runs took 56.8 to 64.2 s (median 60.3 s) and 453 to
-469 CPU-seconds (median 465); K = 5 took 94 s and 119 s and 462 and 491 CPU-seconds, and K = 5 with `"common"` 86 s
-and 80 s and 469 and 450. Once the zygote has loaded the gems, a worker saves no CPU worth the name over a file's own
-process, and its batch ends later: its runs of five sorted files leave some slots 20 to 30 s behind the others (a
-slot's files added up to 50 to 79 s at least and 73 to 101 s at most, against 41 to 43 s for every slot with one
-process per file). `rails_worker_files` therefore stays 1 by default, and on vex it is not worth its precision with
-zygotes on.
+against one process per file *without* zygotes. With zygotes, over six interleaved rounds on 14 November (vex-api's
+shard 2 of 2, 908 files, 12 slots, a local SQLite store, release builds, each round paired with 2.11.1 in the same
+lock session): K = 5 with `"gems"` used 444 CPU-seconds and with `"common"` 447, against 496 for `"gems"` with one
+process per file and 538 for 2.11.1; paired with 2.11.1, 0.84 and 0.82 of its CPU against 0.93 for `"gems"` alone
+(0.43 CPU-seconds a file against 0.49). So a worker still saves about a tenth of the CPU on top of the zygote. Its
+batch ends later, by about 10 s (67.2 s against 56.9 s for `"gems"` alone, medians of different sessions; 0.97 of
+2.11.1's in the same session), because its runs of five sorted files leave some slots 14 to 17 s behind the others.
+(A first measurement of two runs each said K = 5 saved no CPU with zygotes and ended 20 to 60 s later; six rounds did
+not reproduce that.) `rails_worker_files` stays 1 by default for its precision, which is the reason: about twice as
+many files run again on a typical commit. In the review's model of vex's CI jobs, K = 5 raises runner time on a suite
+shaped like vex's (15.8 runner-hours a day with `"gems"`, 15.1 with `"common"`, against 14.3 without workers; 14.1
+with workers and no zygote, a figure that rests on a heavily loaded laptop's CPU ratio of 0.72), because most of
+vex's jobs run few files and those then run about twice as many.
 
 The collector (`ruby/vci-collector/vci_collector.rb`, plain Ruby, nothing is installed into your project) is loaded
 through `RUBYOPT` before `bin/rails`, Bundler and Rails. It sets these run conditions:
@@ -1450,7 +1478,7 @@ checkout, or the unit runs:
 
 | Attested fact (full plan: compared with the probe) | Early plan: compared with |
 |---|---|
-| Ruby `X.Y.Zp<n>` and `ruby X.Y.Z` | the exact `X.Y.Z` every version file names, from the project dir up to the repository root (`.ruby-version`, `.tool-versions`, `mise.toml`, `.mise.toml`, `mise.local.toml`, `mise.<env>.toml`, ...); none, an inexact one (`3.4`, `latest`) or two that disagree: run. The patchlevel is not compared (MRI has one per release). The lockfile's `RUBY VERSION`, when present, must agree too |
+| Ruby `X.Y.Zp<n>` and `ruby X.Y.Z` | the exact `X.Y.Z` every version file names, from the project dir up to the repository root: `.ruby-version`, `.tool-versions`, every mise config file there (`mise.toml`, `mise.local.toml`, `mise.<env>.toml`, `mise.<env>.local.toml`, each with or without a leading dot, the same names in `.config/`, and every `*.toml` at any depth under `mise/`, `.mise/` and `.config/mise/`, which holds `config.toml`, `config.<env>.toml`, `config.local.toml` and `conf.d/*.toml`; files of every `MISE_ENV`, not only the job's: one more can only make it run), and since the 2.12.0 review the variables that pick a Ruby where the early plan runs (`MISE_RUBY_VERSION`, `RBENV_VERSION`, `ASDF_RUBY_VERSION`, `RUBY_VERSION`); none, an inexact one (`3.4`, `latest`), two that disagree, a config file that is not TOML, or a variable that points mise at other config files (`MISE_CONFIG_FILE`, `MISE_DEFAULT_CONFIG_FILENAME`, `MISE_OVERRIDE_CONFIG_FILENAMES`, ...): run. The patchlevel is not compared (MRI has one per release). The lockfile's `RUBY VERSION`, when present, must agree too |
 | Bundler | the lockfile's `BUNDLED WITH` (Bundler switches to it) |
 | Rails, the test frameworks | the lockfile's `railties`, `minitest`, `rspec-*` |
 | the bundle (every gem, `name==version`) | every attested gem pinned in that version by the lockfile (`Gemfile.lock`, or `gems.locked`; `BUNDLE_GEMFILE` set: run). Both files are inputs of every Rails unit as well, so any change to them runs everything anyway |
@@ -1462,6 +1490,7 @@ checkout, or the unit runs:
 | a native library (`native:libvips.so.42`; by name under `"any"`) | not compared: taken as installed by the job's setup (recorded by `vci explain` as accepted) |
 | any other item of the attested libraries | run |
 | a variable mise exports from those files' `[env]` that the project's env policy hashes, or an `[env]` directive (`_.file`, `_.source`, `_.path`) | run (the early plan's environment does not have it yet) |
+| the database adapters (`database`: what the probe reads from `config/database.yml` with its ERB, and `DATABASE_URL`) | not compared, when each variable the file's ERB reads by literal name (`ENV["X"]`, `ENV.fetch("X", ...)`) is one the tests get fixed (`set`), compared (`hash`, built-in hash such as `DATABASE_URL` and `*_DATABASE_URL`) or not at all (unlisted, strict mode): then the adapters follow from the file, an input of every unit, and the compared environment. A variable passed to the tests uncompared (`ignore`, built-in ignore, or any under `mode = "loose"`), or ERB that does anything else (`ENV` by a computed name, `Rails`, `File`, the application's code, a shell command, an interpolated string, a global): run. vex's file (17 tags, 9 variables, none passed uncompared) is decided |
 
 **The guarantee.** The early plan skips a unit only when every check of the full chain passes with the facts above,
 and answers `skip_all=true` only when every unit of the listed projects (of the partition) is skipped. Given that the
@@ -1475,9 +1504,38 @@ and the full plan would (each one makes the full plan run units that the early p
 - a system library the setup fails to install, or installs other than when the attestation was made, where the full
   plan compares whether it is loaded: a native library opened through FFI (libvips), libyaml; under `libraries =
   "any"` their versions are not compared by the full plan either;
-- an environment variable a later step exports through `$GITHUB_ENV` (mise's `[env]` in the version files is read);
-- the database adapters the probe reports (`database`): they come from `config/database.yml` and `DATABASE_URL`,
-  which every unit records as an input file and a hashed variable.
+- an environment variable a later step exports through `$GITHUB_ENV` (mise's `[env]` in the version files is read),
+  and mise config outside the checkout (`~/.config/mise/`, `/etc/mise/`, `MISE_GLOBAL_CONFIG_FILE`).
+
+Until the review of 14 November 2026 (before 2.12.0 was released) the early plan read only nine fixed version file
+names and did not look at the database adapters: a `mise/config.toml`, `.config/mise/conf.d/*.toml`,
+`.config/mise/config.local.toml` or `.config/mise/config.<env>.toml` naming another Ruby or exporting a hashed
+variable, `MISE_RUBY_VERSION` set to another Ruby, or a `config/database.yml` taking its adapter from an `ignore`d
+variable (a CI matrix over databases) all made it skip every unit that the full plan ran. These are tested
+(`rails_early_plan_reads_every_mise_config_file`, `rails_early_plan_and_ruby_version_variables`,
+`rails_early_plan_database_adapter_from_erb`). The extra mise locations are read by the early plan only; they are not
+global inputs of the full plan, which probes the Ruby the setup installed and compares the environment it exported
+(adding them would change every Rails unit's global input set and run every Rails file once after an upgrade).
+
+**A time limit (the action).** The early plan fetches the store first, and on vex the plan step's fetch has a long
+tail (p90 30 s, about 500 s on one job of 40 sampled). The action's `early-timeout` input (seconds, default 90, `0`:
+none) stops the early plan when it runs past it and answers `skip_all=false`: the job then sets up and plans in full
+as it would have anyway. It needs `timeout` (coreutils) on the runner; without it there is no limit. The fetch's own
+time is the `fetch attestations (--fetch, in the background)` line under `VCI_TIMING=1`.
+
+**What it saves, and what it does not.** A job the early plan answers "skip all" for leaves out its toolchain setup
+and tests, nothing else: on 40 sampled vex jobs that had nothing to run (vci 2.10), setup, checkout, the
+attestation-store cache and the plan took 37 to 549 s, median 57.5 s and mean 75.8 s (the store cache restore 9.7 s
+and the plan step 23.6 s on average, median 11 s), not the 40 s estimated before; such a job's mean fell from 2.18 to
+1.26 runner-minutes in the model of those jobs. That applies to 18% of vex's Rails jobs. With the rest of vci's fixed
+cost per job as it is (store cache, a separate plan step, a second plan, publishing: about 46 s against plain's 43 s
+test step), the early plan alone pays for itself only when about 43% of a repository's jobs have nothing to run. The
+steps it gates are every step that needs the toolchain, including ones that are not tests: on vex `bundler-audit`
+(both shards) and `rails zeitwerk:check` (shard 1, 5 s) run in the same job, and gating the setup removes them from
+skip-all jobs. Either accept that (they still run on every job that runs tests, and on the default branch), or keep
+the toolchain for the job that runs them (in the economics model, keeping shard 1's: 13.8 runner-hours a day against
+13.5 dropping both; moving the checks to a job of their own per run: 17.0, worse than not gating at all, 14.3).
+Figures from the 2.12.0 review's model of vex's Rails job history (7 to 14 November 2026), checked against observed jobs to within 3%.
 
 On vex (`platform = "any"`, `libraries = "any"`, Ruby from `mise.toml` and `vex-api/.ruby-version`, the gems from
 `vex-api/Gemfile.lock` installed with `BUNDLE_FROZEN`), what remains unchecked is whether the setup installs the same
@@ -3141,7 +3199,7 @@ adapter = "vitest"     # or "pytest", "go", "cargo", "rails", "node-test"
 # runner = "rspec"     # rails only: "minitest" or "rspec" (unset: detected, see Quick start (RSpec)); in [[projects]] per project
 # rails_inputs = "strict"  # rails only: "loose" (default since 2.7.36: routes, initializers, boot files, migrations, locales,
                            # autoload records are not inputs) or "strict"; in [[projects]] per project
-# rails_zygote = "common"  # rails only (2.12): what a batch's slot zygote preloads, "gems" (default), "common" or "off";
+# rails_zygote = "common"  # rails only (2.12): what a batch's slot zygote preloads, "off" (default, no zygote), "gems" or "common";
                            # see "Slot zygotes" under Quick start (Rails); in [[projects]] per project
 # ignore_inputs = ["config/credentials/**"]  # rails only: more globs (relative to the project dir) that are never inputs
 # rails_worker_files = 5  # rails (Minitest) only, since 2.12: test files one process of a batch's slot runs one after
