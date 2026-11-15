@@ -3940,65 +3940,17 @@ fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> UnitRecord
             .map(|(_, d)| d)
     };
     if !store.caps().columns {
-        // 2.12.0: the newest record of each unit by its key (the issue time
-        // its key hint states), read in one batch; a unit whose newest one
-        // records no duration, or whose keys state no time, has the rest of
-        // its records read in a second. Before, every record of every unit
-        // was read (`read_units`): on vex's git-meta store, 112,982 values
-        // for 896 units, 8.13 s before the batch started. The hdr ids are
-        // those of the records read; supersession reads any other it needs.
-        let Ok(mut units) = store.list_units(test_ids) else {
+        // Every record of every unit, as before (supersession takes the hdr
+        // ids of all of them from here: on git-meta's blobless clone an hdr
+        // not preloaded is never fetched, and its records would be kept).
+        // 2.12.0: in parallel, a share of the units per thread, each on its
+        // own pooled reader and `git cat-file` (git-meta reads a value as a
+        // blob through one): on vex's git-meta store of 12 Nov 2026 the
+        // serial read took 8.13 s for 896 units (112,982 values) before the
+        // batch started.
+        let Ok(units) = read_units_parallel(store, test_ids) else {
             return out;
         };
-        let newest_by_key = |cands: &[StoredEnvelope]| -> Option<usize> {
-            cands
-                .iter()
-                .enumerate()
-                .filter_map(|(i, e)| e.issued.map(|t| (t, i)))
-                .max()
-                .map(|(_, i)| i)
-        };
-        let firsts: Vec<Option<usize>> = units.iter().map(|c| newest_by_key(c)).collect();
-        {
-            let mut refs: Vec<&mut StoredEnvelope> = units
-                .iter_mut()
-                .zip(&firsts)
-                .filter_map(|(c, f)| f.and_then(|i| c.get_mut(i)))
-                .collect();
-            if store.read_values(&mut refs).is_err() {
-                return out;
-            }
-        }
-        let rest: Vec<usize> = units
-            .iter()
-            .zip(&firsts)
-            .enumerate()
-            .filter(|(_, (c, f))| {
-                f.and_then(|i| c.get(i))
-                    .filter(|e| e.error.is_none())
-                    .and_then(|e| record_duration(&e.bytes))
-                    .is_none()
-            })
-            .map(|(u, _)| u)
-            .collect();
-        if !rest.is_empty() {
-            let mut refs: Vec<&mut StoredEnvelope> = units
-                .iter_mut()
-                .zip(&firsts)
-                .enumerate()
-                .filter(|(u, _)| rest.binary_search(u).is_ok())
-                .flat_map(|(_, (c, f))| {
-                    c.iter_mut()
-                        .enumerate()
-                        .filter(move |(i, _)| Some(*i) != *f)
-                        .map(|(_, e)| e)
-                })
-                .collect();
-            if store.read_values(&mut refs).is_err() {
-                return out;
-            }
-        }
-        // A record not read has no bytes: no duration, no hdr.
         for (id, cands) in test_ids.iter().zip(units) {
             if let Some(d) = newest_read(&cands) {
                 out.durations.insert((*id).to_owned(), d);
@@ -4070,6 +4022,37 @@ fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> UnitRecord
         );
     }
     out
+}
+
+/// [`AttestationStore::read_units`] of `test_ids` in shares of at least
+/// 32 units, one thread each (at most 8), the answers in `test_ids`'
+/// order; the first error is the answer.
+fn read_units_parallel(
+    store: &dyn AttestationStore,
+    test_ids: &[&str],
+) -> Result<Vec<Vec<StoredEnvelope>>, vci_store::StoreError> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, 8)
+        .min(test_ids.len().div_ceil(32))
+        .max(1);
+    if threads == 1 {
+        return store.read_units(test_ids);
+    }
+    let share = test_ids.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = test_ids
+            .chunks(share)
+            .map(|ids| s.spawn(move || store.read_units(ids)))
+            .collect();
+        let mut out = Vec::with_capacity(test_ids.len());
+        for h in handles {
+            out.extend(h.join().map_err(|_| {
+                vci_store::StoreError::invalid("units", "", "a reading thread panicked")
+            })??);
+        }
+        Ok(out)
+    })
 }
 
 /// What [`last_durations`] read of the selected units' stored records: the
@@ -6332,42 +6315,208 @@ mod tests {
         assert!(got.columns.is_empty());
     }
 
-    /// Without columns (git-meta), only the newest record of each unit by
-    /// its key's issue time is read, when it records a duration; a unit
-    /// whose newest one does not, or whose keys state no time, has the rest
-    /// read. The durations are the newest's, as when every record was read.
+    /// Without columns (git-meta), every record of every unit is read, in
+    /// parallel shares of the units (2.12.0), and each unit's duration is
+    /// its newest record's, in the order of the ids asked about.
     #[test]
-    fn last_durations_without_columns_read_the_newest_record_by_key_first() {
+    fn last_durations_without_columns_read_every_record_in_parallel_shares() {
         let s = crate::store::mem::MemStore::new();
         let put = |id: &str, sk: &str, issued: Option<i64>, value: &[u8]| {
             let hint = issued.map(|issued| KeyHint { issued, tree: None });
-            s.put(&NewAttestation::for_test(id, SIGNER, sk, hint.as_ref(), value))
-                .unwrap();
+            s.put(&NewAttestation::for_test(
+                id,
+                SIGNER,
+                sk,
+                hint.as_ref(),
+                value,
+            ))
+            .unwrap();
         };
-        // a: ten records, the newest by key records 99.
+        // a: ten records, the newest records 99.
         for i in 0..9 {
             let f = frame_with("a", "2026-01-01T00:00:00Z", 10 + i, PREDICATE_TYPE_V2);
             put("a", &format!("a{i}"), Some(100 + i64::from(i as u8)), &f);
         }
         let newest = frame_with("a", "2026-02-01T00:00:00Z", 99, PREDICATE_TYPE_V2);
         put("a", "af", Some(500), &newest);
-        // b: the newest by key is unreadable as a record: the rest is read.
-        put("b", "b1", Some(10), &envelope_with("b", "2026-03-01T00:00:00Z", 70));
-        put("b", "b2", Some(20), b"garbage");
-        // c: keys without a time: every record read.
-        put("c", "c1", None, &envelope_with("c", "2026-03-01T00:00:00Z", 5));
-        put("c", "c2", None, &envelope_with("c", "2026-04-01T00:00:00Z", 6));
-        let got = last_durations(&s, &["a", "b", "c", "d"]);
-        assert_eq!(
-            got.durations,
-            BTreeMap::from([
-                ("a".to_owned(), 99),
-                ("b".to_owned(), 70),
-                ("c".to_owned(), 6)
-            ])
+        // b: the newest by key is unreadable as a record.
+        put(
+            "b",
+            "b1",
+            Some(10),
+            &envelope_with("b", "2026-03-01T00:00:00Z", 70),
         );
-        // a: 1 of 10; b: 2; c: 2.
-        assert_eq!(s.values_read(), 1 + 1 + 1 + 2, "newest first, then the rest of b and c");
+        put("b", "b2", Some(20), b"garbage");
+        // c: keys without a time.
+        put(
+            "c",
+            "c1",
+            None,
+            &envelope_with("c", "2026-03-01T00:00:00Z", 5),
+        );
+        put(
+            "c",
+            "c2",
+            None,
+            &envelope_with("c", "2026-04-01T00:00:00Z", 6),
+        );
+        // Enough units for several shares, each with its own duration.
+        let many: Vec<String> = (0..200).map(|i| format!("u{i:03}")).collect();
+        for (i, id) in many.iter().enumerate() {
+            put(
+                id,
+                &format!("{:x}", 0x1000 + i),
+                Some(1),
+                &envelope_with(id, "2026-03-01T00:00:00Z", i as u64),
+            );
+        }
+        let mut ids: Vec<&str> = vec!["a", "b", "c", "d"];
+        ids.extend(many.iter().map(String::as_str));
+        let got = last_durations(&s, &ids);
+        assert_eq!(got.durations["a"], 99);
+        assert_eq!(got.durations["b"], 70);
+        assert_eq!(got.durations["c"], 6);
+        assert!(!got.durations.contains_key("d"));
+        for (i, id) in many.iter().enumerate() {
+            assert_eq!(got.durations[id], i as u64, "{id}");
+        }
+        assert_eq!(s.values_read(), 10 + 2 + 2 + 200, "every record read once");
+        assert_eq!(got.hdrs.len(), 1, "the hdr the format-3 records name");
+    }
+
+    /// Timing only (`cargo test -- --ignored --nocapture
+    /// last_durations_on_git_meta_timing`; VCI_BENCH_UNITS, VCI_BENCH_RECORDS):
+    /// [`last_durations`] on a git-meta store, serial `read_units` against
+    /// [`read_units_parallel`].
+    #[test]
+    #[ignore]
+    fn last_durations_on_git_meta_timing() {
+        let n: usize = std::env::var("VCI_BENCH_UNITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(896);
+        let k: usize = std::env::var("VCI_BENCH_RECORDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let t = tempfile::tempdir().unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+        let (a, bare, b) = (
+            t.path().join("a"),
+            t.path().join("bare.git"),
+            t.path().join("b"),
+        );
+        std::fs::create_dir_all(&a).unwrap();
+        git(&a, &["init", "-q", "-b", "main"]);
+        git(
+            &a,
+            &[
+                "-c",
+                "user.name=x",
+                "-c",
+                "user.email=x@x",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        );
+        git(
+            t.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                a.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        git(&a, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        let root = camino::Utf8PathBuf::from_path_buf(a.canonicalize().unwrap()).unwrap();
+        let repo = vci_git::Repo::discover(&root).unwrap();
+        let store = crate::store::for_repo(&repo);
+        assert_eq!(store.kind(), "git-meta");
+        let ids: Vec<String> = (0..n)
+            .map(|i| format!("test/models/m{i:04}_test.rb"))
+            .collect();
+        let w = std::time::Instant::now();
+        let batch = store.batch().unwrap();
+        for (u, id) in ids.iter().enumerate() {
+            for r in 0..k {
+                // Over git-meta's 1 KiB inline limit, as vex's records are:
+                // stored as git blobs.
+                let mut f = frame_with(
+                    id,
+                    "2026-01-01T00:00:00Z",
+                    (u * 10 + r) as u64,
+                    PREDICATE_TYPE_V2,
+                );
+                let mut fr = match decode_record(&f).unwrap() {
+                    Record::FormatThree(fr) => fr,
+                    Record::FormatOne(_) => unreachable!(),
+                };
+                fr.descriptor = vec![7; 2048];
+                f = fr.encode().unwrap().into_bytes();
+                let hint = KeyHint {
+                    issued: 1000 + r as i64,
+                    tree: None,
+                };
+                let sk = format!("{:x}", 0x10_0000 + u * 100 + r);
+                store
+                    .put(&NewAttestation::for_test(id, SIGNER, &sk, Some(&hint), &f))
+                    .unwrap();
+            }
+        }
+        batch.finish().unwrap();
+        eprintln!("put {} records: {:.2}s", n * k, w.elapsed().as_secs_f64());
+        // Published and fetched into a clone, as a CI job reads them (the
+        // values git blobs, read through `git cat-file`).
+        store
+            .exchange()
+            .unwrap()
+            .push(Some("origin"), vci_store::PushMode::Merge)
+            .unwrap();
+        git(
+            t.path(),
+            &["clone", "-q", bare.to_str().unwrap(), b.to_str().unwrap()],
+        );
+        let root = camino::Utf8PathBuf::from_path_buf(b.canonicalize().unwrap()).unwrap();
+        let repo = vci_git::Repo::discover(&root).unwrap();
+        let store = crate::store::for_repo(&repo);
+        let w = std::time::Instant::now();
+        store.exchange().unwrap().fetch(Some("origin")).unwrap();
+        let refs0: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let _ = store.prefetch(vci_store::Prefetch::Units {
+            test_ids: &refs0,
+            choose: None,
+        });
+        eprintln!("fetch and prefetch: {:.2}s", w.elapsed().as_secs_f64());
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        for round in 0..2 {
+            let w = std::time::Instant::now();
+            let serial = store.read_units(&refs).unwrap();
+            let ts = w.elapsed().as_secs_f64();
+            let w = std::time::Instant::now();
+            let par = read_units_parallel(&*store, &refs).unwrap();
+            let tp = w.elapsed().as_secs_f64();
+            let w = std::time::Instant::now();
+            let got = last_durations(&*store, &refs);
+            let tl = w.elapsed().as_secs_f64();
+            assert_eq!(serial, par);
+            assert_eq!(got.durations.len(), n);
+            eprintln!(
+                "round {round}: {} units x {k} records: serial read_units {ts:.2}s, parallel {tp:.2}s, last_durations {tl:.2}s",
+                n
+            );
+        }
     }
 
     /// Supersession's pre-filter takes the columns [`last_durations`]

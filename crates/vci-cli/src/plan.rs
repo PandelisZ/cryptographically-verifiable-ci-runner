@@ -2352,6 +2352,7 @@ fn unused_hint_flag(project: &str) -> String {
 /// List a project's test files and, with `resolve`, resolve its toolchain
 /// and externals at the same time (both may shell out: uv, go, cargo, ruby;
 /// pytest and Minitest files are listed without a process).
+#[allow(clippy::too_many_arguments)]
 fn probe_project(
     ctx: &Ctx,
     store: &dyn AttestationStore,
@@ -2481,7 +2482,10 @@ fn resolve_declared(
     repo_id: &Result<String, String>,
 ) -> Result<Resolved, String> {
     let repo_id = repo_id.clone()?;
-    let max_ttl = project.policy.max_ttl_secs().map_err(|e| format!("{e:#}"))?;
+    let max_ttl = project
+        .policy
+        .max_ttl_secs()
+        .map_err(|e| format!("{e:#}"))?;
     // BUNDLE_GEMFILE where vci runs, or set for the tests.
     let gemfile = child
         .get("BUNDLE_GEMFILE")
@@ -5497,11 +5501,18 @@ impl Verifier<'_> {
         // `vci plan --early`: the declared toolchain instead of the probed
         // one, and the same platform whatever the policy accepts.
         if let Some(d) = &self.declared {
+            let env = self.project.file_env(&f.project_rel);
+            let compared = |k: &str| {
+                crate::envpolicy::list_matches(&env.hash, k)
+                    || crate::envpolicy::list_matches(&env.builtin_hash, k)
+                    || crate::envpolicy::list_matches(&env.loose_hash, k)
+            };
             let tdiff = crate::early::toolchain_diff(
                 self.project.policy.allow_superuser_mismatch,
                 libraries,
                 tc,
                 d,
+                &compared,
             );
             if !tdiff.is_empty() {
                 return Err(Failure {
@@ -6043,7 +6054,10 @@ pub fn early_answer(
     split: Option<&crate::partition::Split>,
 ) -> crate::early::EarlyAnswer {
     let skipped = res.skipped().count();
-    let mut why: Option<String> = res.run_all.as_ref().map(|r| format!("running everything: {r}"));
+    let mut why: Option<String> = res
+        .run_all
+        .as_ref()
+        .map(|r| format!("running everything: {r}"));
     let run = match split {
         Some(s) => {
             let whole = res
@@ -6056,7 +6070,9 @@ pub fn early_answer(
                     format!(
                         "{} runs everything: {}",
                         p.label(),
-                        p.run_all.as_deref().unwrap_or("its test files could not be listed")
+                        p.run_all
+                            .as_deref()
+                            .unwrap_or("its test files could not be listed")
                     )
                 });
             }

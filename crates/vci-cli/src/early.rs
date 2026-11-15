@@ -56,6 +56,12 @@ pub struct Declared {
     /// The project is a Rails application (`config/environment.rb`): its
     /// toolchain probe sets both default encodings to UTF-8.
     pub rails_app: bool,
+    /// The variables the mise files from the project dir up to the
+    /// repository root set in their `[env]` (as `file: NAME`), which the
+    /// job's toolchain setup exports after the early plan ran; `_.file`,
+    /// `_.source` and the like name every variable they could set as
+    /// `file: _.<directive>`.
+    pub mise_env: Result<Vec<(String, String)>, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +90,7 @@ pub struct Lockfile {
 pub fn declare(root: &Utf8Path, project_dir: &Utf8Path, bundle_gemfile: Option<&str>) -> Declared {
     Declared {
         ruby: declared_ruby(root, project_dir),
+        mise_env: mise_env(root, project_dir),
         lock: match bundle_gemfile.filter(|g| !g.is_empty()) {
             Some(g) => Err(format!(
                 "BUNDLE_GEMFILE is set ({g}): the early plan reads only the project's own lockfile"
@@ -182,6 +189,55 @@ fn ruby_in(name: &str, text: &str) -> Result<Option<String>, String> {
     Ok(found)
 }
 
+/// The `[env]` keys of a mise TOML file (`Ok(empty)` for any other file).
+fn mise_env_in(name: &str, text: &str) -> Result<Vec<String>, String> {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    if base == ".ruby-version" || base == ".tool-versions" {
+        return Ok(Vec::new());
+    }
+    let v: toml::Table = text.parse().map_err(|e| format!("not TOML: {e}"))?;
+    let Some(env) = v.get("env") else {
+        return Ok(Vec::new());
+    };
+    let env = env.as_table().ok_or("[env] is not a table")?;
+    let mut out = Vec::new();
+    for (k, val) in env {
+        if k == "_" {
+            // mise's directives: `_.path`, `_.file`, `_.source`, ...
+            match val.as_table() {
+                Some(t) => out.extend(t.keys().map(|d| format!("_.{d}"))),
+                None => out.push("_".to_owned()),
+            }
+        } else {
+            out.push(k.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// The `[env]` keys of every mise file from the project dir up to the
+/// repository root ([`version_files_in`]), as `(file, key)`.
+pub fn mise_env(root: &Utf8Path, project_dir: &Utf8Path) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    let mut dir = Some(project_dir);
+    while let Some(d) = dir {
+        for f in version_files_in(d) {
+            if !f.is_file() {
+                continue;
+            }
+            let r = rel(root, &f);
+            let text = std::fs::read_to_string(&f).map_err(|e| format!("{r}: {e}"))?;
+            let keys = mise_env_in(f.as_str(), &text).map_err(|e| format!("{r}: {e}"))?;
+            out.extend(keys.into_iter().map(|k| (r.clone(), k)));
+        }
+        if d == root || !d.starts_with(root) {
+            break;
+        }
+        dir = d.parent();
+    }
+    Ok(out)
+}
+
 /// The files of `dir` that may declare Ruby: [`RUBY_VERSION_FILES`] and
 /// mise's environment files.
 fn version_files_in(dir: &Utf8Path) -> Vec<Utf8PathBuf> {
@@ -255,7 +311,8 @@ fn read_lockfile(project_dir: &Utf8Path) -> Result<Lockfile, String> {
     } else {
         "Gemfile.lock"
     };
-    let text = std::fs::read_to_string(project_dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
+    let text =
+        std::fs::read_to_string(project_dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
     parse_lockfile(&text).map_err(|e| format!("{name}: {e}"))
 }
 
@@ -289,10 +346,7 @@ pub fn parse_lockfile(text: &str) -> Result<Lockfile, String> {
                     revision = Some(r.trim().to_owned());
                 } else if line == "  specs:" {
                     in_specs = true;
-                } else if in_specs
-                    && line.starts_with("    ")
-                    && !line.starts_with("     ")
-                {
+                } else if in_specs && line.starts_with("    ") && !line.starts_with("     ") {
                     let spec = &line[4..];
                     let (name, rest) = spec
                         .split_once(" (")
@@ -309,10 +363,7 @@ pub fn parse_lockfile(text: &str) -> Result<Lockfile, String> {
                     let recorded = match (section, &revision) {
                         ("GIT", Some(r)) => format!("{version} git {r}"),
                         ("GIT", None) => {
-                            return Err(format!(
-                                "line {}: a git source without a revision",
-                                n + 1
-                            ));
+                            return Err(format!("line {}: a git source without a revision", n + 1));
                         }
                         _ => version.to_owned(),
                     };
@@ -356,7 +407,10 @@ fn declared_runner(lock: &Lockfile) -> Result<String, String> {
         match lock.gems.get(n).map(Vec::as_slice) {
             None | Some([]) => Ok(None),
             Some([v]) => Ok(Some(v.as_str())),
-            Some(vs) => Err(format!("the lock pins {n} in several versions: {}", vs.join(", "))),
+            Some(vs) => Err(format!(
+                "the lock pins {n} in several versions: {}",
+                vs.join(", ")
+            )),
         }
     };
     let mut parts = Vec::new();
@@ -419,8 +473,32 @@ pub fn toolchain_diff(
     libraries: Libraries,
     tc: &Toolchain,
     d: &Declared,
+    compared_env: &dyn Fn(&str) -> bool,
 ) -> Vec<(&'static str, String, String)> {
     let mut out = Vec::new();
+    // A variable the toolchain setup exports after the early plan (mise's
+    // `[env]`) that the project's env policy compares: the early plan sees
+    // the environment without it. A directive (`_.file`) could set any.
+    match &d.mise_env {
+        Ok(keys) => {
+            let set: Vec<String> = keys
+                .iter()
+                .filter(|(_, k)| k.starts_with('_') || compared_env(k))
+                .map(|(f, k)| format!("{f}: {k}"))
+                .collect();
+            if !set.is_empty() {
+                out.push((
+                    UNDECIDED,
+                    "the environment the tests run with".into(),
+                    format!(
+                        "mise sets variables the env policy compares, after the early plan: {}",
+                        set.join(", ")
+                    ),
+                ));
+            }
+        }
+        Err(e) => out.push((UNDECIDED, "the mise files' [env]".into(), e.clone())),
+    }
     let os_arch = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     if tc.os != std::env::consts::OS || tc.arch != std::env::consts::ARCH {
         out.push((
@@ -446,7 +524,10 @@ pub fn toolchain_diff(
     }
     match &d.ruby {
         Ok(r) => {
-            let patch = tc.ruby.strip_prefix(&r.version).and_then(|p| p.strip_prefix('p'));
+            let patch = tc
+                .ruby
+                .strip_prefix(&r.version)
+                .and_then(|p| p.strip_prefix('p'));
             if patch.is_none_or(|p| p.is_empty()) {
                 out.push((
                     "ruby (declared)",
@@ -472,10 +553,16 @@ pub fn toolchain_diff(
         let same = if lr.contains('p') {
             *lr == tc.ruby
         } else {
-            tc.ruby.strip_prefix(lr.as_str()).is_some_and(|p| p.starts_with('p'))
+            tc.ruby
+                .strip_prefix(lr.as_str())
+                .is_some_and(|p| p.starts_with('p'))
         };
         if !same {
-            out.push(("ruby (RUBY VERSION of the lockfile)", tc.ruby.clone(), lr.clone()));
+            out.push((
+                "ruby (RUBY VERSION of the lockfile)",
+                tc.ruby.clone(),
+                lr.clone(),
+            ));
         }
     }
     match &lock.bundled_with {
@@ -568,17 +655,38 @@ pub fn toolchain_diff(
             if sqlite.is_some() {
                 known += 1;
             }
-            if sqlite.is_some_and(|v| !v.is_empty() && v != "none")
-                && !lock.gems.contains_key("sqlite3")
-            {
-                out.push((
+            // Loaded exactly when the bundle has sqlite3 (the full plan
+            // compares whether it is loaded): loaded without sqlite3 in the
+            // lock differs; not loaded with it cannot be told apart from a
+            // probe that did not load it (undecided).
+            let sqlite_loaded = sqlite.is_some_and(|v| !v.is_empty() && v != "none");
+            match (sqlite_loaded, lock.gems.contains_key("sqlite3")) {
+                (true, false) => out.push((
                     "ruby libraries: sqlite loaded",
                     "loaded".into(),
                     "no sqlite3 in the lockfile".into(),
-                ));
+                )),
+                (false, true) => out.push((
+                    UNDECIDED,
+                    "ruby libraries: sqlite not loaded".into(),
+                    "sqlite3 is in the lockfile: whether the probe loads it is Ruby's to say"
+                        .into(),
+                )),
+                _ => {}
             }
-            if lib_item(&tc.ruby_libs, "yaml").is_some() {
+            // libyaml comes with the Ruby the job installs: taken as loaded
+            // only when the attestation recorded it loaded (its version is
+            // not compared under "any"); not loaded there, the unit runs.
+            let yaml = lib_item(&tc.ruby_libs, "yaml");
+            if yaml.is_some() {
                 known += 1;
+            }
+            if !yaml.is_some_and(|v| !v.is_empty() && v != "none") {
+                out.push((
+                    UNDECIDED,
+                    "ruby libraries: yaml not loaded".into(),
+                    "whether the Ruby the job installs loads libyaml is Ruby's to say".into(),
+                ));
             }
             let collector = lib_item(&tc.ruby_libs, "collector");
             if collector.is_some() {
@@ -638,7 +746,8 @@ pub fn lock_gems(d: &Declared) -> Result<InstalledExternals, String> {
         .map_err(|e| format!("the early plan reads the lockfile: {e}"))?;
     let mut gems = l.gems.clone();
     if let Some(b) = &l.bundled_with {
-        gems.entry("bundler".to_owned()).or_insert_with(|| vec![b.clone()]);
+        gems.entry("bundler".to_owned())
+            .or_insert_with(|| vec![b.clone()]);
     }
     Ok(gems)
 }
@@ -750,19 +859,28 @@ BUNDLED WITH
 
     #[test]
     fn ruby_versions_are_read_from_each_kind_of_file() {
-        assert_eq!(ruby_in(".ruby-version", "ruby-3.4.9\n").unwrap().as_deref(), Some("3.4.9"));
+        assert_eq!(
+            ruby_in(".ruby-version", "ruby-3.4.9\n").unwrap().as_deref(),
+            Some("3.4.9")
+        );
         assert!(ruby_in(".ruby-version", "3.4\n").is_err());
         assert_eq!(
-            ruby_in(".tool-versions", "nodejs 22.1.0\nruby 3.4.9 3.3.1\n").unwrap().as_deref(),
+            ruby_in(".tool-versions", "nodejs 22.1.0\nruby 3.4.9 3.3.1\n")
+                .unwrap()
+                .as_deref(),
             Some("3.4.9")
         );
         assert_eq!(ruby_in(".tool-versions", "nodejs 22.1.0\n").unwrap(), None);
         assert_eq!(
-            ruby_in("mise.toml", "[tools]\nruby = \"3.4.9\"\nnode = \"22\"\n").unwrap().as_deref(),
+            ruby_in("mise.toml", "[tools]\nruby = \"3.4.9\"\nnode = \"22\"\n")
+                .unwrap()
+                .as_deref(),
             Some("3.4.9")
         );
         assert_eq!(
-            ruby_in("mise.toml", "[tools]\nruby = { version = \"3.4.9\" }\n").unwrap().as_deref(),
+            ruby_in("mise.toml", "[tools]\nruby = { version = \"3.4.9\" }\n")
+                .unwrap()
+                .as_deref(),
             Some("3.4.9")
         );
         assert!(ruby_in("mise.toml", "[tools]\nruby = \"latest\"\n").is_err());
@@ -799,8 +917,9 @@ BUNDLED WITH
             rails: "8.1.3.1".into(),
             bundler: "2.7.2".into(),
             ruby_test: "minitest 5.25.4".into(),
-            ruby_libs: "sqlite=3.50.4;yaml=0.2.5;tz=zoneinfo 2025b;encoding=UTF-8/UTF-8;collector=0.5.0"
-                .into(),
+            ruby_libs:
+                "sqlite=3.50.4;yaml=0.2.5;tz=zoneinfo 2025b;encoding=UTF-8/UTF-8;collector=0.5.0"
+                    .into(),
             ruby_db: "sqlite3".into(),
             ruby_gems: vec![
                 "bundler==2.7.2".into(),
@@ -824,25 +943,37 @@ BUNDLED WITH
             lock: parse_lockfile(LOCK),
             collector: Ok("0.5.0".into()),
             rails_app: true,
+            mise_env: Ok(vec![("mise.toml".into(), "CARGO_TARGET_DIR".into())]),
         }
+    }
+
+    fn no_env(k: &str) -> bool {
+        k.starts_with("RUBY")
     }
 
     #[test]
     fn the_declared_toolchain_matches_only_what_the_checkout_declares() {
         let d = declared();
-        assert!(toolchain_diff(false, Libraries::Any, &tc(), &d).is_empty());
+        assert!(toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env).is_empty());
         // Every library version is read by Ruby: undecided under "exact".
-        let whats: Vec<&str> = toolchain_diff(false, Libraries::Exact, &tc(), &d)
+        let whats: Vec<&str> = toolchain_diff(false, Libraries::Exact, &tc(), &d, &no_env)
             .into_iter()
             .map(|x| x.0)
             .collect();
         assert_eq!(whats, vec![UNDECIDED]);
-        let cases: Vec<(&str, fn(&mut Toolchain))> = vec![
+        type Edit = fn(&mut Toolchain);
+        let cases: Vec<(&str, Edit)> = vec![
             ("ruby (declared)", |t| t.ruby = "3.4.8p72".into()),
-            ("ruby engine (declared)", |t| t.ruby_engine = "jruby 9.4.0".into()),
+            ("ruby engine (declared)", |t| {
+                t.ruby_engine = "jruby 9.4.0".into()
+            }),
             ("bundler (BUNDLED WITH)", |t| t.bundler = "2.6.9".into()),
-            ("rails (railties in the lockfile)", |t| t.rails = "8.0.0".into()),
-            ("ruby test framework (lockfile)", |t| t.ruby_test = "minitest 6.0.0".into()),
+            ("rails (railties in the lockfile)", |t| {
+                t.rails = "8.0.0".into()
+            }),
+            ("ruby test framework (lockfile)", |t| {
+                t.ruby_test = "minitest 6.0.0".into()
+            }),
             ("gems (bundle) not pinned so by the lockfile", |t| {
                 t.ruby_gems.push("pg==1.6.0".into())
             }),
@@ -850,43 +981,77 @@ BUNDLED WITH
             ("ruby libraries: collector", |t| {
                 t.ruby_libs = t.ruby_libs.replace("collector=0.5.0", "collector=0.4.0")
             }),
-            ("ruby libraries: encoding (a Rails application's probe sets UTF-8)", |t| {
-                t.ruby_libs = t.ruby_libs.replace("UTF-8/UTF-8", "US-ASCII/none")
-            }),
+            (
+                "ruby libraries: encoding (a Rails application's probe sets UTF-8)",
+                |t| t.ruby_libs = t.ruby_libs.replace("UTF-8/UTF-8", "US-ASCII/none"),
+            ),
             (UNDECIDED, |t| t.ruby_libs.push_str(";newlib=1")),
-            ("platform (the early plan takes the declared toolchain only for an attestation made on this platform)", |t| {
-                t.os = "plan9".into()
+            (UNDECIDED, |t| {
+                t.ruby_libs = t.ruby_libs.replace("yaml=0.2.5;", "")
             }),
+            (UNDECIDED, |t| {
+                t.ruby_libs = t.ruby_libs.replace("sqlite=3.50.4;", "")
+            }),
+            (
+                "ruby libraries: tz loaded (TZInfo is loaded when the bundle has tzinfo)",
+                |t| t.ruby_libs = t.ruby_libs.replace("tz=zoneinfo 2025b", "tz="),
+            ),
+            (
+                "platform (the early plan takes the declared toolchain only for an attestation made on this platform)",
+                |t| t.os = "plan9".into(),
+            ),
             (vci_core::PRIVILEGES_DIFF, |t| t.superuser = !t.superuser),
         ];
         for (what, edit) in cases {
             let mut t = tc();
             edit(&mut t);
-            let d = toolchain_diff(false, Libraries::Any, &t, &declared());
+            let d = toolchain_diff(false, Libraries::Any, &t, &declared(), &no_env);
             assert!(d.iter().any(|x| x.0 == what), "{what}: {d:?}");
         }
         // Who runs the tests: accepted under allow_superuser_mismatch.
         let mut t = tc();
         t.superuser = !t.superuser;
-        assert!(toolchain_diff(true, Libraries::Any, &t, &declared()).is_empty());
+        assert!(toolchain_diff(true, Libraries::Any, &t, &declared(), &no_env).is_empty());
         // A declaration that could not be read decides nothing.
         let mut d = declared();
         d.ruby = Err("no file declares the Ruby version".into());
-        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d).is_empty());
+        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env).is_empty());
         let mut d = declared();
         d.lock = Err("Gemfile.lock: missing".into());
-        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d).is_empty());
+        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env).is_empty());
         let mut d = declared();
         d.collector = Err("not found".into());
-        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d).is_empty());
+        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env).is_empty());
+        // mise exports a variable the env policy compares, or any through
+        // a directive: undecided; one it does not compare: decided.
+        for k in ["RUBY_YJIT_ENABLE", "_.file"] {
+            let mut d = declared();
+            d.mise_env
+                .as_mut()
+                .unwrap()
+                .push(("mise.toml".into(), k.into()));
+            let whats: Vec<&str> = toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env)
+                .into_iter()
+                .map(|x| x.0)
+                .collect();
+            assert_eq!(whats, vec![UNDECIDED], "{k}");
+        }
+        assert_eq!(
+            mise_env_in("mise.toml", "[env]\nA = \"1\"\n_.file = \".env\"\n").unwrap(),
+            vec!["A", "_.file"]
+        );
         let mut d = declared();
         d.rails_app = false;
-        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d).is_empty());
+        assert!(!toolchain_diff(false, Libraries::Any, &tc(), &d, &no_env).is_empty());
     }
 
     #[test]
     fn native_libraries_are_taken_as_declared_only_by_name() {
-        assert!(native("native:libvips.so.42", Libraries::Any).unwrap().is_some());
+        assert!(
+            native("native:libvips.so.42", Libraries::Any)
+                .unwrap()
+                .is_some()
+        );
         assert!(native("native:libvips.so.42", Libraries::Exact).is_err());
     }
 }

@@ -4140,7 +4140,10 @@ impl World {
         let mut env = env.to_vec();
         env.push(("VCI_RUBY", NO_RUBY));
         let out = self.vci_env(dir, &a, &env);
-        assert!(out.status.success(), "vci plan --early exits 0 whatever happens");
+        assert!(
+            out.status.success(),
+            "vci plan --early exits 0 whatever happens"
+        );
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert!(v["early"]["skipAll"].is_boolean(), "{v}");
         v
@@ -4152,7 +4155,15 @@ impl World {
         let dir = self.base.join(format!("wt-{name}"));
         self.git(
             &self.work,
-            &["worktree", "add", "-q", "-b", name, dir.to_str().unwrap(), "main"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                name,
+                dir.to_str().unwrap(),
+                "main",
+            ],
         );
         std::fs::write(dir.join("vci.toml"), vci_toml).unwrap();
         self.git(&dir, &["commit", "-q", "-am", &format!("policy {name}")]);
@@ -4216,27 +4227,52 @@ fn rails_early_plan_never_skips_what_the_full_plan_runs() {
     assert_eq!(early["early"]["run"], 0);
 
     // Text and github formats.
-    let out = w.vci_env(&work, &["plan", "--early", "--base-ref", "main"], &[("VCI_RUBY", NO_RUBY)]);
+    let out = w.vci_env(
+        &work,
+        &["plan", "--early", "--base-ref", "main"],
+        &[("VCI_RUBY", NO_RUBY)],
+    );
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.lines().any(|l| l.starts_with("early: skip all: 4 unit(s) skipped")),
+        text.lines()
+            .any(|l| l.starts_with("early: skip all: 4 unit(s) skipped")),
         "{text}"
     );
     let gh_out = w.base.join("github-output");
     let out = w.vci_env(
         &work,
-        &["plan", "--early", "--base-ref", "main", "--format", "github"],
-        &[("VCI_RUBY", NO_RUBY), ("GITHUB_OUTPUT", gh_out.to_str().unwrap())],
+        &[
+            "plan",
+            "--early",
+            "--base-ref",
+            "main",
+            "--format",
+            "github",
+        ],
+        &[
+            ("VCI_RUBY", NO_RUBY),
+            ("GITHUB_OUTPUT", gh_out.to_str().unwrap()),
+        ],
     );
     assert!(out.status.success());
     let gh = std::fs::read_to_string(&gh_out).unwrap();
-    for l in ["skip_all=true", "skipped_count=4", "run_count=0", "run_all=false"] {
+    for l in [
+        "skip_all=true",
+        "skipped_count=4",
+        "run_count=0",
+        "run_all=false",
+    ] {
         assert!(gh.lines().any(|x| x == l), "{l} in {gh}");
     }
     // --json-file writes the same plan.
     let saved = w.base.join("early.json");
-    w.early(&work, "main", &["--json-file", saved.to_str().unwrap()], &[]);
+    w.early(
+        &work,
+        "main",
+        &["--json-file", saved.to_str().unwrap()],
+        &[],
+    );
     let v: Value = serde_json::from_slice(&std::fs::read(&saved).unwrap()).unwrap();
     assert_eq!(v["early"]["skipAll"], true);
 
@@ -4318,7 +4354,10 @@ fn rails_early_plan_needs_the_base_policy() {
     };
     let work = w.work.clone();
     w.run(&work, ALL, &w.trusted);
-    w.base_with("probed", &EARLY_TOML.replace("toolchain = \"declared\"\n", ""));
+    w.base_with(
+        "probed",
+        &EARLY_TOML.replace("toolchain = \"declared\"\n", ""),
+    );
     w.base_with("exact", &EARLY_TOML.replace("libraries = \"any\"\n", ""));
 
     // Without the opt-in: the project runs everything, unlisted.
@@ -4328,7 +4367,10 @@ fn rails_early_plan_needs_the_base_policy() {
     assert_within(&early, &full, "no opt-in");
     assert!(!skip_all(&early));
     let why = early["early"]["why"].as_str().unwrap();
-    assert!(why.contains("policy.toolchain = \\\"declared\\\"") || why.contains("policy.toolchain"), "{why}");
+    assert!(
+        why.contains("policy.toolchain = \\\"declared\\\"") || why.contains("policy.toolchain"),
+        "{why}"
+    );
 
     // libraries = "exact": the library versions are Ruby's to read.
     let full = w.plan(&work, "exact");
